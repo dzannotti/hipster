@@ -464,7 +464,26 @@ __device__ __forceinline__ float gemv_row_1(const uint8_t* __restrict__ W, const
     return acc[0];
 }
 
-template <int TPR>
+template <WFmt F, int TPR, int NCOL>
+__device__ __forceinline__ void gemv_row_n(const uint8_t* __restrict__ W, const int8_t* __restrict__ xq, const float* __restrict__ xd,
+                                           const float* __restrict__ xs, int K, int row, int lane, float* acc) {
+    const int nb = (K + 255) / 256, nsb = K / 32;
+    const uint8_t* rp = row_ptr<F>(W, row, K);
+#pragma unroll
+    for (int c = 0; c < NCOL; ++c) acc[c] = 0.f;
+    for (int b = lane; b < nb; b += TPR) {
+        const uint32_t* xw[NCOL]; const float* cxd[NCOL]; const float* cxs[NCOL];
+#pragma unroll
+        for (int c = 0; c < NCOL; ++c) { xw[c] = (const uint32_t*)(xq + (size_t)c * K + b * 256); cxd[c] = xd + (size_t)c * nsb + b * 8; cxs[c] = xs + (size_t)c * nsb + b * 8; }
+        dispatch_block<F, NCOL>(rp, b, K, xw, cxd, cxs, acc);
+    }
+#pragma unroll
+    for (int c = 0; c < NCOL; ++c) {
+#pragma unroll
+        for (int off = TPR / 2; off > 0; off >>= 1) acc[c] += __shfl_xor(acc[c], off, TPR);
+    }
+}
+template <int TPR, int NCOL>
 __global__ void __launch_bounds__(256) k_gemv_multi(SegArgs a, const int8_t* __restrict__ xq, const float* __restrict__ xd, const float* __restrict__ xs) {
     constexpr int ROWS = 256 / TPR;
     const int nblk = a.s[a.n - 1].block0 + (a.s[a.n - 1].N + ROWS - 1) / ROWS;
@@ -475,16 +494,19 @@ __global__ void __launch_bounds__(256) k_gemv_multi(SegArgs a, const int8_t* __r
     const SegDev sg = a.s[si];
     const int lane = threadIdx.x % TPR, row = (vb - sg.block0) * ROWS + threadIdx.x / TPR;
     if (row >= sg.N) continue;
-    float v;
+    float v[NCOL];
     switch (sg.fmt) {
-        case (int)WFmt::Q4_K:     v = gemv_row_1<WFmt::Q4_K, TPR>(sg.w, xq, xd, xs, sg.K, row, lane); break;
-        case (int)WFmt::Q5_K:     v = gemv_row_1<WFmt::Q5_K, TPR>(sg.w, xq, xd, xs, sg.K, row, lane); break;
-        case (int)WFmt::IQ4_XS:   v = gemv_row_1<WFmt::IQ4_XS, TPR>(sg.w, xq, xd, xs, sg.K, row, lane); break;
-        case (int)WFmt::Q6_K_SOA: v = gemv_row_1<WFmt::Q6_K_SOA, TPR>(sg.w, xq, xd, xs, sg.K, row, lane); break;
-        case (int)WFmt::Q5_1_SOA: v = gemv_row_1<WFmt::Q5_1_SOA, TPR>(sg.w, xq, xd, xs, sg.K, row, lane); break;
-        default:                  v = gemv_row_1<WFmt::Q8_0_SOA, TPR>(sg.w, xq, xd, xs, sg.K, row, lane); break;
+        case (int)WFmt::Q4_K:     gemv_row_n<WFmt::Q4_K, TPR, NCOL>(sg.w, xq, xd, xs, sg.K, row, lane, v); break;
+        case (int)WFmt::Q5_K:     gemv_row_n<WFmt::Q5_K, TPR, NCOL>(sg.w, xq, xd, xs, sg.K, row, lane, v); break;
+        case (int)WFmt::IQ4_XS:   gemv_row_n<WFmt::IQ4_XS, TPR, NCOL>(sg.w, xq, xd, xs, sg.K, row, lane, v); break;
+        case (int)WFmt::Q6_K_SOA: gemv_row_n<WFmt::Q6_K_SOA, TPR, NCOL>(sg.w, xq, xd, xs, sg.K, row, lane, v); break;
+        case (int)WFmt::Q5_1_SOA: gemv_row_n<WFmt::Q5_1_SOA, TPR, NCOL>(sg.w, xq, xd, xs, sg.K, row, lane, v); break;
+        default:                  gemv_row_n<WFmt::Q8_0_SOA, TPR, NCOL>(sg.w, xq, xd, xs, sg.K, row, lane, v); break;
     }
-    if (lane == 0) sg.y[row] = v;
+    if (lane == 0) {
+#pragma unroll
+        for (int c = 0; c < NCOL; ++c) sg.y[(size_t)c * sg.N + row] = v[c];
+    }
     }
 }
 
@@ -696,13 +718,20 @@ void repack_row_q8_0(const uint8_t* src, uint8_t* dst, int K) {
     const int nb = K / 32;
     for (int b = 0; b < nb; ++b) { memcpy(dst + (size_t)K + b * 2, src + (size_t)b * 34, 2); memcpy(dst + (size_t)b * 32, src + (size_t)b * 34 + 2, 32); }
 }
-void gemv_multi(const GemvSeg* segs, int nseg, XQ8 x, hipStream_t s) {
+void gemv_multi(const GemvSeg* segs, int nseg, XQ8 x, int ncol, hipStream_t s) {
     constexpr int TPR = 32, ROWS = 256 / TPR;
-    SegArgs a; a.n = nseg; int blocks = 0;
-    for (int i = 0; i < nseg; ++i) { a.s[i] = {(const uint8_t*)segs[i].w, segs[i].y, segs[i].N, segs[i].K, (int)segs[i].fmt, blocks}; blocks += (segs[i].N + ROWS - 1) / ROWS; }
-    for (int i = nseg; i < 4; ++i) a.s[i] = a.s[nseg - 1];
-    if (g_persist_blocks > 0 && blocks > g_persist_blocks) blocks = g_persist_blocks;
-    k_gemv_multi<TPR><<<blocks, 256, 0, s>>>(a, x.q, x.d, x.s);
+    for (int c0 = 0; c0 < ncol; c0 += 8) {   // up to 8 columns per launch (all segments share the same x rows)
+        const int nc = std::min(8, ncol - c0);
+        SegArgs a; a.n = nseg; int blocks = 0;
+        for (int i = 0; i < nseg; ++i) { a.s[i] = {(const uint8_t*)segs[i].w, segs[i].y + (size_t)c0 * segs[i].N, segs[i].N, segs[i].K, (int)segs[i].fmt, blocks}; blocks += (segs[i].N + ROWS - 1) / ROWS; }
+        for (int i = nseg; i < 4; ++i) a.s[i] = a.s[nseg - 1];
+        if (g_persist_blocks > 0 && blocks > g_persist_blocks) blocks = g_persist_blocks;
+        const int K = segs[0].K;   // all segments share K (same input)
+        const int8_t* xq = x.q + (size_t)c0 * K; const float* xd = x.d + (size_t)c0 * K / 32; const float* xs = x.s + (size_t)c0 * K / 32;
+        #define KM(NC) k_gemv_multi<TPR, NC><<<blocks, 256, 0, s>>>(a, xq, xd, xs)
+        switch (nc) { case 1: KM(1); break; case 2: KM(2); break; case 3: KM(3); break; case 4: KM(4); break; case 5: KM(5); break; case 6: KM(6); break; case 7: KM(7); break; default: KM(8); break; }
+        #undef KM
+    }
 }
 // experiment: interleaved layout (rpt == 5). Weights must have been repacked with repack_interleave8.
 template <WFmt F> static void launch_il(const void* W, XQ8 x, float* y, int N, int K, int ncol, hipStream_t s) {
@@ -721,32 +750,49 @@ void gemv_moe(WFmt f, WFmt fs, const MoeSegs& a, int nseg, const int* ids, int n
         default: if (s8) launch_moe<WFmt::Q5_K, WFmt::Q8_0_SOA>(a, nseg, ids, nexp, x, N, K, T, xrow_te, s); else launch_moe<WFmt::Q5_K, WFmt::Q5_K>(a, nseg, ids, nexp, x, N, K, T, xrow_te, s); break;
     }
 }
-// split-K GEMV for skinny weights (few rows, long K): grid = row-blocks x ksplit x ncol; partial sums written to
-// part[(c*ksplit + ks)][N] (summed in a fixed order by the consumer: deterministic, T-invariant)
-template <WFmt F, int TPR>
+// split-K GEMV for skinny weights (few rows, long K): grid = row-blocks x ksplit; NCOL columns share one weight read;
+// partial sums written to part[(c*ksplit + ks)][N] (summed in a fixed order by the consumer: deterministic, T-invariant)
+template <WFmt F, int TPR, int NCOL>
 __global__ void __launch_bounds__(256) k_gemv_splitk(const uint8_t* __restrict__ W, const int8_t* __restrict__ xq, const float* __restrict__ xd, const float* __restrict__ xs,
                                                      float* __restrict__ part, int N, int K, int ksplit) {
     constexpr int ROWS = 256 / TPR;
-    const int nrb = (N + ROWS - 1) / ROWS, rb = blockIdx.x % nrb, ks = (blockIdx.x / nrb) % ksplit, c = blockIdx.x / (nrb * ksplit);
+    const int nrb = (N + ROWS - 1) / ROWS, rb = blockIdx.x % nrb, ks = blockIdx.x / nrb;
     const int lane = threadIdx.x % TPR, row = rb * ROWS + threadIdx.x / TPR;
     if (row >= N) return;
     const int nb = (K + 255) / 256, nsb = K / 32, b0 = ks * nb / ksplit, b1 = (ks + 1) * nb / ksplit;
     const uint8_t* rp = row_ptr<F>(W, row, K);
-    float acc[1] = {0.f};
+    float acc[NCOL];
+#pragma unroll
+    for (int c = 0; c < NCOL; ++c) acc[c] = 0.f;
     for (int b = b0 + lane; b < b1; b += TPR) {
-        const uint32_t* xw[1] = {(const uint32_t*)(xq + (size_t)c * K + b * 256)}; const float* cxd[1] = {xd + (size_t)c * nsb + b * 8}; const float* cxs[1] = {xs + (size_t)c * nsb + b * 8};
-        dispatch_block<F, 1>(rp, b, K, xw, cxd, cxs, acc);
+        const uint32_t* xw[NCOL]; const float* cxd[NCOL]; const float* cxs[NCOL];
+#pragma unroll
+        for (int c = 0; c < NCOL; ++c) { xw[c] = (const uint32_t*)(xq + (size_t)c * K + b * 256); cxd[c] = xd + (size_t)c * nsb + b * 8; cxs[c] = xs + (size_t)c * nsb + b * 8; }
+        dispatch_block<F, NCOL>(rp, b, K, xw, cxd, cxs, acc);
     }
 #pragma unroll
-    for (int off = TPR / 2; off > 0; off >>= 1) acc[0] += __shfl_xor(acc[0], off, TPR);
-    if (lane == 0) part[((size_t)c * ksplit + ks) * N + row] = acc[0];
+    for (int c = 0; c < NCOL; ++c) {
+#pragma unroll
+        for (int off = TPR / 2; off > 0; off >>= 1) acc[c] += __shfl_xor(acc[c], off, TPR);
+        if (lane == 0) part[((size_t)c * ksplit + ks) * N + row] = acc[c];
+    }
+}
+template <WFmt F> static void launch_splitk(const void* W, XQ8 x, float* part, int N, int K, int ksplit, int ncol, hipStream_t s) {
+    const int grid = ((N + 7) / 8) * ksplit;   // 8 rows per block
+    for (int c0 = 0; c0 < ncol; c0 += 8) {
+        const int nc = std::min(8, ncol - c0);
+        const int8_t* xq = x.q + (size_t)c0 * K; const float* xd = x.d + (size_t)c0 * K / 32; const float* xs = x.s + (size_t)c0 * K / 32;
+        float* p = part + (size_t)c0 * ksplit * N;
+        #define KS(NC) k_gemv_splitk<F, 32, NC><<<grid, 256, 0, s>>>((const uint8_t*)W, xq, xd, xs, p, N, K, ksplit)
+        switch (nc) { case 1: KS(1); break; case 2: KS(2); break; case 3: KS(3); break; case 4: KS(4); break; case 5: KS(5); break; case 6: KS(6); break; case 7: KS(7); break; default: KS(8); break; }
+        #undef KS
+    }
 }
 void gemv_splitk(WFmt f, const void* W, XQ8 x, float* part, int N, int K, int ksplit, int ncol, hipStream_t s) {
-    const int grid = ((N + 7) / 8) * ksplit * ncol;   // 8 rows per block
     switch (f) {
-        case WFmt::Q8_0_SOA: k_gemv_splitk<WFmt::Q8_0_SOA, 32><<<grid, 256, 0, s>>>((const uint8_t*)W, x.q, x.d, x.s, part, N, K, ksplit); break;
-        case WFmt::Q4_K: k_gemv_splitk<WFmt::Q4_K, 32><<<grid, 256, 0, s>>>((const uint8_t*)W, x.q, x.d, x.s, part, N, K, ksplit); break;
-        default: k_gemv_splitk<WFmt::Q6_K_SOA, 32><<<grid, 256, 0, s>>>((const uint8_t*)W, x.q, x.d, x.s, part, N, K, ksplit); break;
+        case WFmt::Q8_0_SOA: launch_splitk<WFmt::Q8_0_SOA>(W, x, part, N, K, ksplit, ncol, s); break;
+        case WFmt::Q4_K: launch_splitk<WFmt::Q4_K>(W, x, part, N, K, ksplit, ncol, s); break;
+        default: launch_splitk<WFmt::Q6_K_SOA>(W, x, part, N, K, ksplit, ncol, s); break;
     }
 }
 void repack_interleave8(WFmt f, const uint8_t* src, uint8_t* dst, int N, int K) {

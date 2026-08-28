@@ -30,7 +30,14 @@ void silu_mul(const float* gate, const float* up, float* out, int n, hipStream_t
 // ---- Gated DeltaNet (per layer) ----
 // Causal conv over C channels with 4 taps, T tokens sequentially: st_in [3][C] holds the 3 previous
 // inputs (oldest first); x [T][C]. out[t][c] = silu(sum_k w[k][c] * hist); final history -> st_out.
+// Batched forms: SeqBatch = up to 8 sequences, each a run of rows [r0, r0+T) with its own state buffers
+// (in/out = indices into a state array of stride st_stride floats). RowBatch = per-row position + KV slot for
+// attention (n == 0 -> single sequence at pos0+t, slot 0; the prefill path uses that form).
+struct SeqDesc { int r0, T, in, out; };
+struct SeqBatch { SeqDesc s[8]; int n = 0; };
+struct RowBatch { int pos[32]; int kv[32]; int n = 0; };
 void gdn_conv(const float* x, int T, const float* st_in, float* st_out, const float* w, float* out, int C, hipStream_t s);
+void gdn_conv_b(const float* x, const SeqBatch& sb, size_t st_stride, const float* st_base, float* st_obase, const float* w, float* out, int C, hipStream_t s);
 // T recurrent steps for all heads, state kept in registers. qkv [T][2048 q | 2048 k | 6144 v]
 // (post-conv), z [T][6144], beta_raw/alpha_raw [T][48], dt_bias [48], a_neg [48] (= -exp(A_log)),
 // state_in/out [48][128][128] f32 (M[j][i] = S[i][j]), ssm_norm w [128].
@@ -52,6 +59,10 @@ void gdn_out(const float* raw, const float* z, const float* norm_w, int T, float
 void gdn_step_sig(const float* qkv, const float* z, const float* beta_raw, const float* alpha_raw, int T, const float* dt_bias, const float* a_neg,
                   const float* state_in, float* state_out, const float* norm_w, float* out, XQ8 xq, float eps, hipStream_t s);
 void gdn_out_sig(const float* raw, const float* z, const float* norm_w, int T, float* out, uint16_t* xb, float eps, hipStream_t s);
+void gdn_step_sig_b(const float* qkv, const float* z, const float* beta_raw, const float* alpha_raw, const SeqBatch& sb, size_t st_stride, const float* dt_bias, const float* a_neg,
+                    const float* st_base, float* st_obase, const float* norm_w, float* out, XQ8 xq, float eps, hipStream_t s);
+void attn_decode_24_2_b(float* q_full, float* k, float* v, int T, const float* q_norm_w, const float* k_norm_w, float rope_base, const RowBatch& rb,
+                        uint16_t* kc, uint16_t* vc, size_t kv_stride, size_t kvt_stride, int max_ctx, float* out, XQ8 xq, float eps, hipStream_t s);
 void attn_decode_24_2(float* q_full, float* k, float* v, int T, const float* q_norm_w, const float* k_norm_w, float rope_base, int pos0,
                       uint16_t* kc, uint16_t* vc, int max_ctx, float* out, XQ8 xq, float eps, hipStream_t s);
 

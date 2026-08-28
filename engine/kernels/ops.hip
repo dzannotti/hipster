@@ -184,12 +184,15 @@ __global__ void k_add(float* __restrict__ y, const float* __restrict__ x, int n)
 __global__ void k_silu_mul(const float* __restrict__ g, const float* __restrict__ u, float* __restrict__ o, int n) { const int i = blockIdx.x * 256 + threadIdx.x; if (i < n) o[i] = silu(g[i]) * u[i]; }
 
 // ---- GDN conv: state [3][C] oldest first; weights w [4][C] (tap-major as in GGUF ssm_conv1d [4, C]) ----
-__global__ void k_gdn_conv(const float* __restrict__ x, int T, const float* __restrict__ st_in, float* __restrict__ st_out, const float* __restrict__ w, float* __restrict__ out, int C) {
+__global__ void k_gdn_conv(const float* __restrict__ x, SeqBatch sb, size_t st_stride, const float* __restrict__ st_base, float* __restrict__ st_obase,
+                           const float* __restrict__ w, float* __restrict__ out, int C) {
     const int c = blockIdx.x * 256 + threadIdx.x; if (c >= C) return;
+    const SeqDesc sd = sb.s[blockIdx.y];
+    const float* st_in = st_base + (size_t)sd.in * st_stride; float* st_out = st_obase + (size_t)sd.out * st_stride;
     float h0 = st_in[c], h1 = st_in[C + c], h2 = st_in[2 * C + c];
     // ggml: weight tensor ne = [4, C] -> element (tap, c) at w[c*4 + tap]; taps oldest..newest
     const float* wc = w + (size_t)c * 4;
-    for (int t = 0; t < T; ++t) {
+    for (int t = sd.r0; t < sd.r0 + sd.T; ++t) {
         const float xc = x[(size_t)t * C + c];
         out[(size_t)t * C + c] = silu(wc[0] * h0 + wc[1] * h1 + wc[2] * h2 + wc[3] * xc);
         h0 = h1; h1 = h2; h2 = xc;
@@ -200,19 +203,21 @@ __global__ void k_gdn_conv(const float* __restrict__ x, int T, const float* __re
 // ---- GDN recurrent step, T tokens: one block (256 threads) per v-head; thread handles j = tid/2, i-half = tid%2 ----
 template <bool SIGMOID_GATE>
 __global__ void __launch_bounds__(256) k_gdn_step(const float* __restrict__ qkv, const float* __restrict__ z,
-                                                  const float* __restrict__ beta_raw, const float* __restrict__ alpha_raw, int T,
+                                                  const float* __restrict__ beta_raw, const float* __restrict__ alpha_raw, SeqBatch sb, size_t st_stride,
                                                   const float* __restrict__ dt_bias, const float* __restrict__ a_neg,
-                                                  const float* __restrict__ state_in, float* __restrict__ state_out, const float* __restrict__ norm_w,
+                                                  const float* __restrict__ st_base, float* __restrict__ st_obase, const float* __restrict__ norm_w,
                                                   float* __restrict__ out, int8_t* __restrict__ oq, float* __restrict__ od, float* __restrict__ os, float eps) {
     constexpr int D = 128, QKV = 10240, Z = 6144;
     const int h = blockIdx.x, hk = h % 16;
+    const SeqDesc sd = sb.s[blockIdx.y];
+    const float* state_in = st_base + (size_t)sd.in * st_stride; float* state_out = st_obase + (size_t)sd.out * st_stride;
     const int tid = threadIdx.x, j = tid / 2, ih = tid % 2;   // this thread: row j of M, i in [64*ih, 64*ih+64)
     __shared__ float sq[D], sk[D], sh[8], sout[D];
     const float* Min = state_in + (size_t)h * D * D + (size_t)j * D + 64 * ih;
     float m[64];
 #pragma unroll
     for (int i = 0; i < 64; ++i) m[i] = Min[i];
-    for (int t = 0; t < T; ++t) {
+    for (int t = sd.r0; t < sd.r0 + sd.T; ++t) {
         const float* qh = qkv + (size_t)t * QKV + hk * D; const float* kh = qkv + (size_t)t * QKV + 2048 + hk * D; const float* vh = qkv + (size_t)t * QKV + 4096 + h * D;
         float qq = 0.f, kk = 0.f;
         if (tid < D) { qq = qh[tid] * qh[tid]; kk = kh[tid] * kh[tid]; }
@@ -358,9 +363,13 @@ template <int NQ, int NKV, bool I8>
 __global__ void k_qk_norm_rope_kv(float* __restrict__ qf, float* __restrict__ k, const float* __restrict__ v,
                                   const float* __restrict__ qw, const float* __restrict__ kw, float base, int pos0,
                                   uint16_t* __restrict__ kc, uint16_t* __restrict__ vc, int max_ctx, float eps,
-                                  int8_t* __restrict__ kc8, uint16_t* __restrict__ ks, int8_t* __restrict__ vc8, uint16_t* __restrict__ vs) {
+                                  int8_t* __restrict__ kc8, uint16_t* __restrict__ ks, int8_t* __restrict__ vc8, uint16_t* __restrict__ vs,
+                                  RowBatch rb, size_t kv_stride, size_t kvt_stride) {
     __shared__ float sh[8]; __shared__ float buf[256];
-    const int t = threadIdx.x, hb = blockIdx.x % (NQ + NKV), tt = blockIdx.x / (NQ + NKV), pos = pos0 + tt;
+    const int t = threadIdx.x, hb = blockIdx.x % (NQ + NKV), tt = blockIdx.x / (NQ + NKV);
+    const int pos = rb.n ? rb.pos[tt] : pos0 + tt, slot = rb.n ? rb.kv[tt] : 0;
+    kc += (size_t)slot * kv_stride; vc += (size_t)slot * kvt_stride;
+    if (kc8) { kc8 += (size_t)slot * kv_stride; ks += (size_t)slot * (kv_stride / 32); vc8 += (size_t)slot * kvt_stride; vs += (size_t)slot * (kvt_stride / 256); }
     const bool isq = hb < NQ;
     float* x = isq ? qf + (size_t)tt * NQ * 512 + hb * 512 : k + (size_t)tt * NKV * 256 + (hb - NQ) * 256;
     const float* w = isq ? qw : kw;
@@ -402,16 +411,20 @@ __global__ void k_qk_norm_rope_kv(float* __restrict__ qf, float* __restrict__ k,
 template <int NQ, int NKV, bool I8>
 __global__ void __launch_bounds__(256) k_attn(const float* __restrict__ qf, const uint16_t* __restrict__ kc, const uint16_t* __restrict__ vc,
                                               const int8_t* __restrict__ kc8, const uint16_t* __restrict__ ks, const int8_t* __restrict__ vc8, const uint16_t* __restrict__ vs,
-                                              int pos0, int max_ctx, float* __restrict__ out, int8_t* __restrict__ oq, float* __restrict__ od, float* __restrict__ os) {
+                                              int pos0, int max_ctx, float* __restrict__ out, int8_t* __restrict__ oq, float* __restrict__ od, float* __restrict__ os,
+                                              RowBatch rb, size_t kv_stride, size_t kvt_stride) {
     __shared__ float sh[8]; __shared__ float sq[256]; __shared__ float sc[4096];
     const int h = blockIdx.x % NQ, tt = blockIdx.x / NQ, kh = h / (NQ / NKV), t = threadIdx.x;
     const int cp = max_ctx + 128;
+    const int rpos = rb.n ? rb.pos[tt] : pos0 + tt, slot = rb.n ? rb.kv[tt] : 0;
+    kc += (size_t)slot * kv_stride; vc += (size_t)slot * kvt_stride;
+    if (kc8) { kc8 += (size_t)slot * kv_stride; ks += (size_t)slot * (kv_stride / 32); vc8 += (size_t)slot * kvt_stride; vs += (size_t)slot * (kvt_stride / 256); }
     const uint16_t* kch = kc + (size_t)kh * max_ctx * 256; const uint16_t* vch = vc + ((size_t)kh * 256 + t) * cp;   // this thread's dim row of V^T
     const int8_t* kch8 = kc8 + (size_t)kh * max_ctx * 256; const int8_t* vch8 = vc8 + ((size_t)kh * 256 + t) * cp;
     const uint16_t* ksh = ks + (size_t)kh * max_ctx * 8; const uint16_t* vsh = vs + (size_t)kh * max_ctx;
     const float* q = qf + (size_t)tt * NQ * 512 + h * 512;
     sq[t] = q[t]; __syncthreads();
-    const int n = pos0 + tt + 1;
+    const int n = rpos + 1;
     float gmax = -INFINITY, gsum = 0.f; float o = 0.f;
     for (int p0 = 0; p0 < n; p0 += 4096) {
         const int nn = min(4096, n - p0);
@@ -705,14 +718,24 @@ void embed_q4_K(const void* W, const int* toks, int T, float* out, int n, hipStr
 void rmsnorm(const float* x, const float* w, float* out, int rows, int n, float eps, hipStream_t s) { k_rmsnorm<<<rows, 256, 0, s>>>(x, w, out, n, eps); }
 void add_inplace(float* y, const float* x, int n, hipStream_t s) { k_add<<<(n + 255) / 256, 256, 0, s>>>(y, x, n); }
 void silu_mul(const float* g, const float* u, float* o, int n, hipStream_t s) { k_silu_mul<<<(n + 255) / 256, 256, 0, s>>>(g, u, o, n); }
-void gdn_conv(const float* x, int T, const float* st_in, float* st_out, const float* w, float* out, int C, hipStream_t s) { k_gdn_conv<<<(C + 255) / 256, 256, 0, s>>>(x, T, st_in, st_out, w, out, C); }
+static SeqBatch one_seq(int T) { SeqBatch sb; sb.n = 1; sb.s[0] = {0, T, 0, 0}; return sb; }
+void gdn_conv(const float* x, int T, const float* st_in, float* st_out, const float* w, float* out, int C, hipStream_t s) {
+    k_gdn_conv<<<dim3((C + 255) / 256, 1), 256, 0, s>>>(x, one_seq(T), 0, st_in, st_out, w, out, C);
+}
+void gdn_conv_b(const float* x, const SeqBatch& sb, size_t st_stride, const float* st_base, float* st_obase, const float* w, float* out, int C, hipStream_t s) {
+    k_gdn_conv<<<dim3((C + 255) / 256, sb.n), 256, 0, s>>>(x, sb, st_stride, st_base, st_obase, w, out, C);
+}
 void gdn_step(const float* qkv, const float* z, const float* beta_raw, const float* alpha_raw, int T, const float* dt_bias, const float* a_neg,
               const float* state_in, float* state_out, const float* norm_w, float* out, XQ8 xq, float eps, hipStream_t s) {
-    k_gdn_step<false><<<48, 256, 0, s>>>(qkv, z, beta_raw, alpha_raw, T, dt_bias, a_neg, state_in, state_out, norm_w, out, xq.q, xq.d, xq.s, eps);
+    k_gdn_step<false><<<dim3(48, 1), 256, 0, s>>>(qkv, z, beta_raw, alpha_raw, one_seq(T), 0, dt_bias, a_neg, state_in, state_out, norm_w, out, xq.q, xq.d, xq.s, eps);
 }
 void gdn_step_sig(const float* qkv, const float* z, const float* beta_raw, const float* alpha_raw, int T, const float* dt_bias, const float* a_neg,
                   const float* state_in, float* state_out, const float* norm_w, float* out, XQ8 xq, float eps, hipStream_t s) {
-    k_gdn_step<true><<<48, 256, 0, s>>>(qkv, z, beta_raw, alpha_raw, T, dt_bias, a_neg, state_in, state_out, norm_w, out, xq.q, xq.d, xq.s, eps);
+    k_gdn_step<true><<<dim3(48, 1), 256, 0, s>>>(qkv, z, beta_raw, alpha_raw, one_seq(T), 0, dt_bias, a_neg, state_in, state_out, norm_w, out, xq.q, xq.d, xq.s, eps);
+}
+void gdn_step_sig_b(const float* qkv, const float* z, const float* beta_raw, const float* alpha_raw, const SeqBatch& sb, size_t st_stride, const float* dt_bias, const float* a_neg,
+                    const float* st_base, float* st_obase, const float* norm_w, float* out, XQ8 xq, float eps, hipStream_t s) {
+    k_gdn_step<true><<<dim3(48, sb.n), 256, 0, s>>>(qkv, z, beta_raw, alpha_raw, sb, st_stride, dt_bias, a_neg, st_base, st_obase, norm_w, out, xq.q, xq.d, xq.s, eps);
 }
 void gdn_prep(const float* qkv, const float* beta_raw, const float* alpha_raw, const float* dt_bias, const float* a_neg, int T,
               float* qn, float* kn, float* beta, float* decay, float eps, hipStream_t s) {
@@ -743,34 +766,39 @@ void silu_mul_quant(const float* gate, const float* up, XQ8 xq, int n, hipStream
 }
 void attn_decode(float* q_full, float* k, float* v, int T, const float* q_norm_w, const float* k_norm_w, float rope_base, int pos0,
                  uint16_t* kc, uint16_t* vc, int max_ctx, float* out, XQ8 xq, float eps, hipStream_t s) {
-    k_qk_norm_rope_kv<24, 4, false><<<28 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, pos0, kc, vc, max_ctx, eps, nullptr, nullptr, nullptr, nullptr);
-    k_attn<24, 4, false><<<24 * T, 256, 0, s>>>(q_full, kc, vc, nullptr, nullptr, nullptr, nullptr, pos0, max_ctx, out, xq.q, xq.d, xq.s);
+    k_qk_norm_rope_kv<24, 4, false><<<28 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, pos0, kc, vc, max_ctx, eps, nullptr, nullptr, nullptr, nullptr, RowBatch{}, 0, 0);
+    k_attn<24, 4, false><<<24 * T, 256, 0, s>>>(q_full, kc, vc, nullptr, nullptr, nullptr, nullptr, pos0, max_ctx, out, xq.q, xq.d, xq.s, RowBatch{}, 0, 0);
 }
 void attn_decode_i8(float* q_full, float* k, float* v, int T, const float* q_norm_w, const float* k_norm_w, float rope_base, int pos0,
                     const KV8& c, int max_ctx, float* out, XQ8 xq, float eps, hipStream_t s) {
-    k_qk_norm_rope_kv<24, 4, true><<<28 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, pos0, nullptr, nullptr, max_ctx, eps, c.k, c.ks, c.v, c.vs);
-    k_attn<24, 4, true><<<24 * T, 256, 0, s>>>(q_full, nullptr, nullptr, c.k, c.ks, c.v, c.vs, pos0, max_ctx, out, xq.q, xq.d, xq.s);
+    k_qk_norm_rope_kv<24, 4, true><<<28 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, pos0, nullptr, nullptr, max_ctx, eps, c.k, c.ks, c.v, c.vs, RowBatch{}, 0, 0);
+    k_attn<24, 4, true><<<24 * T, 256, 0, s>>>(q_full, nullptr, nullptr, c.k, c.ks, c.v, c.vs, pos0, max_ctx, out, xq.q, xq.d, xq.s, RowBatch{}, 0, 0);
 }
 // Flash-Next geometry: 24 q heads, 2 kv heads (dense; exact below the QSA budget)
 void attn_decode_24_2(float* q_full, float* k, float* v, int T, const float* q_norm_w, const float* k_norm_w, float rope_base, int pos0,
                       uint16_t* kc, uint16_t* vc, int max_ctx, float* out, XQ8 xq, float eps, hipStream_t s) {
-    k_qk_norm_rope_kv<24, 2, false><<<26 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, pos0, kc, vc, max_ctx, eps, nullptr, nullptr, nullptr, nullptr);
-    k_attn<24, 2, false><<<24 * T, 256, 0, s>>>(q_full, kc, vc, nullptr, nullptr, nullptr, nullptr, pos0, max_ctx, out, xq.q, xq.d, xq.s);
+    k_qk_norm_rope_kv<24, 2, false><<<26 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, pos0, kc, vc, max_ctx, eps, nullptr, nullptr, nullptr, nullptr, RowBatch{}, 0, 0);
+    k_attn<24, 2, false><<<24 * T, 256, 0, s>>>(q_full, kc, vc, nullptr, nullptr, nullptr, nullptr, pos0, max_ctx, out, xq.q, xq.d, xq.s, RowBatch{}, 0, 0);
+}
+void attn_decode_24_2_b(float* q_full, float* k, float* v, int T, const float* q_norm_w, const float* k_norm_w, float rope_base, const RowBatch& rb,
+                        uint16_t* kc, uint16_t* vc, size_t kv_stride, size_t kvt_stride, int max_ctx, float* out, XQ8 xq, float eps, hipStream_t s) {
+    k_qk_norm_rope_kv<24, 2, false><<<26 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, 0, kc, vc, max_ctx, eps, nullptr, nullptr, nullptr, nullptr, rb, kv_stride, kvt_stride);
+    k_attn<24, 2, false><<<24 * T, 256, 0, s>>>(q_full, kc, vc, nullptr, nullptr, nullptr, nullptr, 0, max_ctx, out, xq.q, xq.d, xq.s, rb, kv_stride, kvt_stride);
 }
 void attn_decode_gqa(float* q_full, float* k, float* v, int T, const float* q_norm_w, const float* k_norm_w, float rope_base, int pos0,
                      uint16_t* kc, uint16_t* vc, int max_ctx, float* out, XQ8 xq, float* pO, float* pm, float* pl, float eps, hipStream_t s) {
-    k_qk_norm_rope_kv<24, 4, false><<<28 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, pos0, kc, vc, max_ctx, eps, nullptr, nullptr, nullptr, nullptr);
+    k_qk_norm_rope_kv<24, 4, false><<<28 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, pos0, kc, vc, max_ctx, eps, nullptr, nullptr, nullptr, nullptr, RowBatch{}, 0, 0);
     const int nsplit = (pos0 + T + GQA_CH - 1) / GQA_CH;
     k_attn_gqa<<<4 * nsplit, 32, 0, s>>>(q_full, kc, vc, T, pos0, max_ctx, nsplit, pO, pm, pl);
     k_attn_merge<<<4 * 6 * T, 256, 0, s>>>(q_full, pO, pm, pl, T, nsplit, out, xq.q, xq.d, xq.s);
 }
 void attn_stage1(float* q_full, float* k, const float* v, int T, const float* q_norm_w, const float* k_norm_w, float rope_base, int pos0,
                  uint16_t* kc, uint16_t* vc, int max_ctx, float eps, hipStream_t s) {
-    k_qk_norm_rope_kv<24, 4, false><<<28 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, pos0, kc, vc, max_ctx, eps, nullptr, nullptr, nullptr, nullptr);
+    k_qk_norm_rope_kv<24, 4, false><<<28 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, pos0, kc, vc, max_ctx, eps, nullptr, nullptr, nullptr, nullptr, RowBatch{}, 0, 0);
 }
 void attn_stage1_i8(float* q_full, float* k, const float* v, int T, const float* q_norm_w, const float* k_norm_w, float rope_base, int pos0,
                     const KV8& c, int max_ctx, float eps, hipStream_t s) {
-    k_qk_norm_rope_kv<24, 4, true><<<28 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, pos0, nullptr, nullptr, max_ctx, eps, c.k, c.ks, c.v, c.vs);
+    k_qk_norm_rope_kv<24, 4, true><<<28 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, pos0, nullptr, nullptr, max_ctx, eps, c.k, c.ks, c.v, c.vs, RowBatch{}, 0, 0);
 }
 void attn_prefill(const float* q_full, const uint16_t* kc, const uint16_t* vc, int T, int pos0, int max_ctx, uint16_t* out_bf16, hipStream_t s) {
     k_attn_prefill<false><<<24 * ((T + 63) / 64), 128, 0, s>>>(q_full, kc, vc, nullptr, nullptr, nullptr, nullptr, T, pos0, max_ctx, out_bf16);

@@ -90,3 +90,24 @@ All 96/96 identical to plain greedy. The MoE verify pass costs ~7.5 ms per extra
 near roof), so long drafts cannot pay at this acceptance; the 27B (dense: verify ≈ free) is the opposite regime.
 Single-stream ceiling for this model ≈ 40 t/s; the concurrency ceiling is far higher (dense 4.3 GB amortised across
 slots, experts 7.5 ms/token → 83 t/s at 4 slots, 105 at 8) and MTP adds little there. **Next: multi-slot batching.**
+
+## 2026-08-28 · multi-slot batched decode (the concurrency ceiling)
+Engine API: `forward(const SlotReq* reqs, S)` — S sequences, each T tokens, rows in request order; per-slot
+double-buffered GDN/conv/PLE state, KV, n-gram history; `accept(slot, m)` with per-slot replay. Shared kernels take
+per-sequence (`SeqBatch`: GDN step + conv) and per-row (`RowBatch`: RoPE/KV write + attention) descriptors; the 27B
+keeps its single-slot wrappers. Driver: `./build.sh 'BATCH_DISTINCT=1 ./build/batchfn <shard1> docs/ref/fn-code.json 48 S'`
+(slot s runs the prompt minus its first s tokens, each slot checked against its own single-slot stream).
+
+| slots | prompts | aggregate t/s | per slot | GPU ms/pass | byte floor | exact |
+|---|---|---|---|---|---|---|
+| 1 | | 27.5 | 27.5 | 36 | 25 | 12/12 vs llama.cpp |
+| 2 | identical | 44.1 | 22.0 | 45 | | 2/2 |
+| 4 | identical | 70.6 | 17.7 | 56.5 | (experts overlap → cache) | 4/4 |
+| 4 | **distinct** | **63.3** | 15.8 | 63.1 | 48 (4.3 GB dense + 4 × 1.8 GB experts) | 4/4 |
+| 8 | **distinct** | **79.9** | 10.0 | 100 | 78 | 8/8 |
+
+Identical prompts pick identical experts and the MoE reads hit the MALL (the gate|up kernel showed 417 GB/s, above
+the DRAM roof) — the distinct rows are the honest ones. Batched-pass fixes from the profile: the K=2560 dense GEMVs
+now go through the multi-segment kernel for any row count (183 → 48 launches per pass), split-K and the f32 router
+read their weights once for up to 8 rows. Per-row cost at S=8 ≈ 9 ms (experts 1.8 GB ≈ 7.5 ms at roof).
+Prefill is still token-by-token (27 t/s): **the Flash-Next prefill GEMM path is next** — a 2K prompt costs 74 s today.

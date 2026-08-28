@@ -34,3 +34,6 @@ target_link_libraries(runfn hipster_core)
 
 add_executable(specfn bench/specfn.cpp)
 target_link_libraries(specfn hipster_core)
+
+add_executable(batchfn bench/batchfn.cpp)
+target_link_libraries(batchfn hipster_core)

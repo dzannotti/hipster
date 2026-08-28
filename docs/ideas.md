@@ -97,7 +97,8 @@ the value is elsewhere:
 | gated residual: read/write as two fused kernels; residual streams in FP8 (Qwen: negligible loss) | write folded into the next read's norm (0 launches); read = norm + split-K down + silu + up + mix; FP8 streams untested |
 | MoE prefill: sort tokens by expert, per-expert GEMM tiles sized by average rows/expert, shared activation quant for gate/up | untested |
 | MTP block (QSA + MoE + hc) with the frozen top-k across draft steps | done (dense attention): 27.4 → 37.2 t/s at n=2, exact; acceptance 69% first draft, decays fast (docs/decode-flash-next.md) |
-| multi-slot batched decode (S sequences × T rows; per-row state/KV/position) — the concurrency ceiling: 83 t/s at 4 slots, 105 at 8 | next |
+| multi-slot batched decode (S sequences × T rows; per-row state/KV/position) | done, exact: 63 t/s at 4 slots, 80 at 8 (distinct prompts); floors 83/105 |
+| Flash-Next prefill GEMM path (dense: dequant + hipBLASLt as the 27B; MoE: tokens sorted by expert, grouped GEMM) | next — prompts run at 27 t/s today |
 | draft-only Q4_K LM head for the MTP (2.8 of 5.6 ms per draft) | untested |
 | deterministic, T-invariant numerics as a contract (no float atomics, lane policy by tensor only) | done, tested bit-exact T=3 vs T=1 |
 | lanes-per-row policy per tensor shape (short K rows are issue-bound, not bandwidth-bound) | measured, applied: docs/decode-flash-next.md table |

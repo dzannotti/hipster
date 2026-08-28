@@ -185,7 +185,7 @@ void Qwen35::lin(const Lin& l, float* y, int M) {
 // one [sum N][K] bf16 matrix, one GEMM, then split the bf16 output rows into the f32 targets.
 void Qwen35::lin_multi(const GemvSeg* segs, int n, int M) {
     if (M <= D::max_T) {
-        if (M == 1) { gemv_multi(segs, n, xq_, s_); tmark(T_GEMV); return; }
+        if (M == 1) { gemv_multi(segs, n, xq_, 1, s_); tmark(T_GEMV); return; }
         for (int i = 0; i < n; ++i) gemv_q8(segs[i].fmt, segs[i].w, xq_, segs[i].y, segs[i].N, segs[i].K, M, 4, 3, s_);
         tmark(T_GEMV); return;
     }

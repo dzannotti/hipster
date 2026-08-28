@@ -244,19 +244,33 @@ __global__ void __launch_bounds__(256) k_ple_apply(float* __restrict__ R, const 
         st[(size_t)8 * W + c] = n;
     }
 }
-// f32 weights [N][K], f32 x [T][K] -> y [T][N]; one wave per (t, row)
-__global__ void k_f32_gemv(const float* __restrict__ W, const float* __restrict__ x, float* __restrict__ y, int N, int K, int T) {
-    const int wave = (blockIdx.x * 256 + threadIdx.x) / 32, lane = threadIdx.x % 32;
-    const int t = wave / N, n = wave % N; if (t >= T) return;
-    const float* w = W + (size_t)n * K; const float* xr = x + (size_t)t * K;
-    float acc = 0.f;
-    for (int i = lane * 4; i < K; i += 128) { const float4 a = *(const float4*)(w + i), b = *(const float4*)(xr + i); acc += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w; }
-    acc = wave_sum(acc);
-    if (lane == 0) y[(size_t)t * N + n] = acc;
+// f32 weights [N][K], f32 x [T][K] -> y [T][N]; one wave per weight row, NT x rows share the read
+template <int NT>
+__global__ void k_f32_gemv(const float* __restrict__ W, const float* __restrict__ x, float* __restrict__ y, int N, int K) {
+    const int n = (blockIdx.x * 256 + threadIdx.x) / 32, lane = threadIdx.x % 32; if (n >= N) return;
+    const float* w = W + (size_t)n * K;
+    float acc[NT];
+#pragma unroll
+    for (int t = 0; t < NT; ++t) acc[t] = 0.f;
+    for (int i = lane * 4; i < K; i += 128) {
+        const float4 a = *(const float4*)(w + i);
+#pragma unroll
+        for (int t = 0; t < NT; ++t) { const float4 b = *(const float4*)(x + (size_t)t * K + i); acc[t] += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w; }
+    }
+#pragma unroll
+    for (int t = 0; t < NT; ++t) { const float v = wave_sum(acc[t]); if (lane == 0) y[(size_t)t * N + n] = v; }
 }
 }  // namespace
 
-void f32_gemv(const float* W, const float* x, float* y, int N, int K, int T, hipStream_t s) { k_f32_gemv<<<(T * N * 32 + 255) / 256, 256, 0, s>>>(W, x, y, N, K, T); }
+void f32_gemv(const float* W, const float* x, float* y, int N, int K, int T, hipStream_t s) {
+    const int grid = (N * 32 + 255) / 256;
+    for (int t0 = 0; t0 < T; t0 += 8) {
+        const int nt = std::min(8, T - t0); const float* xr = x + (size_t)t0 * K; float* yr = y + (size_t)t0 * N;
+        #define KF(NT) k_f32_gemv<NT><<<grid, 256, 0, s>>>(W, xr, yr, N, K)
+        switch (nt) { case 1: KF(1); break; case 2: KF(2); break; case 3: KF(3); break; case 4: KF(4); break; case 5: KF(5); break; case 6: KF(6); break; case 7: KF(7); break; default: KF(8); break; }
+        #undef KF
+    }
+}
 void embed_q8_0(const void* W, const int* toks, int T, float* out, int n, hipStream_t s) { k_embed_q8_0<<<T, 256, 0, s>>>((const uint8_t*)W, toks, out, n); }
 void hc_combine(float* R, const float* y, const float* inject, int T, hipStream_t s) { k_hc_combine<<<T * HC, 256, 0, s>>>(R, y, inject); }
 void init_wide(const float* x, float* R, int T, hipStream_t s) { k_init_wide<<<T * HC, 256, 0, s>>>(x, R); }
