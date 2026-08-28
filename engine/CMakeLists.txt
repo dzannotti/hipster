@@ -37,3 +37,12 @@ target_link_libraries(specfn hipster_core)
 
 add_executable(batchfn bench/batchfn.cpp)
 target_link_libraries(batchfn hipster_core)
+
+add_executable(prefillfn bench/prefillfn.cpp)
+target_link_libraries(prefillfn hipster_core)
+
+add_executable(bench_moe bench/bench_moe.cpp)
+target_link_libraries(bench_moe hipster_core)
+
+add_executable(test_fnkernels bench/test_fnkernels.cpp)
+target_link_libraries(test_fnkernels hipster_core)

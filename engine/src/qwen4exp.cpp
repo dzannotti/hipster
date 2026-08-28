@@ -1,5 +1,9 @@
 #include "qwen4exp.h"
 #include <chrono>
+#include <algorithm>
+#include <map>
+#include <set>
+#include <sstream>
 #include <sys/mman.h>
 #include "quant.h"
 #include "../kernels/ops.h"
@@ -110,11 +114,13 @@ void Qwen4Exp::upload_experts(const GGUF& g, const std::string& name, uint8_t** 
     *dst = l.w; *fmt = l.fmt; *eb = l.bytes / E;
 }
 
-Qwen4Exp::Qwen4Exp(const std::string& path, int max_ctx, int n_slots) : max_ctx_(max_ctx), n_slots_(n_slots) {
+Qwen4Exp::Qwen4Exp(const std::string& path, int max_ctx, int n_slots, int max_prefill) : max_ctx_(max_ctx), n_slots_(n_slots), max_prefill_(max_prefill) {
     if (n_slots < 1 || n_slots > MAXS) throw std::runtime_error("n_slots must be 1..8");
     gguf_ = new GGUF(path);
+    if (const char* e = getenv("HIPSTER_DBG_LAYERS")) { std::stringstream ss(e); std::string t; while (std::getline(ss, t, ',')) dbg_layers_.insert(atoi(t.c_str())); }
     GGUF& g = *gguf_;
     if (g.arch() != "qwen4exp") throw std::runtime_error("not a qwen4exp GGUF: " + g.arch());
+    if (getenv("HIPSTER_BLOCKING_SYNC")) CK(hipSetDeviceFlags(hipDeviceScheduleBlockingSync));   // experiment: a spinning host core may steal the APU's power budget from the GPU
     CK(hipStreamCreate(&s_)); CK(hipEventCreate(&ev0_)); CK(hipEventCreate(&ev1_));
     // PLE constants
     { auto* m = g.kv("qwen4exp.ple.layer_multipliers"); auto* o = g.kv("qwen4exp.ple.head_offsets"); auto* v = g.kv("qwen4exp.ple.head_vocab_sizes");
@@ -163,6 +169,21 @@ Qwen4Exp::Qwen4Exp(const std::string& path, int max_ctx, int n_slots) : max_ctx_
     CK(hipMalloc(&xq_.q, xk)); CK(hipMalloc(&xq_.d, xk / 32 * 4)); CK(hipMalloc(&xq_.s, xk / 32 * 4));
     CK(hipMemset(xq_.q, 0, xk)); CK(hipMemset(xq_.d, 0, xk / 32 * 4)); CK(hipMemset(xq_.s, 0, xk / 32 * 4));
     CK(hipMalloc(&d_tok_, T * 4)); CK(hipMalloc(&d_ids_, T * 16 * 4)); CK(hipMalloc(&d_vals_, T * 16 * 4));
+    if (max_prefill_ > 0) {
+        const size_t P = max_prefill_;
+        CK(hipMalloc(&xb_, P * D::wide * 2)); CK(hipMalloc(&xb2_, P * D::n_embd * 2)); CK(hipMalloc(&gout_, P * 16480 * 2)); CK(hipMalloc(&wscratch_, (size_t)16480 * D::n_embd * 2));
+        auto f32 = [&](float** p, size_t n) { CK(hipMalloc(p, n * 4)); };
+        f32(&pR_, P * D::wide); f32(&pxn_, P * D::wide); f32(&pmixed_, P * D::n_embd); f32(&py_, P * D::n_embd); f32(&pymoe_, P * D::n_embd);
+        f32(&pqkv_, P * D::gdn_qkv); f32(&pqkvc_, P * D::gdn_qkv); f32(&pz_, P * D::gdn_z); f32(&pba_, P * 96); f32(&pqn_, P * (4096 + 96)); f32(&praw_, P * D::gdn_z); f32(&pao_, P * D::gdn_z);
+        f32(&pq_, P * 12288); f32(&pk_, P * 512); f32(&pv_, P * 512); f32(&prl_, P * (D::n_exp + 1)); f32(&prw_, P * (D::n_used + 1));
+        f32(&peg_, P * (D::n_used + 1) * D::exp_ff); f32(&peu_, P * (D::n_used + 1) * D::exp_ff); f32(&pinj_, P * 20 * 4); f32(&pinj2_, P * 20 * 4);
+        f32(&pkey_, P * D::wide); f32(&pval_, P * D::n_embd); f32(&pemb_, P * D::n_embd);
+        CK(hipMalloc(&peid_, P * (D::n_used + 1) * 4)); CK(hipMalloc(&pd_tok_, P * 4));
+        CK(hipMalloc(&d_kpos_, P * (D::n_used + 1) * 4)); CK(hipMalloc(&d_rowtok_, P * (D::n_used + 1) * 4)); CK(hipMalloc(&d_tiles_, (P * (D::n_used + 1) / 16 + D::n_exp + 2) * sizeof(MoeTile)));
+        f32(&pdown_, P * (D::n_used + 1) * D::n_embd); CK(hipMalloc(&pxs_, P * (D::n_used + 1) * D::exp_ff * 2));
+        const size_t xk = P * (size_t)(D::n_used + 1) * D::exp_ff;   // widest int8 rows: the MoE down input [P*11][640] (> [P][2560])
+        CK(hipMalloc(&pxq_.q, xk)); CK(hipMalloc(&pxq_.d, xk / 32 * 4)); CK(hipMalloc(&pxq_.s, xk / 32 * 4));
+    }
     reset();
 }
 
@@ -205,36 +226,40 @@ void Qwen4Exp::hc_block(const FnLayer& L, bool ffn, int T, const Pending& p, flo
 
 // PLE (layer 1): n-gram rows hashed on the host and gathered from the mmap; key/value GEMVs over all rows land in the
 // replay buffers; the conv history is advanced per slot, token by token.
+// n-gram rows for T tokens continuing `hist`: 16 rows per token, random over a 28.8 GB mmap on NVMe; hash them all,
+// tell the kernel to fetch the pages in parallel (MADV_WILLNEED), then decode -> emb_out [T][2560] (host memory).
+void Qwen4Exp::ple_rows(const std::vector<int>& hist, const int* tokens, int T, float* emb_out) {
+    std::vector<int> seq = hist; for (int i = 0; i < T; ++i) seq.push_back(tokens[i]);
+    const int base = (int)hist.size();
+    const size_t rb = gtype_row_bytes(ple_table_->type, D::ple_dim);
+    std::vector<const uint8_t*> rowp((size_t)T * D::ple_heads);
+    for (int i = 0; i < T; ++i) {
+        const int pos = base + i;
+        int64_t ctx[3]; ctx[0] = seq[pos]; bool cut = false;
+        for (int s = 1; s < 3; ++s) { const int64_t prev = pos - s >= 0 ? seq[pos - s] : eos_; ctx[s] = cut ? eos_ : prev; if (ctx[s] == eos_) cut = true; }
+        for (int n = 2; n <= 3; ++n) {
+            uint64_t mixed = (uint64_t)ctx[0] * ple_mult_[0];
+            for (int j = 1; j < n; ++j) mixed ^= (uint64_t)ctx[j] * ple_mult_[j];
+            for (int h8 = 0; h8 < 8; ++h8) {
+                const int h = (n - 2) * 8 + h8;
+                const int64_t row = (int64_t)(mixed % (uint64_t)ple_vocab_[h]) + ple_off_[h];
+                rowp[(size_t)i * D::ple_heads + h] = ple_table_->data + (size_t)row * rb;
+            }
+        }
+    }
+    for (const uint8_t* r : rowp) { const uintptr_t a = (uintptr_t)r & ~(uintptr_t)4095; madvise((void*)a, ((uintptr_t)r + rb) - a, MADV_WILLNEED); }
+    for (int i = 0; i < T; ++i)
+        for (int h = 0; h < D::ple_heads; ++h)
+            dequant_row((int)ple_table_->type, rowp[(size_t)i * D::ple_heads + h], emb_out + (size_t)i * D::n_embd + h * D::ple_dim, D::ple_dim);
+}
+
+// PLE (layer 1, decode passes): key/value GEMVs over all rows land in the replay buffers; the conv history is advanced per
+// slot, token by token.
 void Qwen4Exp::ple(const SlotReq* reqs, int S, const int* r0s, int rows) {
     const auto t0 = std::chrono::steady_clock::now();
     const auto& L = layers_[D::ple_layer];
     std::vector<float> emb((size_t)rows * D::n_embd);
-    const size_t rb = gtype_row_bytes(ple_table_->type, D::ple_dim);
-    std::vector<const uint8_t*> rowp((size_t)rows * D::ple_heads);
-    for (int si = 0; si < S; ++si) {
-        const SlotReq& q = reqs[si];
-        std::vector<int> seq = hist_[q.slot]; for (int i = 0; i < q.T; ++i) seq.push_back(q.tokens[i]);
-        const int base = (int)hist_[q.slot].size();
-        for (int i = 0; i < q.T; ++i) {
-            const int pos = base + i, r = r0s[si] + i;
-            int64_t ctx[3]; ctx[0] = seq[pos]; bool cut = false;
-            for (int s = 1; s < 3; ++s) { const int64_t prev = pos - s >= 0 ? seq[pos - s] : eos_; ctx[s] = cut ? eos_ : prev; if (ctx[s] == eos_) cut = true; }
-            for (int n = 2; n <= 3; ++n) {
-                uint64_t mixed = (uint64_t)ctx[0] * ple_mult_[0];
-                for (int j = 1; j < n; ++j) mixed ^= (uint64_t)ctx[j] * ple_mult_[j];
-                for (int h8 = 0; h8 < 8; ++h8) {
-                    const int h = (n - 2) * 8 + h8;
-                    const int64_t row = (int64_t)(mixed % (uint64_t)ple_vocab_[h]) + ple_off_[h];
-                    rowp[(size_t)r * D::ple_heads + h] = ple_table_->data + (size_t)row * rb;
-                }
-            }
-        }
-    }
-    // 16 rows per token, random over a 28.8 GB mmap on NVMe: fetch the pages in parallel (MADV_WILLNEED), then decode
-    for (const uint8_t* r : rowp) { const uintptr_t a = (uintptr_t)r & ~(uintptr_t)4095; madvise((void*)a, ((uintptr_t)r + rb) - a, MADV_WILLNEED); }
-    for (int r = 0; r < rows; ++r)
-        for (int h = 0; h < D::ple_heads; ++h)
-            dequant_row((int)ple_table_->type, rowp[(size_t)r * D::ple_heads + h], emb.data() + (size_t)r * D::n_embd + h * D::ple_dim, D::ple_dim);
+    for (int si = 0; si < S; ++si) ple_rows(hist_[reqs[si].slot], reqs[si].tokens, reqs[si].T, emb.data() + (size_t)r0s[si] * D::n_embd);
     ple_host_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     CK(hipMemcpyAsync(emb_, emb.data(), emb.size() * 4, hipMemcpyHostToDevice, s_));
     quantize_x_q8(emb_, xq_, rows, D::n_embd, s_);
@@ -314,6 +339,7 @@ float Qwen4Exp::forward(const SlotReq* reqs, int S) {
             ple(reqs, S, P.r0, rows);
         }
         hc_block(L, false, rows, pend, mixed_, inject_, R_);
+        if (dbg_armed_ && dbg_layers_.count(il)) dbg_capture_mix(il, mixed_ + (size_t)(rows - 1) * D::n_embd, false);
         if (!D::is_attn(il)) {
             const int gi = gdn_index(il);
             // raw qkv / beta / alpha land in the replay buffers (accept(slot, m < T) recomputes the state from them)
@@ -335,6 +361,7 @@ float Qwen4Exp::forward(const SlotReq* reqs, int S) {
         hc_block(L, true, rows, pend, mixed_, inject2_, R_);
         moe_layer(L, rows);
         pend = Pending{}; pend.y = ymoe_; pend.inject = inject2_;   // the write half is folded into the next read's norm
+        if (dbg_armed_ && dbg_layers_.count(il)) dbg_capture(il, y_ + (size_t)(rows - 1) * D::n_embd, ymoe_ + (size_t)(rows - 1) * D::n_embd, false);
     }
     head(rows, pend, R_, logits_);
     for (int i = 0; i < S; ++i) { const int sl = reqs[i].slot; pend_tokens_[sl].assign(reqs[i].tokens, reqs[i].tokens + reqs[i].T); lr0_[sl] = P.r0[i]; lT_[sl] = reqs[i].T; }
@@ -387,6 +414,187 @@ void Qwen4Exp::accept(int slot, int m) {
     for (int i = 0; i < m; ++i) hist.push_back(pend_tokens_[slot][i]);
     if (hist.size() > 2) hist.erase(hist.begin(), hist.end() - 2);
     cur_[slot] = nxt; lT_[slot] = 0;
+}
+
+// ======================= prefill: GEMM path (bf16 activations, hipBLASLt) =======================
+// per-phase GPU timing for the prefill path (HIPSTER_TIMING=1): events after each phase on the stream
+static const bool g_timing = getenv("HIPSTER_TIMING") != nullptr;
+double g_ptime[8]; static const char* g_pname[8] = {"hc(norm+down+silu+up+mix)", "dense gemm+dequant+split", "gdn", "attention", "router+route+sort", "moe gemm+silu+combine", "ple", "other"};
+struct PhaseTimer {
+    hipStream_t s; hipEvent_t e0, e1; bool on;
+    PhaseTimer(hipStream_t st) : s(st), on(g_timing) { if (on) { hipEventCreate(&e0); hipEventCreate(&e1); hipEventRecord(e0, s); } }
+    void mark(int cat) { if (!on) return; hipEventRecord(e1, s); hipEventSynchronize(e1); float ms; hipEventElapsedTime(&ms, e0, e1); g_ptime[cat] += ms; std::swap(e0, e1); }
+    ~PhaseTimer() { if (on) { hipEventDestroy(e0); hipEventDestroy(e1); } }
+};
+static std::map<std::pair<int, int>, std::pair<double, int>> g_gemm_ms;   // (N,K) -> (sum ms, calls), HIPSTER_TIMING
+static std::map<std::pair<int, int>, double> g_gemm_min;
+void prefill_timing_report(double denom_tokens) {
+    if (!g_timing) return;
+    double tot = 0; for (double v : g_ptime) tot += v;
+    fprintf(stderr, "prefill phases (%.0f tokens): ", denom_tokens);
+    for (int i = 0; i < 8; ++i) if (g_ptime[i] > 0) fprintf(stderr, "%s %.0f ms (%.0f%%) | ", g_pname[i], g_ptime[i], 100 * g_ptime[i] / tot);
+    fprintf(stderr, "total %.0f ms\n", tot);
+    for (double& v : g_ptime) v = 0;
+    for (auto& kv : g_gemm_ms) if (kv.first.first % 8192 > 64) fprintf(stderr, "  gemm M=%d N=%5d K=%5d: %4d calls, avg %.3f ms, min %.3f ms (avg includes the first call's autotune)\n", kv.first.first % 8192, kv.first.first / 8192, kv.first.second / 10, kv.second.second, kv.second.first / kv.second.second, g_gemm_min[kv.first]);
+    g_gemm_ms.clear(); g_gemm_min.clear();
+}
+void Qwen4Exp::lin_gemm(const GemvSeg* segs, int n, int M, const uint16_t* A) {
+    int Nt = 0; const int K = segs[0].K;
+    for (int i = 0; i < n; ++i) { dequant_bf16(segs[i].fmt, segs[i].w, wscratch_ + (size_t)Nt * K, segs[i].N, K, s_); Nt += segs[i].N; }
+    auto run = [&] { blas_.gemm(A, wscratch_, gout_, M, Nt, K, s_); };
+    if (g_timing) { static const bool twice = getenv("HIPSTER_GEMM_TWICE") != nullptr;
+                    hipEvent_t a, b; hipEventCreate(&a); hipEventCreate(&b);
+                    for (int rep = 0; rep < (twice ? 2 : 1); ++rep) {
+                        hipEventRecord(a, s_); run(); hipEventRecord(b, s_); hipEventSynchronize(b);
+                        float ms; hipEventElapsedTime(&ms, a, b); auto& e = g_gemm_ms[{Nt * 8192 + M, K * 10 + rep}]; e.first += ms; ++e.second; auto& mn = g_gemm_min[{Nt * 8192 + M, K * 10 + rep}]; mn = (e.second == 1 || ms < mn) ? ms : mn; }
+                    hipEventDestroy(a); hipEventDestroy(b); return; }
+    run();
+}
+// columns [off, off+N) of the last GEMM output -> f32 [M][N]
+void Qwen4Exp::gemm_seg(int Nt, int off, int N, float* dst, int M) { bf16_to_f32_seg(gout_, Nt, off, N, dst, M, s_); }
+// hyper-connection read over T rows: norm (pending write folded) -> down GEMM -> silu -> up GEMM -> mix.
+// Leaves: pmixed_ f32, xb_ = bf16 mixed [T][2560] (next GEMM input), pxq_ int8 rows when ffn (MoE input), inject partials.
+void Qwen4Exp::hc_read_pf(const FnLayer& L, bool ffn, int T, const Pending& p, float* inject_out) {
+    fn::HcNormArgs na; na.R = pR_; na.y = p.y; na.inject = p.inject; na.w_norm = ffn ? L.hc_ffn_norm : L.hc_attn_norm; na.xn = pxn_; na.xb = xb_;
+    fn::hc_norm(na, XQ8{nullptr, nullptr, nullptr}, T, D::rms_eps, s_);
+    const FnLin& dn = ffn ? L.hc_ffn_down : L.hc_attn_down; const FnLin& up = ffn ? L.hc_ffn_up : L.hc_attn_up;
+    GemvSeg sd = {dn.fmt, dn.w, nullptr, dn.N, dn.K}; lin_gemm(&sd, 1, T, xb_);         // gout_ [T][320] bf16
+    fn::hc_silu_bf16(gout_, xb2_, T, s_);
+    GemvSeg su = {up.fmt, up.w, nullptr, up.N, up.K}; lin_gemm(&su, 1, T, xb2_);        // gout_ [T][10240] bf16
+    fn::hc_mix_bf16(pxn_, gout_, ffn ? L.hc_ffn_inject : L.hc_attn_inject, pmixed_, inject_out, ffn ? pxq_ : XQ8{nullptr, nullptr, nullptr}, xb_, T, s_);
+}
+
+// HIPSTER_DBG_LAYERS="0,1,3,47": capture y (attention/GDN output) and ymoe (MoE output) of the last row after those layers,
+// on both paths, so prefill vs decode can be bisected layer by layer
+void Qwen4Exp::dbg_capture(int il, const float* y, const float* ymoe, bool pf) {
+    auto& d = pf ? dbg_pf_[il] : dbg_dec_[il];
+    d.resize(3 * D::n_embd);
+    CK(hipMemcpy(d.data(), y, D::n_embd * 4, hipMemcpyDeviceToHost)); CK(hipMemcpy(d.data() + D::n_embd, ymoe, D::n_embd * 4, hipMemcpyDeviceToHost));
+}
+void Qwen4Exp::dbg_capture_mix(int il, const float* mixed, bool pf) {   // mixed after the attention-side hc read of layer il
+    auto& d = pf ? dbg_pf_[il] : dbg_dec_[il]; d.resize(3 * D::n_embd);
+    CK(hipMemcpy(d.data() + 2 * D::n_embd, mixed, D::n_embd * 4, hipMemcpyDeviceToHost));
+}
+void Qwen4Exp::dbg_report() const {
+    for (auto& kv : dbg_pf_) {
+        auto it = dbg_dec_.find(kv.first); if (it == dbg_dec_.end()) continue;
+        const auto& a = kv.second; const auto& b = it->second;
+        for (int part = 0; part < 3; ++part) {
+            double md = 0, mx = 0, se = 0, sz = 0; for (int i = 0; i < D::n_embd; ++i) { const double x = a[part * D::n_embd + i], z = b[part * D::n_embd + i]; md = fmax(md, fabs(x - z)); mx = fmax(mx, fabs(z)); se += (x - z) * (x - z); sz += z * z; }
+            fprintf(stderr, "  layer %2d %-5s: max|diff| %.3g / max %.3g = %.2f%%   rel rms %.4f\n", kv.first, part == 0 ? "y" : part == 1 ? "moe" : "mix0", md, mx, 100 * md / mx, sqrt(se / sz));
+        }
+    }
+}
+
+float Qwen4Exp::prefill(const int* tokens, int T, int pos0) {
+    if (!max_prefill_) throw std::runtime_error("engine built without prefill buffers");
+    if (T < 1 || T > max_prefill_) throw std::runtime_error("bad prefill T");
+    if (pos0 + T > max_ctx_) throw std::runtime_error("pos >= max_ctx");
+    if (pos0 + T > D::qsa_dense_limit) fprintf(stderr, "warning: %d cached tokens > QSA budget; dense attention is no longer exact\n", pos0 + T);
+    const int sl = 0, cur = cur_[sl], nxt = cur ^ 1;
+    CK(hipEventRecord(ev0_, s_));
+    CK(hipMemcpyAsync(pd_tok_, tokens, T * 4, hipMemcpyHostToDevice, s_));
+    fn::embed_q8_0(tok_embd_, pd_tok_, T, pemb_, D::n_embd, s_);
+    fn::init_wide(pemb_, pR_, T, s_);
+    PhaseTimer pt(s_);
+    Pending pend;
+    for (int il = 0; il < D::n_layer; ++il) {
+        auto& L = layers_[il];
+        if (il == D::ple_layer) {
+            fn::hc_combine(pR_, pymoe_, pinj2_, T, s_); pend = Pending{};
+            std::vector<float> emb((size_t)T * D::n_embd);
+            const auto t0 = std::chrono::steady_clock::now();
+            ple_rows(hist_[sl], tokens, T, emb.data());
+            ple_host_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            CK(hipMemcpyAsync(pemb_, emb.data(), emb.size() * 4, hipMemcpyHostToDevice, s_));
+            f32_to_bf16(pemb_, xb2_, (size_t)T * D::n_embd, s_);
+            GemvSeg sk = {L.ple_key.fmt, L.ple_key.w, nullptr, L.ple_key.N, L.ple_key.K}; lin_gemm(&sk, 1, T, xb2_); gemm_seg(D::wide, 0, D::wide, pkey_, T);
+            GemvSeg sv = {L.ple_value.fmt, L.ple_value.w, nullptr, L.ple_value.N, L.ple_value.K}; lin_gemm(&sv, 1, T, xb2_); gemm_seg(D::n_embd, 0, D::n_embd, pval_, T);
+            float* stc = ple_state_ + ((size_t)sl * 2 + cur) * ple_stride_; float* stn = ple_state_ + ((size_t)sl * 2 + nxt) * ple_stride_;
+            CK(hipMemcpyAsync(stn, stc, ple_stride_ * 4, hipMemcpyDeviceToDevice, s_));
+            fn::ple_apply(pR_, pkey_, pval_, L.ple_nk, L.ple_nq, L.ple_nc, L.ple_conv, stn, T, D::rms_eps, s_);
+            pt.mark(6);
+        }
+        hc_read_pf(L, false, T, pend, pinj_); pt.mark(0);
+        if (dbg_layers_.count(il)) dbg_capture_mix(il, pmixed_ + (size_t)(T - 1) * D::n_embd, true);
+        if (!D::is_attn(il)) {
+            const int gi = gdn_index(il);
+            GemvSeg segs[4] = {{L.qkv.fmt, L.qkv.w, nullptr, L.qkv.N, L.qkv.K}, {L.zgate.fmt, L.zgate.w, nullptr, L.zgate.N, L.zgate.K},
+                               {L.beta.fmt, L.beta.w, nullptr, L.beta.N, L.beta.K}, {L.alpha.fmt, L.alpha.w, nullptr, L.alpha.N, L.alpha.K}};
+            lin_gemm(segs, 4, T, xb_);   // gout_ [T][10240 | 6144 | 48 | 48]
+            const int Nt = D::gdn_qkv + D::gdn_z + 96;
+            gemm_seg(Nt, 0, D::gdn_qkv, pqkv_, T); gemm_seg(Nt, D::gdn_qkv, D::gdn_z, pz_, T);
+            gemm_seg(Nt, D::gdn_qkv + D::gdn_z, 48, pba_, T); gemm_seg(Nt, D::gdn_qkv + D::gdn_z + 48, 48, pba_ + (size_t)T * 48, T);
+            pt.mark(1);
+            const size_t cso = (size_t)gi * 3 * D::gdn_qkv, gso = (size_t)gi * D::gdn_v_heads * D::gdn_dim * D::gdn_dim;
+            gdn_conv(pqkv_, T, conv_state_ + ((size_t)sl * 2 + cur) * cs_stride_ + cso, conv_state_ + ((size_t)sl * 2 + nxt) * cs_stride_ + cso, L.conv_w, pqkvc_, D::gdn_qkv, s_);
+            float* qn = pqn_; float* kn = pqn_ + (size_t)T * 2048; float* bt = pqn_ + (size_t)T * 4096; float* dc = bt + (size_t)T * 48;
+            gdn_prep(pqkvc_, pba_, pba_ + (size_t)T * 48, L.dt_bias, L.a_neg, T, qn, kn, bt, dc, D::rms_eps, s_);
+            gdn_scan(qn, kn, pqkvc_, bt, dc, T, gdn_state_ + ((size_t)sl * 2 + cur) * st_stride_ + gso, gdn_state_ + ((size_t)sl * 2 + nxt) * st_stride_ + gso, praw_, s_);
+            gdn_out_sig(praw_, pz_, L.ssm_norm, T, pao_, xb_, D::rms_eps, s_); pt.mark(2);
+            GemvSeg so = {L.ssm_out.fmt, L.ssm_out.w, nullptr, L.ssm_out.N, L.ssm_out.K}; lin_gemm(&so, 1, T, xb_); gemm_seg(D::n_embd, 0, D::n_embd, py_, T); pt.mark(1);
+        } else {
+            const int ai = attn_index(il);
+            const size_t off = (size_t)ai * max_ctx_ * D::n_head_kv * D::head_dim, offv = (size_t)ai * (max_ctx_ + 128) * D::n_head_kv * D::head_dim;
+            GemvSeg segs[3] = {{L.wq.fmt, L.wq.w, nullptr, L.wq.N, L.wq.K}, {L.wk.fmt, L.wk.w, nullptr, L.wk.N, L.wk.K}, {L.wv.fmt, L.wv.w, nullptr, L.wv.N, L.wv.K}};
+            lin_gemm(segs, 3, T, xb_);
+            const int Nt = 12288 + 1024;
+            gemm_seg(Nt, 0, 12288, pq_, T); gemm_seg(Nt, 12288, 512, pk_, T); gemm_seg(Nt, 12800, 512, pv_, T); pt.mark(1);
+            attn_stage1_24_2(pq_, pk_, pv_, T, L.q_norm, L.k_norm, D::rope_base, pos0, kc_ + off, vc_ + offv, max_ctx_, D::rms_eps, s_);
+            attn_prefill_24_2(pq_, kc_ + off, vc_ + offv, T, pos0, max_ctx_, xb_, s_);   // xb_ bf16 [T][6144]
+            pt.mark(3);
+            GemvSeg so = {L.wo.fmt, L.wo.w, nullptr, L.wo.N, L.wo.K}; lin_gemm(&so, 1, T, xb_); gemm_seg(D::n_embd, 0, D::n_embd, py_, T); pt.mark(1);
+        }
+        pend = Pending{}; pend.y = py_; pend.inject = pinj_;
+        hc_read_pf(L, true, T, pend, pinj2_); pt.mark(0);
+        // MoE over T rows: exact f32 router GEMM, top-10, sorted slots -> grouped WMMA GEMMs
+        blas_.gemm_f32(pmixed_, L.router, prl_, T, D::n_exp + 1, D::n_embd, s_);
+        fn::moe_route(prl_, peid_, prw_, T, s_);
+        {   // slots sorted by expert on the host -> tiles of <= 16 columns; grouped WMMA GEMMs read each expert once per tile
+            const int NS = T * (D::n_used + 1); constexpr int NE = D::n_used + 1;
+            std::vector<int> eid(NS); CK(hipMemcpy(eid.data(), peid_, (size_t)NS * 4, hipMemcpyDeviceToHost));
+            std::vector<int> order(NS), kpos(NS), rowtok(NS); for (int i = 0; i < NS; ++i) order[i] = i;
+            std::sort(order.begin(), order.end(), [&](int a, int b) { return eid[a] != eid[b] ? eid[a] < eid[b] : a < b; });
+            // column tiles of up to 16*ct sorted positions per expert: the expert's weights are read once per tile
+            static const int ct_env = getenv("HIPSTER_MOE_CT") ? atoi(getenv("HIPSTER_MOE_CT")) : 3;
+            const int ct = std::max(1, std::min(3, ct_env)), maxc = 16 * ct;
+            std::vector<MoeTile> tiles, stiles; tiles.reserve(NS / maxc + D::n_exp + 2);
+            for (int k = 0; k < NS; ++k) {
+                const int te = order[k]; kpos[te] = k; rowtok[k] = te / NE;
+                auto& lst = eid[te] < 0 ? stiles : tiles;
+                if (lst.empty() || (k > 0 && eid[te] != eid[order[k - 1]]) || lst.back().ncols == maxc) lst.push_back({eid[te], k, 1}); else ++lst.back().ncols;
+            }
+            const int nt = (int)tiles.size(), nst = (int)stiles.size();
+            CK(hipMemcpyAsync(d_kpos_, kpos.data(), (size_t)NS * 4, hipMemcpyHostToDevice, s_)); CK(hipMemcpyAsync(d_rowtok_, rowtok.data(), (size_t)NS * 4, hipMemcpyHostToDevice, s_));
+            CK(hipMemcpyAsync(d_tiles_, tiles.data(), (size_t)nt * sizeof(MoeTile), hipMemcpyHostToDevice, s_));
+            CK(hipMemcpyAsync(d_tiles_ + nt, stiles.data(), (size_t)nst * sizeof(MoeTile), hipMemcpyHostToDevice, s_)); pt.mark(4);
+            const MoeTile* dst = d_tiles_ + nt;
+            static const bool moe_i8 = getenv("HIPSTER_MOE_I8") != nullptr;
+            if (moe_i8) {
+                moe_gemm(L.gate_fmt, L.sh_gate.fmt, L.gate_exps, L.sh_gate.w, L.gate_eb, d_tiles_, nt, dst, nst, ct, d_rowtok_, pxq_, peg_, D::exp_ff, D::n_embd, s_);
+                moe_gemm(L.up_fmt, L.sh_up.fmt, L.up_exps, L.sh_up.w, L.up_eb, d_tiles_, nt, dst, nst, ct, d_rowtok_, pxq_, peu_, D::exp_ff, D::n_embd, s_);
+                fn::moe_silu_quant(peg_, peu_, pxq_, NS, D::exp_ff, s_);
+                moe_gemm(L.down_fmt, L.sh_down.fmt, L.down_exps, L.sh_down.w, L.down_eb, d_tiles_, nt, dst, nst, ct, nullptr, pxq_, pdown_, D::n_embd, D::exp_ff, s_);
+            } else {   // bf16 x (the mixed rows xb_), scales folded into the weight fragments
+                moe_gemm_bf16(L.gate_fmt, L.sh_gate.fmt, L.gate_exps, L.sh_gate.w, L.gate_eb, d_tiles_, nt, dst, nst, ct, d_rowtok_, xb_, peg_, D::exp_ff, D::n_embd, s_);
+                moe_gemm_bf16(L.up_fmt, L.sh_up.fmt, L.up_exps, L.sh_up.w, L.up_eb, d_tiles_, nt, dst, nst, ct, d_rowtok_, xb_, peu_, D::exp_ff, D::n_embd, s_);
+                fn::moe_silu_bf16(peg_, peu_, pxs_, NS, D::exp_ff, s_);   // bf16 rows [NS][640] in sorted order
+                moe_gemm_bf16(L.down_fmt, L.sh_down.fmt, L.down_exps, L.sh_down.w, L.down_eb, d_tiles_, nt, dst, nst, ct, nullptr, pxs_, pdown_, D::n_embd, D::exp_ff, s_);
+            }
+            fn::moe_combine_sorted(pdown_, prw_, d_kpos_, pymoe_, T, NE, s_); pt.mark(5);
+        }
+        pend = Pending{}; pend.y = pymoe_; pend.inject = pinj2_;
+        if (dbg_layers_.count(il)) dbg_capture(il, py_ + (size_t)(T - 1) * D::n_embd, pymoe_ + (size_t)(T - 1) * D::n_embd, true);
+    }
+    fn::hc_combine(pR_, pymoe_, pinj2_, T, s_);                                                          // final residual for all rows
+    CK(hipMemcpyAsync(R_, pR_ + (size_t)(T - 1) * D::wide, (size_t)D::wide * 4, hipMemcpyDeviceToDevice, s_));   // h_nextn = last row
+    head(1, Pending{}, R_, logits_);                                                                     // logits for the last row
+    pt.mark(7);
+    auto& hist = hist_[sl]; for (int i = 0; i < T; ++i) hist.push_back(tokens[i]); if (hist.size() > 2) hist.erase(hist.begin(), hist.end() - 2);
+    cur_[sl] = nxt; lT_[sl] = 0;
+    CK(hipEventRecord(ev1_, s_)); CK(hipEventSynchronize(ev1_));
+    float ms; CK(hipEventElapsedTime(&ms, ev0_, ev1_));
+    return ms;
 }
 
 void Qwen4Exp::topk(const float* logits, int T, int k, int* ids, float* vals) {

@@ -93,6 +93,9 @@ void attn_prefill(const float* q_full, const uint16_t* kc, const uint16_t* vc, i
 // stage 1 only (norm + rope + KV write) for T queries
 void attn_stage1(float* q_full, float* k, const float* v, int T, const float* q_norm_w, const float* k_norm_w, float rope_base, int pos0,
                  uint16_t* kc, uint16_t* vc, int max_ctx, float eps, hipStream_t s);
+void attn_stage1_24_2(float* q_full, float* k, const float* v, int T, const float* q_norm_w, const float* k_norm_w, float rope_base, int pos0,
+                      uint16_t* kc, uint16_t* vc, int max_ctx, float eps, hipStream_t s);
+void attn_prefill_24_2(const float* q_full, const uint16_t* kc, const uint16_t* vc, int T, int pos0, int max_ctx, uint16_t* out_bf16, hipStream_t s);
 // per row t < T: top-k (k <= 16) ids/values sorted desc -> out_ids[t*k..], out_vals[t*k..]
 void argmax_topk(const float* logits, int T, int n, int k, int* out_ids, float* out_vals, hipStream_t s);
 

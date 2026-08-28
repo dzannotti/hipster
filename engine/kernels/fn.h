@@ -20,7 +20,7 @@ void init_wide(const float* x, float* R, int T, hipStream_t s);
 // 10240->320 GEMV).
 struct HcNormArgs {
     float* R; const float* y = nullptr; const float* inject = nullptr;
-    const float* w_norm; float* xn;
+    const float* w_norm; float* xn; uint16_t* xb = nullptr;   // xb: bf16 copy of xn (prefill GEMM input)
     int8_t* q = nullptr; float* qd = nullptr; float* qs = nullptr;
 };
 void hc_norm(const HcNormArgs& a, XQ8 xq, int T, float eps, hipStream_t s);
@@ -29,9 +29,14 @@ void hc_silu_quant(const float* part, int ksplit, XQ8 xq, int T, hipStream_t s);
 // part 3: gate = sigmoid(up) [T][10240]; mixed[t] = mean_s(xn[s]*gate[s]) [2560] -> f32 out + xq;
 // inject = W_inject^T xn (W_inject f32 [10240][4], i.e. GGUF [4 x 10240] ne0=4) as per-block partials [T][20][4]
 void hc_mix(const float* xn, const float* up, const float* w_inject, float* mixed, float* inject, XQ8 xq, int T, hipStream_t s);
+// prefill variants: up bf16 (GEMM output); mixed also as bf16 rows xb; lo bf16 -> silu -> bf16
+void hc_mix_bf16(const float* xn, const uint16_t* up, const float* w_inject, float* mixed, float* inject, XQ8 xq, uint16_t* xb, int T, hipStream_t s);
+void hc_silu_bf16(const uint16_t* lo, uint16_t* out, int T, hipStream_t s);
 
 // exact f32 GEMV (router 512x2560, shared-expert gate 1x2560): y [T][N] = W [N][K] . x [T][K]
 void f32_gemv(const float* W, const float* x, float* y, int N, int K, int T, hipStream_t s);
+// prefill MoE combine over sorted down rows: y[t] = sum_e w[t][e] * down[kpos[t][e]]
+void moe_combine_sorted(const float* down, const float* w, const int* kpos, float* y, int T, int nexp, hipStream_t s);
 // MTP input rows: xq [T*4][5120] = [rmsnorm(e)*enorm | rmsnorm(h, over the whole 10240 row)*hnorm, stream s] (eh_proj input)
 void mtp_prep(const float* e, const float* enorm, const float* h, const float* hnorm, XQ8 xq, int T, float eps, hipStream_t s);
 // MoE routing: logits [T][512] f32 -> softmax -> top-10 ids [T][10] and renormalised weights [T][10]
@@ -43,6 +48,7 @@ void moe_gemv(WFmt fmt, WFmt shared_fmt, const MoeSegs& a, int nseg, const int* 
 // h[t][e][640] = silu(g)*u from the fused gate|up output y [T][10][2*640]? (we run gate and up as two
 // segments) -> quantised rows into xq (row index t*10+e)
 void moe_silu_quant(const float* gate, const float* up, XQ8 xq, int rows, int n, hipStream_t s);
+void moe_silu_bf16(const float* gate, const float* up, uint16_t* out, int rows, int n, hipStream_t s);   // bf16 rows [rows][n]
 
 // PLE gate + conv: emb rows gathered on the host. key [T][10240] (W_key . emb), value [T][2560],
 // R [T][4][2560] (the wide residual, updated in place), conv state [9][10240] per sequence.

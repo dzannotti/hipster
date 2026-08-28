@@ -19,6 +19,8 @@ __device__ __forceinline__ void wave_quant32(float v, int8_t* __restrict__ q, fl
     q[sb * 32 + lane] = (int8_t)qi;
     if (lane == 0) { d[sb] = dd; s[sb] = dd * sum; }
 }
+__device__ __forceinline__ uint16_t f2bf(float f) { uint32_t u = __float_as_uint(f); u += 0x7FFFu + ((u >> 16) & 1); return (uint16_t)(u >> 16); }
+__device__ __forceinline__ float bf2f(uint16_t b) { return __uint_as_float((uint32_t)b << 16); }
 __device__ __forceinline__ float wave_sum(float v) {
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor(v, o, 32);
@@ -71,7 +73,8 @@ __global__ void __launch_bounds__(256) k_hc_norm(HcNormArgs a, float eps) {
         const float v = r[i] * sc * a.w_norm[s * E + i];
         const size_t oi = ((size_t)t * HC + s) * E + i;
         a.xn[oi] = v;
-        wave_quant32(v, a.q, a.qd, a.qs, (int)(oi / 32), lane);
+        if (a.xb) a.xb[oi] = f2bf(v);
+        if (a.q) wave_quant32(v, a.q, a.qd, a.qs, (int)(oi / 32), lane);
     }
 }
 // lo = sum over the ksplit partials (fixed order) -> silu(lo/4) -> quantised 320-wide rows
@@ -83,10 +86,15 @@ __global__ void k_hc_silu_quant(const float* __restrict__ part, int ksplit, int8
     for (int ks = 0; ks < ksplit; ++ks) v += part[((size_t)t * ksplit + ks) * 320 + i];
     wave_quant32(silu(v * 0.25f), q, qd, qs, sb, lane);
 }
+// prefill: lo bf16 [T][320] (GEMM output) -> silu(lo/4) -> bf16 [T][320]
+__global__ void k_hc_silu_bf16(const uint16_t* __restrict__ lo, uint16_t* __restrict__ out, int n) {
+    const int i = blockIdx.x * 256 + threadIdx.x; if (i < n) out[i] = f2bf(silu(bf2f(lo[i]) * 0.25f));
+}
 // hc_mix: block per (t, 128 dims): 4 waves; 20 blocks per token. inject written as per-block partials
 // [T][INJ_PART][4] (summed by the consumer) instead of contended atomics (4 addresses: 13 us).
-__global__ void __launch_bounds__(128) k_hc_mix(const float* __restrict__ xn, const float* __restrict__ up, const float* __restrict__ w_inj,
-                                                float* __restrict__ mixed, float* __restrict__ inject, int8_t* __restrict__ q, float* __restrict__ qd, float* __restrict__ qs) {
+template <typename UP>
+__global__ void __launch_bounds__(128) k_hc_mix(const float* __restrict__ xn, const UP* __restrict__ up, const float* __restrict__ w_inj,
+                                                float* __restrict__ mixed, float* __restrict__ inject, int8_t* __restrict__ q, float* __restrict__ qd, float* __restrict__ qs, uint16_t* __restrict__ xb) {
     __shared__ float sh[4][HC];
     const int t = blockIdx.x / INJ_PART, b = blockIdx.x % INJ_PART;
     const int wave = threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -94,7 +102,7 @@ __global__ void __launch_bounds__(128) k_hc_mix(const float* __restrict__ xn, co
     float acc = 0.f, inj[HC] = {0.f, 0.f, 0.f, 0.f};
     float x[HC], g[HC];
 #pragma unroll
-    for (int s = 0; s < HC; ++s) { const size_t i = ((size_t)t * HC + s) * E + d; x[s] = xn[i]; g[s] = up[i]; }
+    for (int s = 0; s < HC; ++s) { const size_t i = ((size_t)t * HC + s) * E + d; x[s] = xn[i]; if constexpr (sizeof(UP) == 2) g[s] = bf2f(up[i]); else g[s] = up[i]; }
 #pragma unroll
     for (int s = 0; s < HC; ++s) {
         acc += x[s] * sigmoid(g[s]);
@@ -105,7 +113,8 @@ __global__ void __launch_bounds__(128) k_hc_mix(const float* __restrict__ xn, co
     }
     const float m = acc * 0.25f;
     mixed[(size_t)t * E + d] = m;
-    wave_quant32(m, q, qd, qs, t * (E / 32) + b * 4 + wave, lane);
+    if (xb) xb[(size_t)t * E + d] = f2bf(m);
+    if (q) wave_quant32(m, q, qd, qs, t * (E / 32) + b * 4 + wave, lane);
     if (inject) {
 #pragma unroll
         for (int n = 0; n < HC; ++n) { const float v = wave_sum(inj[n]); if (lane == 0) sh[wave][n] = v; }
@@ -126,6 +135,13 @@ __global__ void k_init_wide(const float* __restrict__ x, float* __restrict__ R) 
     for (int i = threadIdx.x; i < E; i += 256) R[((size_t)t * HC + s) * E + i] = x[(size_t)t * E + i];
 }
 
+// prefill MoE combine: y[t][d] = sum_e w[t*nexp+e] * down[kpos[t*nexp+e]][d] (sorted-position rows, slot order: deterministic)
+__global__ void k_moe_combine_sorted(const float* __restrict__ down, const float* __restrict__ w, const int* __restrict__ kpos, float* __restrict__ y, int nexp) {
+    const int t = blockIdx.x / (E / 256), d = (blockIdx.x % (E / 256)) * 256 + threadIdx.x;
+    float acc = 0.f;
+    for (int e = 0; e < nexp; ++e) { const int te = t * nexp + e; acc += w[te] * down[(size_t)kpos[te] * E + d]; }
+    y[(size_t)t * E + d] = acc;
+}
 // ---- MTP input: block per token. e_norm = rmsnorm(e[2560])*enorm; h_norm = rmsnorm(h[10240], whole row)*hnorm;
 // per stream s: xq row t*4+s = [e_norm | h_norm[s*2560..]] (5120), quantised (input of eh_proj) ----
 __global__ void __launch_bounds__(256) k_mtp_prep(const float* __restrict__ e, const float* __restrict__ enorm, const float* __restrict__ h,
@@ -198,6 +214,9 @@ __global__ void __launch_bounds__(512) k_moe_route(const float* __restrict__ log
         if (lane < nexp) w[t * (nexp + 1) + lane] /= wsum;
         if (lane == 0) { ids[t * (nexp + 1) + nexp] = -1; w[t * (nexp + 1) + nexp] = sigmoid(logits[t * 513 + 512]); }   // shared expert slot
     }
+}
+__global__ void k_moe_silu_bf16(const float* __restrict__ g, const float* __restrict__ u, uint16_t* __restrict__ out, int total) {
+    const int i = blockIdx.x * 256 + threadIdx.x; if (i < total) out[i] = f2bf(silu(g[i]) * u[i]);
 }
 __global__ void k_moe_silu_quant(const float* __restrict__ g, const float* __restrict__ u, int8_t* __restrict__ q, float* __restrict__ qd, float* __restrict__ qs, int total) {
     const int sb = blockIdx.x * 8 + threadIdx.x / 32, lane = threadIdx.x % 32;
@@ -275,12 +294,21 @@ void embed_q8_0(const void* W, const int* toks, int T, float* out, int n, hipStr
 void hc_combine(float* R, const float* y, const float* inject, int T, hipStream_t s) { k_hc_combine<<<T * HC, 256, 0, s>>>(R, y, inject); }
 void init_wide(const float* x, float* R, int T, hipStream_t s) { k_init_wide<<<T * HC, 256, 0, s>>>(x, R); }
 void hc_norm(const HcNormArgs& a0, XQ8 xq, int T, float eps, hipStream_t s) {
-    HcNormArgs a = a0; a.q = xq.q; a.qd = xq.d; a.qs = xq.s;
+    HcNormArgs a = a0; a.q = xq.q; a.qd = xq.d; a.qs = xq.s;   // xq.q may be null (prefill: bf16 only)
     k_hc_norm<<<T * HC, 256, 0, s>>>(a, eps);
 }
 void hc_silu_quant(const float* part, int ksplit, XQ8 xq, int T, hipStream_t s) { k_hc_silu_quant<<<(T * 10 + 7) / 8, 256, 0, s>>>(part, ksplit, xq.q, xq.d, xq.s, T); }
 void hc_mix(const float* xn, const float* up, const float* w_inject, float* mixed, float* inject, XQ8 xq, int T, hipStream_t s) {
-    k_hc_mix<<<T * INJ_PART, 128, 0, s>>>(xn, up, w_inject, mixed, inject, xq.q, xq.d, xq.s);
+    k_hc_mix<float><<<T * INJ_PART, 128, 0, s>>>(xn, up, w_inject, mixed, inject, xq.q, xq.d, xq.s, nullptr);
+}
+
+void hc_mix_bf16(const float* xn, const uint16_t* up, const float* w_inject, float* mixed, float* inject, XQ8 xq, uint16_t* xb, int T, hipStream_t s) {
+    k_hc_mix<uint16_t><<<T * INJ_PART, 128, 0, s>>>(xn, up, w_inject, mixed, inject, xq.q, xq.d, xq.s, xb);
+}
+void hc_silu_bf16(const uint16_t* lo, uint16_t* out, int T, hipStream_t s) { k_hc_silu_bf16<<<(T * 320 + 255) / 256, 256, 0, s>>>(lo, out, T * 320);
+}
+void moe_combine_sorted(const float* down, const float* w, const int* kpos, float* y, int T, int nexp, hipStream_t s) {
+    k_moe_combine_sorted<<<T * (E / 256), 256, 0, s>>>(down, w, kpos, y, nexp);
 }
 void mtp_prep(const float* e, const float* enorm, const float* h, const float* hnorm, XQ8 xq, int T, float eps, hipStream_t s) {
     k_mtp_prep<<<T, 256, 0, s>>>(e, enorm, h, hnorm, xq.q, xq.d, xq.s, eps);
@@ -289,6 +317,7 @@ void moe_route(const float* logits, int* ids, float* w, int T, hipStream_t s) { 
 void moe_gemv(WFmt fmt, WFmt shared_fmt, const MoeSegs& a, int nseg, const int* ids, int nexp, XQ8 xq, int N, int K, int T, hipStream_t s) {
     hip::gemv_moe(fmt, shared_fmt, a, nseg, ids, nexp, xq, N, K, T, K == 640, s);   // down-proj (K = 640) reads per-(t,e) rows
 }
+void moe_silu_bf16(const float* gate, const float* up, uint16_t* out, int rows, int n, hipStream_t s) { k_moe_silu_bf16<<<(rows * n + 255) / 256, 256, 0, s>>>(gate, up, out, rows * n); }
 void moe_silu_quant(const float* gate, const float* up, XQ8 xq, int rows, int n, hipStream_t s) { k_moe_silu_quant<<<(rows * n / 32 + 7) / 8, 256, 0, s>>>(gate, up, xq.q, xq.d, xq.s, rows * n); }
 void ple_apply(float* R, const float* key, const float* value, const float* w_key, const float* w_query, const float* w_conv_norm,
                const float* conv_w, float* conv_state, int T, float eps, hipStream_t s) {

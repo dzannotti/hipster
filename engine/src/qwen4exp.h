@@ -5,9 +5,12 @@
 #include "gguf.h"
 #include "../kernels/gemv.h"
 #include "../kernels/ops.h"
+#include "../kernels/gemm.h"
 #include <hip/hip_runtime.h>
 #include <string>
 #include <vector>
+#include <set>
+#include <map>
 
 namespace hip {
 
@@ -44,12 +47,16 @@ struct FnLayer {
 struct FnMtp { FnLayer L; FnLin eh_proj; float *enorm, *hnorm; };   // blk.48: nextn.* + one attention layer (dense here) + MoE + hc
 
 // One sequence's contribution to a pass: T tokens (continuing that slot's sequence) at positions pos..pos+T-1.
+void prefill_timing_report(double tokens);   // HIPSTER_TIMING=1: per-phase GPU ms accumulated over prefill() calls (stderr), then reset
 struct SlotReq { int slot; const int* tokens; int T; int pos; };
 
 class Qwen4Exp {
 public:
     static constexpr int MAXR = 32, MAXS = 8;   // rows per pass, slots per pass
-    explicit Qwen4Exp(const std::string& gguf_path, int max_ctx = 8192, int n_slots = 1);
+    explicit Qwen4Exp(const std::string& gguf_path, int max_ctx = 8192, int n_slots = 1, int max_prefill = 0);
+    // Prefill (slot 0): T tokens (<= max_prefill) at positions pos0.. through the GEMM path (bf16 activations,
+    // hipBLASLt); logits for the LAST row only in logits(); state committed (no accept). h_nextn() = the last row.
+    float prefill(const int* tokens, int T, int pos0);
     // A pass over S slots (rows = sum of T, <= MAXR, in request order). Logits [rows][n_vocab] on device.
     // Commit per slot with accept(slot, m): m == T swaps that slot's state buffers, m < T replays the recurrent
     // state (GDN, conv, PLE conv history) for the first m tokens from the saved inputs.
@@ -65,6 +72,8 @@ public:
     bool has_mtp() const { return has_mtp_; }
     double ple_host_ms() const { return ple_host_ms_; }   // host time spent hashing + gathering n-gram rows from the mmap (SSD)
     double gpu_ms() const { return gpu_ms_; }             // accumulated forward() GPU time
+    void dbg_report() const;                              // HIPSTER_DBG_LAYERS: prefill vs decode activation diffs (stderr)
+    void dbg_arm(bool on) { dbg_armed_ = on; }            // decode-side captures only while armed
     const float* h_nextn() const { return R_; }        // [T][4][2560] after the last combine
     const float* mtp_h() const { return R_mtp_; }
     const float* mtp_logits() const { return mlogits_; }
@@ -90,6 +99,10 @@ private:
     void ple(const SlotReq* reqs, int S, const int* r0s, int rows);
     void attn_layer_b(const FnLayer& L, int rows, const RowBatch& rb, uint16_t* kc, uint16_t* vc, size_t kvs, size_t kvts);
     void gemv_cols(WFmt fmt, const void* w, int N, int K, int tpr, float* y, int ncol);
+    void ple_rows(const std::vector<int>& hist, const int* tokens, int T, float* emb_out);   // host hash + gather -> emb_out [T][2560]
+    void lin_gemm(const GemvSeg* segs, int n, int M, const uint16_t* A);                      // dequant segments -> one GEMM -> gout_ bf16 [M][sum N]
+    void gemm_seg(int Nt, int off, int N, float* dst, int M);
+    void hc_read_pf(const FnLayer& L, bool ffn, int T, const Pending& p, float* inject_out);
 
     GGUF* gguf_ = nullptr;             // kept open: the n-gram table is read from the mmap on demand
     const GTensor* ple_table_ = nullptr;
@@ -110,6 +123,13 @@ private:
     float *rlogits_, *rw_, *eg_, *eu_, *ymoe_, *shx_, *sg_; int* eid_;
     int* d_tok_; XQ8 xq_; int* d_ids_; float* d_vals_;
     hipStream_t s_; hipEvent_t ev0_, ev1_;
+    // prefill (GEMM path) buffers, allocated when max_prefill > 0
+    int max_prefill_ = 0; BlasLt blas_;
+    uint16_t *xb_ = nullptr, *xb2_, *gout_, *wscratch_;
+    float *pR_, *pxn_, *pmixed_, *py_, *pymoe_, *pqkv_, *pqkvc_, *pz_, *pba_, *pqn_, *praw_, *pao_, *pq_, *pk_, *pv_, *prl_, *prw_, *peg_, *peu_, *pinj_, *pinj2_, *pkey_, *pval_, *pemb_;
+    int *peid_, *pd_tok_, *d_kpos_, *d_rowtok_; MoeTile* d_tiles_; float* pdown_; uint16_t* pxs_; XQ8 pxq_;
+    std::set<int> dbg_layers_; std::map<int, std::vector<float>> dbg_pf_, dbg_dec_; bool dbg_armed_ = false;
+    void dbg_capture(int il, const float* y, const float* ymoe, bool pf); void dbg_capture_mix(int il, const float* mixed, bool pf);
     size_t weight_bytes_ = 0; std::string report_; double ple_host_ms_ = 0, gpu_ms_ = 0;
 };
 

@@ -33,7 +33,16 @@ void gemv_multi(const GemvSeg* segs, int nseg, XQ8 x, int ncol, hipStream_t s); 
 struct MoeSegs { const void* w[2]; const void* shared[2]; float* y[2]; size_t ebytes; const float* slotw = nullptr; };
 void gemv_moe(WFmt f, WFmt shared_fmt, const MoeSegs& a, int nseg, const int* ids, int nexp, XQ8 x, int N, int K, int T, bool xrow_te, hipStream_t s);
 // split-K GEMV for skinny weights (N small, K long): partial sums part[ncol][ksplit][N], summed by the consumer in a fixed order
-extern int g_moe_tpr;   // bench knob: force lanes/row in gemv_moe (0 = policy)
+// MoE grouped GEMM (prefill): slots sorted by expert into tiles of <= 16 columns; x columns at rows rowtab[k] (or k);
+// y[k][N]. expert < 0 in a tile selects the shared matrix Wsh (Q8_0). Weights decoded to iu8 WMMA fragments.
+struct MoeTile { int expert, k0, ncols; };
+void moe_gemm(WFmt f, WFmt fs, const void* W, const void* Wsh, size_t ebytes, const MoeTile* tiles, int ntiles, const MoeTile* stiles, int nstiles, int ct,
+              const int* rowtab, XQ8 x, float* y, int N, int K, hipStream_t s);   // routed tiles + shared-expert tiles (separate launches, one format each); ct = 16-column tiles per block
+// bf16 variant: x rows bf16 (stride K), scales folded into the weight fragments, f32 WMMA accumulate (no fix-ups)
+void moe_gemm_bf16(WFmt f, WFmt fs, const void* W, const void* Wsh, size_t ebytes, const MoeTile* tiles, int ntiles, const MoeTile* stiles, int nstiles, int ct,
+                   const int* rowtab, const uint16_t* xb, float* y, int N, int K, hipStream_t s);
+extern int g_moe_tpr;
+extern int g_moe_fake;   // bench knob: bf16 MoE GEMM with constant weight fragments (WMMA + LDS floor)   // bench knob: force lanes/row in gemv_moe (0 = policy)
 void gemv_splitk(WFmt f, const void* W, XQ8 x, float* part, int N, int K, int ksplit, int ncol, hipStream_t s);
 // f32-x baseline, Q4_K only (kept for the record).
 void gemv_q4_K_f32(const void* W, const float* x, float* y, int N, int K, int ncol, int tpr, hipStream_t s);

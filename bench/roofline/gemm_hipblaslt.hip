@@ -1,3 +1,6 @@
+#include <cstring>
+#include <cstdlib>
+#include <vector>
 // hipBLASLt f16 GEMM roof: D[M,N] = A[M,K] * B[N,K]^T, heuristic best algo
 #include <hip/hip_runtime.h>
 #include <hipblaslt/hipblaslt.h>
@@ -5,12 +8,19 @@
 #include <cstdlib>
 #include <vector>
 #define CK(x) do{ auto e=(x); if(e!=HIPBLAS_STATUS_SUCCESS){printf("hipblaslt err %d line %d\n",(int)e,__LINE__); return 1;} }while(0)
+#include <random>
+static void fill_random(void* d, size_t n, hipDataType t) {   // env RANDOM=1: real data (uninitialised buffers are zeros: data-dependent power skews clocks)
+    std::vector<uint16_t> h(n); std::mt19937 rng(1); std::normal_distribution<float> nd(0.f, 1.f);
+    for (size_t i = 0; i < n; ++i) { float f = nd(rng); uint32_t u; memcpy(&u, &f, 4); h[i] = t == HIP_R_16BF ? (uint16_t)(u >> 16) : (uint16_t)0x3C00; }
+    hipMemcpy(d, h.data(), n * 2, hipMemcpyHostToDevice);
+}
 int main(int argc, char** argv) {
     int M = argc>1?atoi(argv[1]):2048, K = argc>2?atoi(argv[2]):5120, N = argc>3?atoi(argv[3]):17408;
     hipDataType tin = HIP_R_16F; if (argc>4 && argv[4][0]=='b') tin = HIP_R_16BF;
     hipDataType tout = tin; if (argc>5 && argv[5][0]=='f') tout = HIP_R_32F;
     void *A,*B,*D; hipMalloc(&A,(size_t)M*K*2); hipMalloc(&B,(size_t)N*K*2); hipMalloc(&D,(size_t)M*N*4);
     hipMemset(A,0,(size_t)M*K*2); hipMemset(B,0,(size_t)N*K*2);
+    if (getenv("RANDOM")) { fill_random(A, (size_t)M*K, tin); fill_random(B, (size_t)N*K, tin); }
     void* ws; size_t wsz = 64<<20; hipMalloc(&ws, wsz);
     hipblasLtHandle_t h; CK(hipblasLtCreate(&h));
     hipblasLtMatmulDesc_t op; CK(hipblasLtMatmulDescCreate(&op, HIPBLAS_COMPUTE_32F, HIP_R_32F));

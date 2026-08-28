@@ -478,14 +478,14 @@ __device__ __forceinline__ f16x16_t ld_i8x16_scaled(const int8_t* p, float scale
     for (int i = 0; i < 16; ++i) r[i] = (_Float16)((float)q[i] * scale);
     return r;
 }
-template <bool I8>
+template <bool I8, int NKV>
 __global__ void __launch_bounds__(128) k_attn_prefill(const float* __restrict__ qf, const uint16_t* __restrict__ kc, const uint16_t* __restrict__ vc,
                                                       const int8_t* __restrict__ kc8, const uint16_t* __restrict__ ks, const int8_t* __restrict__ vc8, const uint16_t* __restrict__ vs,
                                                       int T, int pos0, int max_ctx, uint16_t* __restrict__ out) {
     constexpr int HD = 256, BQ = 64, BK = 32, NW = 4;
     __shared__ __align__(16) uint16_t sQ[BQ][HD];        // 32 KB
     __shared__ __align__(16) uint16_t sP[NW][16][BK];    // 4 KB
-    const int h = blockIdx.x % 24, qt = blockIdx.x / 24, kh = h / 6;
+    const int h = blockIdx.x % 24, qt = blockIdx.x / 24, kh = h / (24 / NKV);
     const int wave = threadIdx.x / 32, lane = threadIdx.x % 32, r16 = lane % 16, half = lane / 16;
     const int q0 = qt * BQ, cp = max_ctx + 128;
     const uint16_t* K = kc + (size_t)kh * max_ctx * HD; const uint16_t* Vt = vc + (size_t)kh * HD * cp;
@@ -801,10 +801,18 @@ void attn_stage1_i8(float* q_full, float* k, const float* v, int T, const float*
     k_qk_norm_rope_kv<24, 4, true><<<28 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, pos0, nullptr, nullptr, max_ctx, eps, c.k, c.ks, c.v, c.vs, RowBatch{}, 0, 0);
 }
 void attn_prefill(const float* q_full, const uint16_t* kc, const uint16_t* vc, int T, int pos0, int max_ctx, uint16_t* out_bf16, hipStream_t s) {
-    k_attn_prefill<false><<<24 * ((T + 63) / 64), 128, 0, s>>>(q_full, kc, vc, nullptr, nullptr, nullptr, nullptr, T, pos0, max_ctx, out_bf16);
+    k_attn_prefill<false, 4><<<24 * ((T + 63) / 64), 128, 0, s>>>(q_full, kc, vc, nullptr, nullptr, nullptr, nullptr, T, pos0, max_ctx, out_bf16);
 }
 void attn_prefill_i8(const float* q_full, const KV8& c, int T, int pos0, int max_ctx, uint16_t* out_bf16, hipStream_t s) {
-    k_attn_prefill<true><<<24 * ((T + 63) / 64), 128, 0, s>>>(q_full, nullptr, nullptr, c.k, c.ks, c.v, c.vs, T, pos0, max_ctx, out_bf16);
+    k_attn_prefill<true, 4><<<24 * ((T + 63) / 64), 128, 0, s>>>(q_full, nullptr, nullptr, c.k, c.ks, c.v, c.vs, T, pos0, max_ctx, out_bf16);
+}
+// Flash-Next prefill: 24 q / 2 kv heads
+void attn_stage1_24_2(float* q_full, float* k, const float* v, int T, const float* q_norm_w, const float* k_norm_w, float rope_base, int pos0,
+                      uint16_t* kc, uint16_t* vc, int max_ctx, float eps, hipStream_t s) {
+    k_qk_norm_rope_kv<24, 2, false><<<26 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, pos0, kc, vc, max_ctx, eps, nullptr, nullptr, nullptr, nullptr, RowBatch{}, 0, 0);
+}
+void attn_prefill_24_2(const float* q_full, const uint16_t* kc, const uint16_t* vc, int T, int pos0, int max_ctx, uint16_t* out_bf16, hipStream_t s) {
+    k_attn_prefill<false, 2><<<24 * ((T + 63) / 64), 128, 0, s>>>(q_full, kc, vc, nullptr, nullptr, nullptr, nullptr, T, pos0, max_ctx, out_bf16);
 }
 void argmax_topk(const float* logits, int T, int n, int k, int* out_ids, float* out_vals, hipStream_t s) { k_topk<<<T, 1024, 0, s>>>(logits, n, k, out_ids, out_vals); }
 

@@ -1,5 +1,7 @@
 # AMD HRX ("hipx") — ROCm/hrx-system + llama.cpp discussion #27219 (investigated 2026-08-27)
 
+Measured follow-up (2026-08-28): `amd-hrx-bench.md` — HRX dispatches at the same ~1.85 µs/packet AQL floor as a HIP graph, 0.7–1.0 µs slower than HIP on real kernels at the commit AMD pins; PM4 not reachable. Not adopted.
+
 Note: there is no "hipx"; the project is **HRX = Hip Runtime Extended** (`ROCm/hrx-system`, HEAD 1425d394).
 [V] = verified in code by the agent, [C] = claimed by AMD, unverified. Nothing was run (no numbers exist anywhere).
 

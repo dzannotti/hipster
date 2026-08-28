@@ -74,6 +74,15 @@ __global__ void k_dequant_bf16(const uint8_t* __restrict__ W, uint16_t* __restri
     uint4 pk; pk.x = v[0] | ((uint32_t)v[1] << 16); pk.y = v[2] | ((uint32_t)v[3] << 16); pk.z = v[4] | ((uint32_t)v[5] << 16); pk.w = v[6] | ((uint32_t)v[7] << 16);
     *(uint4*)(out + (size_t)row * K + b * 256 + e0) = pk;
 }
+template <WFmt F>
+__global__ void k_dequant_f32(const uint8_t* __restrict__ W, float* __restrict__ out, int N, int K) {
+    const int nb = K / 256;
+    const size_t gb = (size_t)blockIdx.x * 8 + threadIdx.x / 32;
+    if (gb >= (size_t)N * nb) return;
+    const int row = (int)(gb / nb), b = (int)(gb % nb), e0 = 8 * (threadIdx.x % 32);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) out[(size_t)row * K + b * 256 + e0 + i] = dq_elem<F>(W, row, b, e0 + i, nb, K);
+}
 // rows m < M of a [M][Nt] bf16 matrix, columns off..off+N -> f32 [M][N]
 __global__ void k_bf16_to_f32_seg(const uint16_t* __restrict__ x, int Nt, int off, int N, float* __restrict__ o, int M) {
     const size_t i = (size_t)blockIdx.x * 256 + threadIdx.x; if (i >= (size_t)M * N) return;
@@ -93,6 +102,16 @@ __global__ void k_f32_to_bf16(const float* __restrict__ x, uint16_t* __restrict_
 void bf16_to_f32_seg2(const uint16_t* x, const uint16_t* x2, int Nt, int off, int N, float* out, int M, hipStream_t s) { k_bf16_to_f32_seg2<<<(unsigned)(((size_t)M * N + 255) / 256), 256, 0, s>>>(x, x2, Nt, off, N, out, M); }
 void bf16_to_f32_seg(const uint16_t* x, int Nt, int off, int N, float* out, int M, hipStream_t s) { k_bf16_to_f32_seg<<<(unsigned)(((size_t)M * N + 255) / 256), 256, 0, s>>>(x, Nt, off, N, out, M); }
 void bf16_to_f32(const uint16_t* x, float* out, size_t n, hipStream_t s) { k_bf16_to_f32<<<(unsigned)((n + 255) / 256), 256, 0, s>>>(x, out, n); }
+void dequant_f32(WFmt f, const void* W, float* out, int N, int K, hipStream_t s) {
+    const int grid = (int)(((size_t)N * (K / 256) + 7) / 8);
+    switch (f) {
+        case WFmt::Q4_K: k_dequant_f32<WFmt::Q4_K><<<grid, 256, 0, s>>>((const uint8_t*)W, out, N, K); break;
+        case WFmt::Q6_K_SOA: k_dequant_f32<WFmt::Q6_K_SOA><<<grid, 256, 0, s>>>((const uint8_t*)W, out, N, K); break;
+        case WFmt::Q5_1_SOA: k_dequant_f32<WFmt::Q5_1_SOA><<<grid, 256, 0, s>>>((const uint8_t*)W, out, N, K); break;
+        case WFmt::Q5_K: k_dequant_f32<WFmt::Q5_K><<<grid, 256, 0, s>>>((const uint8_t*)W, out, N, K); break;
+        default: k_dequant_f32<WFmt::Q8_0_SOA><<<grid, 256, 0, s>>>((const uint8_t*)W, out, N, K); break;
+    }
+}
 void dequant_bf16(WFmt f, const void* W, uint16_t* out, int N, int K, hipStream_t s) {
     const int grid = (N * (K / 256) + 7) / 8;
     switch (f) {
@@ -101,18 +120,19 @@ void dequant_bf16(WFmt f, const void* W, uint16_t* out, int N, int K, hipStream_
         case WFmt::IQ4_XS: k_dequant_bf16<WFmt::IQ4_XS><<<grid, 256, 0, s>>>((const uint8_t*)W, out, N, K); break;
         case WFmt::Q6_K_SOA: k_dequant_bf16<WFmt::Q6_K_SOA><<<grid, 256, 0, s>>>((const uint8_t*)W, out, N, K); break;
         case WFmt::Q5_1_SOA: k_dequant_bf16<WFmt::Q5_1_SOA><<<grid, 256, 0, s>>>((const uint8_t*)W, out, N, K); break;
+        case WFmt::Q8_0_SOA: k_dequant_bf16<WFmt::Q8_0_SOA><<<grid, 256, 0, s>>>((const uint8_t*)W, out, N, K); break;
         default: k_dequant_bf16<WFmt::Q8_0_SOA><<<grid, 256, 0, s>>>((const uint8_t*)W, out, N, K); break;
     }
 }
 void f32_to_bf16(const float* x, uint16_t* out, size_t n, hipStream_t s) { k_f32_to_bf16<<<(unsigned)((n + 255) / 256), 256, 0, s>>>(x, out, n); }
 
 struct BlasLt::Impl {
-    hipblasLtHandle_t h; void* ws; size_t wsz = 64u << 20;
+    hipblasLtHandle_t h; void* ws; size_t wsz = 64u << 20; void* flush = nullptr;   // 64 MB scratch: evicts L2 + MALL between autotune reps
     hipblasLtMatmulDesc_t op; hipblasLtMatmulPreference_t pref;
     std::map<std::tuple<int, int, int>, hipblasLtMatmulAlgo_t> algos;
 };
 BlasLt::BlasLt() : p_(new Impl) {
-    CKB(hipblasLtCreate(&p_->h)); hipMalloc(&p_->ws, p_->wsz);
+    CKB(hipblasLtCreate(&p_->h)); hipMalloc(&p_->ws, p_->wsz); hipMalloc(&p_->flush, 64u << 20);
     CKB(hipblasLtMatmulDescCreate(&p_->op, HIPBLAS_COMPUTE_32F, HIP_R_32F));
     hipblasOperation_t ta = HIPBLAS_OP_T, tb = HIPBLAS_OP_N;
     CKB(hipblasLtMatmulDescSetAttribute(p_->op, HIPBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof ta));
@@ -141,9 +161,48 @@ void BlasLt::gemm_ld(const uint16_t* A, int lda, const uint16_t* W, int ldw, uin
         float best = 1e30f; int bi = 0;
         for (int i = 0; i < n; ++i) {
             if (hipblasLtMatmul(p_->h, p_->op, &alpha, W, la, A, lb, &beta, D, ld, D, ld, &res[i].algo, p_->ws, p_->wsz, s) != HIPBLAS_STATUS_SUCCESS) continue;
-            hipEventRecord(e0, s); for (int r = 0; r < 3; ++r) hipblasLtMatmul(p_->h, p_->op, &alpha, W, la, A, lb, &beta, D, ld, D, ld, &res[i].algo, p_->ws, p_->wsz, s);
-            hipEventRecord(e1, s); hipEventSynchronize(e1); float ms; hipEventElapsedTime(&ms, e0, e1);
-            if (ms < best) { best = ms; bi = i; }
+            // time COLD: the engine always feeds freshly dequantised weights; warm-timed candidates picked algorithms that
+            // only perform from cache (measured 2-4x slower in the engine than in the warm autotune)
+            float tot = 0.f;
+            for (int r = 0; r < 2; ++r) {
+                hipMemsetAsync(p_->flush, r, 64u << 20, s);
+                hipEventRecord(e0, s); hipblasLtMatmul(p_->h, p_->op, &alpha, W, la, A, lb, &beta, D, ld, D, ld, &res[i].algo, p_->ws, p_->wsz, s);
+                hipEventRecord(e1, s); hipEventSynchronize(e1); float ms; hipEventElapsedTime(&ms, e0, e1); tot += ms;
+            }
+            if (tot < best) { best = tot; bi = i; }
+        }
+        hipEventDestroy(e0); hipEventDestroy(e1);
+        it = p_->algos.emplace(key, res[bi].algo).first;
+    }
+    CKB(hipblasLtMatmul(p_->h, p_->op, &alpha, W, la, A, lb, &beta, D, ld, D, ld, &it->second, p_->ws, p_->wsz, s));
+    hipblasLtMatrixLayoutDestroy(la); hipblasLtMatrixLayoutDestroy(lb); hipblasLtMatrixLayoutDestroy(ld);
+}
+// f32 in / f32 out (the MoE router: 513 x 2560, exact routing logits); same autotune, separate cache key
+void BlasLt::gemm_f32(const float* A, const float* W, float* D, int M, int N, int K, hipStream_t s) {
+    hipblasLtMatrixLayout_t la, lb, ld;
+    CKB(hipblasLtMatrixLayoutCreate(&la, HIP_R_32F, K, N, K));
+    CKB(hipblasLtMatrixLayoutCreate(&lb, HIP_R_32F, K, M, K));
+    CKB(hipblasLtMatrixLayoutCreate(&ld, HIP_R_32F, N, M, N));
+    auto key = std::make_tuple(M, N, K * 1000003 + 7);
+    const float alpha = 1.f, beta = 0.f;
+    auto it = p_->algos.find(key);
+    if (it == p_->algos.end()) {
+        hipblasLtMatmulHeuristicResult_t res[16]; int n = 0;
+        CKB(hipblasLtMatmulAlgoGetHeuristic(p_->h, p_->op, la, lb, ld, ld, p_->pref, 16, res, &n));
+        if (!n) throw std::runtime_error("hipblaslt: no f32 algo");
+        hipEvent_t e0, e1; hipEventCreate(&e0); hipEventCreate(&e1);
+        float best = 1e30f; int bi = 0;
+        for (int i = 0; i < n; ++i) {
+            if (hipblasLtMatmul(p_->h, p_->op, &alpha, W, la, A, lb, &beta, D, ld, D, ld, &res[i].algo, p_->ws, p_->wsz, s) != HIPBLAS_STATUS_SUCCESS) continue;
+            // time COLD: the engine always feeds freshly dequantised weights; warm-timed candidates picked algorithms that
+            // only perform from cache (measured 2-4x slower in the engine than in the warm autotune)
+            float tot = 0.f;
+            for (int r = 0; r < 2; ++r) {
+                hipMemsetAsync(p_->flush, r, 64u << 20, s);
+                hipEventRecord(e0, s); hipblasLtMatmul(p_->h, p_->op, &alpha, W, la, A, lb, &beta, D, ld, D, ld, &res[i].algo, p_->ws, p_->wsz, s);
+                hipEventRecord(e1, s); hipEventSynchronize(e1); float ms; hipEventElapsedTime(&ms, e0, e1); tot += ms;
+            }
+            if (tot < best) { best = tot; bi = i; }
         }
         hipEventDestroy(e0); hipEventDestroy(e1);
         it = p_->algos.emplace(key, res[bi].algo).first;
