@@ -18,6 +18,7 @@
 namespace hip {
 
 static constexpr int KSPLIT = 8;   // split-K partials of the 320-row hc down GEMVs
+static int round_m(int M) { return (M + 127) / 128 * 128; }   // GEMM row counts padded to 128: a handful of hipBLASLt shapes (autotuned once)
 using D = FnDims;
 
 static int gdn_index(int il) { return il - (il + 1) / 4; }
@@ -498,7 +499,6 @@ void prefill_timing_report(double denom_tokens) {
     for (auto& kv : g_gemm_ms) if (kv.first.first % 8192 > 64) fprintf(stderr, "  gemm M=%d N=%5d K=%5d: %4d calls, avg %.3f ms, min %.3f ms (avg includes the first call's autotune)\n", kv.first.first % 8192, kv.first.first / 8192, kv.first.second / 10, kv.second.second, kv.second.first / kv.second.second, g_gemm_min[kv.first]);
     g_gemm_ms.clear(); g_gemm_min.clear();
 }
-static int round_m(int M) { return (M + 127) / 128 * 128; }   // GEMM row counts padded to 128: a handful of hipBLASLt shapes (autotuned once)
 void Qwen4Exp::lin_gemm(const GemvSeg* segs, int n, int M, const uint16_t* A) {
     M = round_m(M);
     int Nt = 0; const int K = segs[0].K;
