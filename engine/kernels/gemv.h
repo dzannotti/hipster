@@ -29,7 +29,9 @@ void gemv_multi(const GemvSeg* segs, int nseg, XQ8 x, int ncol, hipStream_t s); 
 // int8-WMMA GEMV for 1..8 columns: same cost for every ncol, every column reduced in the same order (T-invariant).
 // x must have 16 readable rows. Formats Q4_K/Q5_K/IQ4_XS/Q6_K_SOA/Q8_0_SOA, K % 256 == 0 (gemv_wmma_ok).
 bool gemv_wmma_ok(const GemvSeg* segs, int nseg);
-void gemv_wmma(const GemvSeg* segs, int nseg, XQ8 x, int ncol, int tiles, hipStream_t s);
+void gemv_wmma(const GemvSeg* segs, int nseg, XQ8 x, int ncol, int mode, hipStream_t s);   // mode: 0 auto | 1/2/4/8 split-K waves per tile | 3 interleaved layout
+size_t wmma_il_bytes(WFmt f, int N, int K);
+void repack_wmma_il(WFmt f, const uint8_t* src, uint8_t* dst, int N, int K);
 // MoE: for token t < T and slot e < nexp, y[g][(t*nexp+e)][N] = W[g][expert ids[t*nexp+e]] . x[row] for segment g < nseg
 // (gate|up share one launch). ids < 0 selects the shared-expert matrices `shared[g]`. xrow_te: x row = t*nexp+e (down) else t.
 // slotw: per-slot combine weights [T*nexp]; when set (down-projection), y[0][t][N] = sum_e slotw[te] * W_e . x[te], one

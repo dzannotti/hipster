@@ -446,6 +446,7 @@ __global__ void __launch_bounds__(256) k_gemv_q4_K_wmma(const uint8_t* __restric
 }
 
 
+__host__ __device__ constexpr int wfmt_block_bytes(WFmt f) { return f == WFmt::Q4_K ? 144 : f == WFmt::Q5_K ? 176 : f == WFmt::IQ4_XS ? 136 : f == WFmt::Q6_K_SOA ? 210 : f == WFmt::Q8_0_SOA ? 272 : 192; }
 struct SegDev { const uint8_t* w; float* y; int N, K, fmt, block0; };
 struct SegArgs { SegDev s[4]; int n; };
 // ======================= generic WMMA GEMV: every format, 1..8 columns, T-invariant =======================
@@ -459,6 +460,9 @@ struct WQ4K {
     __device__ __forceinline__ void load(const uint8_t* rp, int b, int) { const uint8_t* blk = rp + (size_t)b * 144;
 #pragma unroll
         for (int i = 0; i < 9; ++i) v[i] = ldw((const uint4*)blk + i); }
+    __device__ __forceinline__ void load_il(const uint8_t* g0, int r16, int b, int) { const uint8_t* blk = g0 + (size_t)b * (16 * 144) + r16 * 16;
+#pragma unroll
+        for (int i = 0; i < 9; ++i) v[i] = ldw((const uint4*)(blk + i * 256)); }
     __device__ __forceinline__ void sub(int sb, int32x4_t& A0, int32x4_t& A1, float& s0, float& s1, float& m) const {
         const int j = sb >> 1, h = sb & 1; const uint16_t* hdr = (const uint16_t*)&v[0];
         uint8_t sc0, mn0, sc1, mn1; q4k_scales((const uint8_t*)&v[0] + 4, 2 * j, sc0, mn0, sc1, mn1);
@@ -474,6 +478,9 @@ struct WQ5K {
     __device__ __forceinline__ void load(const uint8_t* rp, int b, int) { const uint8_t* blk = rp + (size_t)b * 176;
 #pragma unroll
         for (int i = 0; i < 11; ++i) v[i] = ldw((const uint4*)blk + i); }
+    __device__ __forceinline__ void load_il(const uint8_t* g0, int r16, int b, int) { const uint8_t* blk = g0 + (size_t)b * (16 * 176) + r16 * 16;
+#pragma unroll
+        for (int i = 0; i < 11; ++i) v[i] = ldw((const uint4*)(blk + i * 256)); }
     __device__ __forceinline__ void sub(int sb, int32x4_t& A0, int32x4_t& A1, float& s0, float& s1, float& m) const {
         const int j = sb >> 1, h = sb & 1; const uint16_t* hdr = (const uint16_t*)&v[0];
         uint8_t sc0, mn0, sc1, mn1; q4k_scales((const uint8_t*)&v[0] + 4, 2 * j, sc0, mn0, sc1, mn1);
@@ -492,6 +499,10 @@ struct WIQ4XS {
     __device__ __forceinline__ void load(const uint8_t* rp, int b, int) { const uint8_t* blk = rp + (size_t)b * 136; h = *(const uint2*)blk;
 #pragma unroll
         for (int i = 0; i < 8; ++i) v[i] = ldw((const uint4*)(blk + 8) + i); }
+    __device__ __forceinline__ void load_il(const uint8_t* g0, int r16, int b, int) { const uint8_t* blk = g0 + (size_t)b * (16 * 136) + r16 * 8;   // 8-byte chunks
+        h = *(const uint2*)blk;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) { const uint2 a = *(const uint2*)(blk + (1 + 2 * i) * 128), c = *(const uint2*)(blk + (2 + 2 * i) * 128); v[i] = make_uint4(a.x, a.y, c.x, c.y); } }
     __device__ __forceinline__ void sub(int sb, int32x4_t& A0, int32x4_t& A1, float& s0, float& s1, float& m) const {
         const uint32_t* qw = (const uint32_t*)v;
 #pragma unroll
@@ -510,6 +521,12 @@ struct WQ6K {   // row-SoA Q6_K (repack_row_q6_K): per-16 scales -> two int dots
 #pragma unroll
         for (int i = 0; i < 4; ++i) vh[i] = ldw((const uint4*)qh + i);
         vs = *(const uint4*)(rp + (size_t)nb * 192 + (size_t)b * 16); d = h2f(*((const uint16_t*)(rp + (size_t)nb * 208) + b)); }
+    __device__ __forceinline__ void load_il(const uint8_t* g0, int r16, int b, int) { const uint8_t* blk = g0 + (size_t)b * (16 * 210) + r16 * 16;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) vl[i] = ldw((const uint4*)(blk + i * 256));
+#pragma unroll
+        for (int i = 0; i < 4; ++i) vh[i] = ldw((const uint4*)(blk + 2048 + i * 256));
+        vs = *(const uint4*)(blk + 3072); d = h2f(*(const uint16_t*)(g0 + (size_t)b * (16 * 210) + 3328 + r16 * 2)); }
     __device__ __forceinline__ void sub(int sb, int32x4_t& A0, int32x4_t& A1, float& s0, float& s1, float& m) const {
         const int n = sb >> 2, k = sb & 3; const uint32_t* lw = (const uint32_t*)vl; const uint32_t* hw = (const uint32_t*)vh; const int8_t* s8 = (const int8_t*)&vs;
 #pragma unroll
@@ -524,10 +541,11 @@ struct WQ6K {   // row-SoA Q6_K (repack_row_q6_K): per-16 scales -> two int dots
 };
 struct WQ8_0 {   // row-SoA Q8_0 (repack_row_q8_0); K must be a multiple of 256. Loads per sub-block (no 64-VGPR block image).
     static constexpr bool SIGNED = true, MIN = false, HALF = false;
-    const uint8_t* q; uint4 dsc;
-    __device__ __forceinline__ void load(const uint8_t* rp, int b, int K) { q = rp + (size_t)b * 256; dsc = *(const uint4*)(rp + K + (size_t)b * 16); }
+    const uint8_t* q; uint4 dsc; int qstride = 16;
+    __device__ __forceinline__ void load(const uint8_t* rp, int b, int K) { q = rp + (size_t)b * 256; dsc = *(const uint4*)(rp + K + (size_t)b * 16); qstride = 16; }
+    __device__ __forceinline__ void load_il(const uint8_t* g0, int r16, int b, int) { q = g0 + (size_t)b * (16 * 272) + r16 * 16; dsc = *(const uint4*)(q + 4096); qstride = 256; }
     __device__ __forceinline__ void sub(int sb, int32x4_t& A0, int32x4_t& A1, float& s0, float& s1, float& m) const {
-        const uint4 v0 = ldw((const uint4*)q + 2 * sb), v1 = ldw((const uint4*)q + 2 * sb + 1);
+        const uint4 v0 = ldw((const uint4*)(q + (size_t)(2 * sb) * qstride)), v1 = ldw((const uint4*)(q + (size_t)(2 * sb + 1) * qstride));
         A0[0] = (int)v0.x; A0[1] = (int)v0.y; A0[2] = (int)v0.z; A0[3] = (int)v0.w; A1[0] = (int)v1.x; A1[1] = (int)v1.y; A1[2] = (int)v1.z; A1[3] = (int)v1.w;
         s0 = s1 = h2f(((const uint16_t*)&dsc)[sb]); m = 0.f;
     }
@@ -539,72 +557,80 @@ template <> struct WDec<WFmt::IQ4_XS> { using T = WIQ4XS; };
 template <> struct WDec<WFmt::Q6_K_SOA> { using T = WQ6K; };
 template <> struct WDec<WFmt::Q8_0_SOA> { using T = WQ8_0; };
 
-template <WFmt F, int TILES>
+// KS waves share one 16-row tile and split its 256-blocks (wave k takes blocks k, k+KS, ...); partials are reduced in
+// LDS in wave order (fixed order: deterministic and T-invariant). Block = 8 waves = 8/KS row tiles.
+template <WFmt F, int KS, bool IL>
 __global__ void __launch_bounds__(256) k_gemv_wmma(SegArgs a, const int8_t* __restrict__ xq, const float* __restrict__ xd, const float* __restrict__ xs, int ncol) {
     using Dec = typename WDec<F>::T;
-    constexpr int ROWS = 128 * TILES;
+    constexpr int TPB = 8 / KS, ROWS = 16 * TPB;   // row tiles per block
+    __shared__ float red[KS > 1 ? KS * TPB * 256 : 1];
     int si = 0;
 #pragma unroll
     for (int i = 1; i < 4; ++i) if (i < a.n && (int)blockIdx.x >= a.s[i].block0) si = i;
     const SegDev sg = a.s[si];
-    const int row_base = ((int)blockIdx.x - sg.block0) * ROWS + (threadIdx.x / 32) * (16 * TILES);
-    if (row_base >= sg.N) return;
+    const int wave = threadIdx.x / 32, tile = wave / KS, ks = wave % KS;
+    const int row_base = ((int)blockIdx.x - sg.block0) * ROWS + tile * 16;
     const uint8_t* __restrict__ W = sg.w; float* __restrict__ y = sg.y; const int N = sg.N, K = sg.K;
     const int lane = threadIdx.x % 32, r16 = lane % 16, half = lane / 16;
     const int nb = K / 256, nsb = K / 32;
-    float acc[TILES][8];
+    float acc[8];
 #pragma unroll
-    for (int t = 0; t < TILES; ++t)
-#pragma unroll
-        for (int l = 0; l < 8; ++l) acc[t][l] = 0.f;
-    const uint8_t* rp[TILES];
-#pragma unroll
-    for (int t = 0; t < TILES; ++t) rp[t] = row_ptr<F>(W, min(row_base + 16 * t + r16, N - 1), K);
-    for (int b = 0; b < nb; ++b) {
-        int32x4_t B[8][2];
-        const int8_t* xcol = xq + (size_t)r16 * K + b * 256;
-#pragma unroll
-        for (int sb = 0; sb < 8; ++sb) { B[sb][0] = *(const int32x4_t*)(xcol + sb * 32); B[sb][1] = *(const int32x4_t*)(xcol + sb * 32 + 16); }
-#pragma unroll
-        for (int t = 0; t < TILES; ++t) {
-            Dec dec; dec.load(rp[t], b, K);
+    for (int l = 0; l < 8; ++l) acc[l] = 0.f;
+    if (row_base < N) {
+        const uint8_t* rp = IL ? W + (size_t)(row_base / 16) * nb * (16 * wfmt_block_bytes(F)) : row_ptr<F>(W, min(row_base + r16, N - 1), K);
+        const int8_t* xcol = xq + (size_t)r16 * K;
+        Dec cur; if (ks < nb) { if constexpr (IL) cur.load_il(rp, r16, ks, K); else cur.load(rp, ks, K); }
+        for (int b = ks; b < nb; b += KS) {
+            Dec nxt;   // software pipeline: the next block's weights are in flight while this block is computed
+            if (b + KS < nb) { if constexpr (IL) nxt.load_il(rp, r16, b + KS, K); else nxt.load(rp, b + KS, K); }
 #pragma unroll
             for (int sb = 0; sb < 8; ++sb) {
-                int32x4_t A0, A1; float s0, s1, m; dec.sub(sb, A0, A1, s0, s1, m);
+                const int32x4_t B0 = *(const int32x4_t*)(xcol + b * 256 + sb * 32), B1 = *(const int32x4_t*)(xcol + b * 256 + sb * 32 + 16);
+                int32x4_t A0, A1; float s0, s1, m; cur.sub(sb, A0, A1, s0, s1, m);
                 int32x8_t C0 = {0, 0, 0, 0, 0, 0, 0, 0};
-                C0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, B[sb][0], Dec::SIGNED, A0, C0, false);
+                C0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, B0, Dec::SIGNED, A0, C0, false);
                 int32x8_t C1;
-                if constexpr (Dec::HALF) { C1 = {0, 0, 0, 0, 0, 0, 0, 0}; C1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, B[sb][1], Dec::SIGNED, A1, C1, false); }
-                else C0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, B[sb][1], Dec::SIGNED, A1, C0, false);
+                if constexpr (Dec::HALF) { C1 = {0, 0, 0, 0, 0, 0, 0, 0}; C1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, B1, Dec::SIGNED, A1, C1, false); }
+                else C0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, B1, Dec::SIGNED, A1, C0, false);
                 const int g = b * 8 + sb;
 #pragma unroll
-                for (int l = 0; l < 8; ++l) {
+                for (int l = 0; l < 8; ++l) if (2 * l < ncol) {   // columns >= ncol skipped (wave-uniform)
                     const int col = 2 * l + half; const float xdv = xd[(size_t)col * nsb + g];
                     float v = s0 * xdv * (float)C0[l];
                     if constexpr (Dec::HALF) v += s1 * xdv * (float)C1[l];
                     if constexpr (Dec::MIN) v -= m * xs[(size_t)col * nsb + g];
-                    acc[t][l] += v;
+                    acc[l] += v;
                 }
             }
+            cur = nxt;
         }
     }
+    if constexpr (KS > 1) {
+        float* mine = red + (size_t)wave * 256 + lane * 8;
 #pragma unroll
-    for (int t = 0; t < TILES; ++t) {
-        const int row = row_base + 16 * t + r16;
-        if (row < N) {
+        for (int l = 0; l < 8; ++l) mine[l] = acc[l];
+        __syncthreads();
+        if (ks != 0) return;
 #pragma unroll
-            for (int l = 0; l < 8; ++l) { const int col = 2 * l + half; if (col < ncol) y[(size_t)col * N + row] = acc[t][l]; }
-        }
+        for (int l = 0; l < 8; ++l) acc[l] = 0.f;
+        for (int k = 0; k < KS; ++k) { const float* part = red + (size_t)(tile * KS + k) * 256 + lane * 8;
+#pragma unroll
+            for (int l = 0; l < 8; ++l) acc[l] += part[l]; }
+    }
+    const int row = row_base + r16;
+    if (row < N) {
+#pragma unroll
+        for (int l = 0; l < 8; ++l) { const int col = 2 * l + half; if (col < ncol) y[(size_t)col * N + row] = acc[l]; }
     }
 }
-template <int TILES>
+template <int KS, bool IL>
 static void launch_wmma(WFmt f, const SegArgs& a, int blocks, const int8_t* xq, const float* xd, const float* xs, int nc, hipStream_t s) {
     switch (f) {
-        case WFmt::Q4_K:     k_gemv_wmma<WFmt::Q4_K, TILES><<<blocks, 256, 0, s>>>(a, xq, xd, xs, nc); break;
-        case WFmt::Q5_K:     k_gemv_wmma<WFmt::Q5_K, TILES><<<blocks, 256, 0, s>>>(a, xq, xd, xs, nc); break;
-        case WFmt::IQ4_XS:   k_gemv_wmma<WFmt::IQ4_XS, TILES><<<blocks, 256, 0, s>>>(a, xq, xd, xs, nc); break;
-        case WFmt::Q6_K_SOA: k_gemv_wmma<WFmt::Q6_K_SOA, TILES><<<blocks, 256, 0, s>>>(a, xq, xd, xs, nc); break;
-        default:             k_gemv_wmma<WFmt::Q8_0_SOA, TILES><<<blocks, 256, 0, s>>>(a, xq, xd, xs, nc); break;
+        case WFmt::Q4_K:     k_gemv_wmma<WFmt::Q4_K, KS, IL><<<blocks, 256, 0, s>>>(a, xq, xd, xs, nc); break;
+        case WFmt::Q5_K:     k_gemv_wmma<WFmt::Q5_K, KS, IL><<<blocks, 256, 0, s>>>(a, xq, xd, xs, nc); break;
+        case WFmt::IQ4_XS:   k_gemv_wmma<WFmt::IQ4_XS, KS, IL><<<blocks, 256, 0, s>>>(a, xq, xd, xs, nc); break;
+        case WFmt::Q6_K_SOA: k_gemv_wmma<WFmt::Q6_K_SOA, KS, IL><<<blocks, 256, 0, s>>>(a, xq, xd, xs, nc); break;
+        default:             k_gemv_wmma<WFmt::Q8_0_SOA, KS, IL><<<blocks, 256, 0, s>>>(a, xq, xd, xs, nc); break;
     }
 }
 
@@ -1071,18 +1097,54 @@ bool gemv_wmma_ok(const GemvSeg* segs, int nseg) {
     return true;
 }
 // one launch per run of same-format segments (the kernel is specialised per format)
-void gemv_wmma(const GemvSeg* segs, int nseg, XQ8 x, int ncol, int tiles, hipStream_t s) {
-    const int ROWS = 128 * tiles;
+// 16-row interleaved layout for the WMMA GEMV: rows grouped by 16; per group and 256-block, the block bytes of the 16
+// rows are stored chunk-major ([chunk][row][16 B], 8-byte chunks for IQ4_XS; Q6_K: [ql 8 chunks][qh 4][sc 1][d 16x2 B];
+// Q8_0: [q 16 chunks][d 16x16 B]) so one wave load instruction reads 256 contiguous bytes. N padded to 16 (zero rows).
+size_t wmma_il_bytes(WFmt f, int N, int K) { return (size_t)((N + 15) / 16) * (K / 256) * 16 * wfmt_block_bytes(f); }
+void repack_wmma_il(WFmt f, const uint8_t* src, uint8_t* dst, int N, int K) {
+    const int nb = K / 256, BB = wfmt_block_bytes(f); const size_t gb = (size_t)16 * BB;
+    memset(dst, 0, wmma_il_bytes(f, N, K));
+    for (int r = 0; r < N; ++r) {
+        const int g = r / 16, r16 = r % 16; uint8_t* gbase = dst + (size_t)g * nb * gb;
+        for (int b = 0; b < nb; ++b) {
+            uint8_t* d = gbase + (size_t)b * gb;
+            switch (f) {
+                case WFmt::Q4_K: case WFmt::Q5_K: { const uint8_t* blk = src + ((size_t)r * nb + b) * BB;
+                    for (int i = 0; i < BB / 16; ++i) memcpy(d + i * 256 + r16 * 16, blk + i * 16, 16); break; }
+                case WFmt::IQ4_XS: { const uint8_t* blk = src + ((size_t)r * nb + b) * 136;
+                    for (int i = 0; i < 17; ++i) memcpy(d + i * 128 + r16 * 8, blk + i * 8, 8); break; }
+                case WFmt::Q6_K_SOA: { const uint8_t* rp = src + (size_t)r * ((size_t)K * 210 / 256);
+                    for (int i = 0; i < 8; ++i) memcpy(d + i * 256 + r16 * 16, rp + (size_t)b * 128 + i * 16, 16);
+                    for (int i = 0; i < 4; ++i) memcpy(d + 2048 + i * 256 + r16 * 16, rp + (size_t)nb * 128 + (size_t)b * 64 + i * 16, 16);
+                    memcpy(d + 3072 + r16 * 16, rp + (size_t)nb * 192 + (size_t)b * 16, 16);
+                    memcpy(d + 3328 + r16 * 2, rp + (size_t)nb * 208 + (size_t)b * 2, 2); break; }
+                default: { const uint8_t* rp = src + (size_t)r * ((size_t)K + K / 16);   // Q8_0 SoA
+                    for (int i = 0; i < 16; ++i) memcpy(d + i * 256 + r16 * 16, rp + (size_t)b * 256 + i * 16, 16);
+                    memcpy(d + 4096 + r16 * 16, rp + K + (size_t)b * 16, 16); break; }
+            }
+        }
+    }
+}
+// mode: 1/2/4/8 = split-K waves per 16-row tile (row-major weights), 3 = KS 1 on the interleaved layout, 0 = auto by N
+void gemv_wmma(const GemvSeg* segs, int nseg, XQ8 x, int ncol, int mode, hipStream_t s) {
     for (int c0 = 0; c0 < ncol; c0 += 8) {
         const int nc = std::min(8, ncol - c0);
         const int K = segs[0].K;
         const int8_t* xq = x.q + (size_t)c0 * K; const float* xd = x.d + (size_t)c0 * K / 32; const float* xs = x.s + (size_t)c0 * K / 32;
         for (int i0 = 0; i0 < nseg;) {
             int i1 = i0 + 1; while (i1 < nseg && i1 - i0 < 4 && segs[i1].fmt == segs[i0].fmt) ++i1;
+            int ks = mode; if (mode == 0) { int Nt = 0; for (int i = i0; i < i1; ++i) Nt += segs[i].N; ks = Nt >= 65536 ? 1 : Nt >= 12288 ? 2 : Nt >= 4096 ? 4 : 8; }
+            const int ROWS = mode == 3 ? 128 : 128 / ks;
             SegArgs a; a.n = i1 - i0; int blocks = 0;
             for (int i = i0; i < i1; ++i) { a.s[i - i0] = {(const uint8_t*)segs[i].w, segs[i].y + (size_t)c0 * segs[i].N, segs[i].N, segs[i].K, (int)segs[i].fmt, blocks}; blocks += (segs[i].N + ROWS - 1) / ROWS; }
             for (int i = a.n; i < 4; ++i) a.s[i] = a.s[a.n - 1];
-            if (tiles == 2) launch_wmma<2>(segs[i0].fmt, a, blocks, xq, xd, xs, nc, s); else launch_wmma<1>(segs[i0].fmt, a, blocks, xq, xd, xs, nc, s);
+            switch (mode == 3 ? 3 : ks) {
+                case 3: launch_wmma<1, true>(segs[i0].fmt, a, blocks, xq, xd, xs, nc, s); break;
+                case 2: launch_wmma<2, false>(segs[i0].fmt, a, blocks, xq, xd, xs, nc, s); break;
+                case 4: launch_wmma<4, false>(segs[i0].fmt, a, blocks, xq, xd, xs, nc, s); break;
+                case 8: launch_wmma<8, false>(segs[i0].fmt, a, blocks, xq, xd, xs, nc, s); break;
+                default: launch_wmma<1, false>(segs[i0].fmt, a, blocks, xq, xd, xs, nc, s); break;
+            }
             i0 = i1;
         }
     }

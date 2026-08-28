@@ -33,6 +33,18 @@ int main(int argc, char** argv) {
     hip::Qwen35 m(argv[1]); m.load_dflash(argv[2]);
     int ids[16 * 8]; float vals[16 * 8];
 
+    if (getenv("PROF_T")) {   // per-category GPU time of a T-token pass (HIPSTER_TIMING=1 for the categories)
+        m.reset(); int pos = 0; for (int t : prompt) { m.forward(&t, 1, pos++); m.accept(1); }
+        for (int T : {1, 2, 4, 8}) {
+            std::vector<int> toks(T, 1393); m.forward(toks.data(), T, pos); m.accept(T); pos += T; m.timing_reset();
+            const int reps = 6; double t0 = now_ms(); float gpu = 0;
+            for (int r = 0; r < reps; ++r) { gpu += m.forward(toks.data(), T, pos); m.accept(T); pos += T; }
+            hipDeviceSynchronize(); double wall = (now_ms() - t0) / reps; const float* c = m.timing();
+            printf("T=%d: %.1f ms wall, %.1f ms gpu | gemv %.1f deq %.1f gemm %.1f split %.1f attn %.1f gdn %.1f other %.1f\n", T, wall, gpu / reps,
+                   c[0] / reps, c[1] / reps, c[2] / reps, c[3] / reps, c[4] / reps, c[5] / reps, c[6] / reps);
+        }
+        return 0;
+    }
     std::vector<int> plain;
     { m.reset(); int pos = 0;
       for (int t : prompt) { m.forward(&t, 1, pos++); m.accept(1); }

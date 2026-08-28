@@ -66,3 +66,25 @@ gate+up: 450 → ~250 launches); fuse add+rmsnorm+quantize and silu·mul+quantiz
 KV at 32K is 2 GB per token → 8.7 ms at the roof; both kernels lose ~15 ms, the new one for lack
 of parallelism (256 single-wave blocks). 128-position splits are being measured. At 262K the f16
 KV alone is 17 GB per token (≥ 70 ms) — int8 KV is mandatory for the 262K × 4-slot target.
+
+## 2026-08-28 · WMMA GEMV (the T-invariant verify/decode kernel) — what was tried
+
+`bench_gemv <tensor> 8 q8` rows `rpt=4`: `tpr=1/2/4/8` = split-K waves per 16-row tile, `tpr=3` = 16-row interleaved
+layout. GB/s of weights at ncol=1 / ncol=8, one 8-wave block of 16-row tiles:
+
+| variant | Q5_K ffn_up 17408×5120 | Q5_K ffn_down 5120×17408 | Q4_K ffn_gate | Q8_0 ssm_out 6144×5120 |
+|---|---|---|---|---|
+| old kernels (tpr=32 ncol=1 / ncol-tuned ncol=8) | 222 / 90 | 213 / 87 | 218 / 99 | 153 / 82 |
+| WMMA, per-format kernel | 188 / 147 | 190 / 138 | 190 / 164 | 198 / 174 |
+| + split-K 4 waves per tile | 197 / 160 | 203 / 167 | 203 / 159 | 194 / 176 |
+| 16-row interleaved layout (KS 1) | 203 / 161 | — | 194 / 191 | 213 / 198 |
+| + prefetch next block, x fragments per sub-block | 206 / 165 | 203 / 169 | 203 / 161 | 165 / 144 (KS4) |
+| scale loads as float4 (8 sub-blocks) | spills (256 VGPRs) → 77–92 | | | |
+| scale loads as float4 (4 sub-blocks) | spills → 76–90 | | | |
+
+Neither occupancy (split-K: +5–10%, worse for Q8_0), coalescing (interleaving: +3–15%, −35% for Q6_K), nor latency
+(prefetch: ±3%) explains the ~165 GB/s ceiling of the K-quants at 8 columns; per 16-row × 256 block a wave issues
+11 weight loads, 16 x-fragment loads and 128 scalar scale loads (`xd`/`xs` per column and sub-block) — the scale loads
+dominate the vector-memory instruction count, and holding them in registers spills. Engine (`PROF_T=1 HIPSTER_TIMING=1
+dflash27b …`, throttled box): T=1 101 ms (GEMV 85), T=8 120 ms (GEMV 98) with WMMA; old kernels 90 / 152.
+Auto mode (`gemv_wmma(..., mode 0)`): split-K 8/4/2/1 by rows (< 4096 / < 12288 / < 65536 / above).

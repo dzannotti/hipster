@@ -195,7 +195,7 @@ void Qwen35::lin_multi(const GemvSeg* segs, int n, int M) {
         // 32-lane multi-column kernel (T-invariant, slow at T=8); fast: the old ncol-tuned kernels (not T-invariant).
         static const std::string mode = getenv("HIPSTER_GEMV") ? getenv("HIPSTER_GEMV") : "wmma";
         static const bool fast = mode == "fast";
-        if (mode == "wmma" && gemv_wmma_ok(segs, n)) { gemv_wmma(segs, n, xq_, M, 1, s_); tmark(T_GEMV); return; }
+        if (mode == "wmma" && gemv_wmma_ok(segs, n)) { gemv_wmma(segs, n, xq_, M, 0, s_); tmark(T_GEMV); return; }
         if (M == 1 || !fast) { gemv_multi(segs, n, xq_, M, s_); tmark(T_GEMV); return; }
         for (int i = 0; i < n; ++i) gemv_q8(segs[i].fmt, segs[i].w, xq_, segs[i].y, segs[i].N, segs[i].K, M, 4, 3, s_);
         tmark(T_GEMV); return;
