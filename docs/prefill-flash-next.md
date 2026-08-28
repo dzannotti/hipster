@@ -77,3 +77,6 @@ References from llama.cpp (`tools/ref-long.py` against the fn-tree ROCm build, n
 Costs surfaced: the scalar gather attention is ~12× slower than the WMMA flash kernel on the ≤2K dense chunk
 (72 vs 6 ms per layer) and the per-query selection scans dominate at 16K (attention phase 40%); the host n-gram gather
 is 0.75 ms/token cold (65K random NVMe rows per 4K prompt) — both next.
+
+| 16767 tokens, WMMA gather attention for prefill rows (f16 Q/K/P/V tiles, 0.023% from the scalar kernel) + hipBLASLt indexer projections | 51.1 s | **21.1 s (795 t/s)** | 0.80 | 7/7 | ✓ |
+The decode path keeps the scalar gather kernel (bit-identical to the old dense kernel, T-invariant); 2K chunks: 976 t/s.

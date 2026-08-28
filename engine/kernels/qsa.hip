@@ -209,6 +209,82 @@ __global__ void k_merge(const float* __restrict__ qf, const float* __restrict__ 
     const float v = (o / l) * sigmoid(qf[((size_t)t * NQH + h) * 512 + HD + d]);
     out[oi] = v; if (oq) wave_quant32(v, oq, od, os, (int)(oi / 32), d % 32);
 }
+
+// ---- gather attention, WMMA f16 (prefill rows): block per (row, kv head), 4 waves; keys in 32-key tiles ----
+// S[16 heads (12 + pad)][32 keys] = Q . K^T (2 key tiles x 16 k-steps), online softmax per head in LDS, O[16][256] += P . V
+// (16 N-tiles x 2 k-steps, 4 per wave). f16 operands, f32 accumulate — the precision of the flash prefill kernel.
+typedef _Float16 f16x16_t __attribute__((ext_vector_type(16)));
+typedef float f32x8_t __attribute__((ext_vector_type(8)));
+constexpr int TKW = 32, PADH = HD + 8;   // padded LDS row (bank spread)
+__global__ void __launch_bounds__(128) k_attend_wmma(const float* __restrict__ qf, const uint16_t* __restrict__ kc, const uint16_t* __restrict__ vc, size_t kvs, int max_ctx,
+                                                     const int* __restrict__ rpos, const int* __restrict__ rkv, const int* __restrict__ idx, const int* __restrict__ cnt,
+                                                     float* __restrict__ out) {
+    __shared__ __align__(16) uint16_t sQ[16][PADH]; __shared__ __align__(16) uint16_t sK[TKW][PADH]; __shared__ __align__(16) uint16_t sV[TKW][PADH];
+    __shared__ float sS[16][TKW]; __shared__ __align__(16) uint16_t sP[16][TKW + 8]; __shared__ float sm[16], sl[16], scorr[16];
+    const int t = blockIdx.x / NKV, kh = blockIdx.x % NKV, tid = threadIdx.x, wave = tid / 32, lane = tid % 32, r16 = lane % 16, half = lane / 16;
+    const int nkeys = idx ? cnt[t] : rpos[t] + 1; const int* list = idx ? idx + (size_t)t * WIDTH : nullptr;
+    const uint16_t* Kc = kc + (size_t)rkv[t] * kvs + (size_t)kh * max_ctx * HD; const uint16_t* Vc = vc + (size_t)rkv[t] * kvs + (size_t)kh * max_ctx * HD;
+    for (int i = tid; i < 16 * HD; i += 128) { const int h = i / HD, d = i % HD; sQ[h][d] = h < QPK ? f2h(qf[((size_t)t * NQH + kh * QPK + h) * 512 + d] * 0.0625f) : (uint16_t)0; }
+    if (tid < 16) { sm[tid] = -INFINITY; sl[tid] = 0.f; }
+    f32x8_t O[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) O[i] = f32x8_t{0, 0, 0, 0, 0, 0, 0, 0};
+    __syncthreads();
+    for (int kb = 0; kb < nkeys; kb += TKW) {
+        const int nk = min(TKW, nkeys - kb);
+        for (int i = tid; i < TKW * 32; i += 128) { const int kk = i / 32, part = i % 32;
+            uint4 kv4 = {0, 0, 0, 0}, vv4 = {0, 0, 0, 0};
+            if (kk < nk) { const int pos = list ? list[kb + kk] : kb + kk; kv4 = *(const uint4*)(Kc + (size_t)pos * HD + part * 8); vv4 = *(const uint4*)(Vc + (size_t)pos * HD + part * 8); }
+            *(uint4*)&sK[kk][part * 8] = kv4; *(uint4*)&sV[kk][part * 8] = vv4; }
+        __syncthreads();
+        // S = Q . K^T : waves 0,1 -> key tiles 0,1 (16 keys each); A = Q rows (heads), B = K rows (keys), 16 k-steps of 16 dims
+        if (wave < 2) {
+            f32x8_t C = {0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+            for (int ks = 0; ks < HD / 16; ++ks) {
+                const f16x16_t A = *(const f16x16_t*)&sQ[r16][ks * 16], B = *(const f16x16_t*)&sK[wave * 16 + r16][ks * 16];
+                C = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(A, B, C);   // D[i = 2l + half (head)][j = r16 (key)]
+            }
+#pragma unroll
+            for (int l = 0; l < 8; ++l) { const int h = 2 * l + half, kk = wave * 16 + r16; sS[h][kk] = kk < nk ? C[l] : -INFINITY; }
+        }
+        __syncthreads();
+        // online softmax per head: 16 heads x 32 keys; wave w handles heads 4w..4w+3 (lane -> key)
+        for (int h = wave * 4; h < wave * 4 + 4; ++h) {
+            const float v = sS[h][lane];
+            const float m = fmaxf(sm[h], wave_max(v)); const float e = lane < nk ? __expf(v - m) : 0.f; const float l = wave_sum(e);
+            if (lane == 0) { scorr[h] = __expf(sm[h] - m); sl[h] = sl[h] * scorr[h] + l; sm[h] = m; }
+            sP[h][lane] = f2h(e);
+        }
+        __syncthreads();
+        // O[h][n] = O * corr + P . V : wave w -> N-tiles 4w..4w+3 (16 dims each); A = P (16 heads x 32 keys: 2 k-steps), B = V[k][n] column fragments
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int nt = wave * 4 + i;
+#pragma unroll
+            for (int l = 0; l < 8; ++l) O[i][l] *= scorr[2 * l + half];
+#pragma unroll
+            for (int ks = 0; ks < 2; ++ks) {
+                const f16x16_t A = *(const f16x16_t*)&sP[r16][ks * 16];
+                f16x16_t B;
+#pragma unroll
+                for (int e = 0; e < 16; ++e) { uint16_t u = sV[ks * 16 + e][nt * 16 + r16]; _Float16 x; __builtin_memcpy(&x, &u, 2); B[e] = x; }
+                O[i] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(A, B, O[i]);   // D[i = head 2l+half][j = r16 (dim within the N-tile)]
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int nt = wave * 4 + i, d = nt * 16 + r16;
+#pragma unroll
+        for (int l = 0; l < 8; ++l) {
+            const int h = 2 * l + half; if (h >= QPK) continue;
+            const int hh = kh * QPK + h;
+            out[((size_t)t * NQH + hh) * HD + d] = (O[i][l] / sl[h]) * sigmoid(qf[((size_t)t * NQH + hh) * 512 + HD + d]);
+        }
+    }
+}
 }  // namespace
 
 void bf16_gemv(const uint16_t* W, const float* x, float* y, int N, int K, int T, hipStream_t s) { k_bf16_gemv<<<(T * N * 32 + 255) / 256, 256, 0, s>>>(W, x, y, N, K, T); }
@@ -222,6 +298,7 @@ void select(const float* q, const int* rpos, const int* rkv, const float* pooled
 }
 void attend(const float* qf, const uint16_t* kc, const uint16_t* vc, size_t kv_slot_stride, int max_ctx, const int* rpos, const int* rkv,
             const int* idx, const int* cnt, int T, int nsplit, float* partials, float* out, XQ8 xq, hipStream_t s) {
+    if (T > 8 && nsplit == 1 && !xq.q) { k_attend_wmma<<<T * NKV, 128, 0, s>>>(qf, kc, vc, kv_slot_stride, max_ctx, rpos, rkv, idx, cnt, out); return; }   // prefill: f16 WMMA tiles
     k_attend<<<T * NKV * nsplit, 256, 0, s>>>(qf, kc, vc, kv_slot_stride, max_ctx, rpos, rkv, idx, cnt, nsplit, partials, out, xq.q, xq.d, xq.s);
     if (nsplit > 1) k_merge<<<T * NQH, HD, 0, s>>>(qf, partials, nsplit, out, xq.q, xq.d, xq.s);
 }

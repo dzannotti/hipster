@@ -294,9 +294,14 @@ void Qwen4Exp::qsa_attention(const FnLayer& L, int rows, const std::vector<int>&
     if (qsa) {
         // indexer: raw keys cached per token; pooled keys for the complete blocks this pass touches (recomputed every pass:
         // a rejected draft may have completed a block); 4 query heads; per-row top-k selection
-        qsa::bf16_gemv(L.idx_k, mixed, k_idx_, qsa::IDX_DIM, D::n_embd, rows, s_);
+        if (rows > MAXR) {   // prefill: one bf16 GEMM on the bf16 mixed rows (xb_) for k and q (weights are bf16 already)
+            blas_.gemm(xb_, L.idx_k, gout_, rows, qsa::IDX_DIM, D::n_embd, s_); bf16_to_f32(gout_, k_idx_, (size_t)rows * qsa::IDX_DIM, s_);
+            blas_.gemm(xb_, L.idx_q, gout_, rows, qsa::IDX_HEADS * qsa::IDX_DIM, D::n_embd, s_); bf16_to_f32(gout_, q_raw_, (size_t)rows * qsa::IDX_HEADS * qsa::IDX_DIM, s_);
+        } else {
+            qsa::bf16_gemv(L.idx_k, mixed, k_idx_, qsa::IDX_DIM, D::n_embd, rows, s_);
+            qsa::bf16_gemv(L.idx_q, mixed, q_raw_, qsa::IDX_HEADS * qsa::IDX_DIM, D::n_embd, rows, s_);
+        }
         qsa::write_k(k_idx_, d_pos_, d_kv_, idxc_ + (size_t)ai * max_ctx_ * qsa::IDX_DIM, idx_slot_stride_, rows, s_);
-        qsa::bf16_gemv(L.idx_q, mixed, q_raw_, qsa::IDX_HEADS * qsa::IDX_DIM, D::n_embd, rows, s_);
         qsa::query(q_raw_, d_pos_, L.idx_qn, q_idx_, rows, D::rms_eps, D::rope_base, s_);
         for (int r0 = 0; r0 < rows;) {   // runs of rows of one slot: pool blocks [first/4, (last+1)/4)
             int r1 = r0; while (r1 + 1 < rows && kv[r1 + 1] == kv[r0] && pos[r1 + 1] == pos[r1] + 1) ++r1;

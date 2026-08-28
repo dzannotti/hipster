@@ -76,6 +76,8 @@ int main(int argc, char** argv) {
         std::vector<int> pos(T), kvs(T, 0); for (int i = 0; i < T; ++i) pos[i] = i; int *dpos = up(pos), *dkv = up(kvs);
         hip::attn_rope_kv_24_2_rowv_pos0(dq3, dk3, dv, T, dqw, dkw, 1e7f, pos0, kc3, vc3, max_ctx, eps, s);
         float* part; CK(hipMalloc(&part, (size_t)T * 2 * 16 * 12 * 258 * 4)); float* out3; CK(hipMalloc(&out3, (size_t)T * NQ * HD * 4));
+        { hip::XQ8 noq = {nullptr, nullptr, nullptr}; hip::qsa::attend(dq3, kc3, vc3, kvn, max_ctx, dpos, dkv, nullptr, nullptr, T, 1, part, out3, noq, s);
+          CK(hipDeviceSynchronize()); auto o3 = down(out3, (size_t)T * NQ * HD); report("gather attention WMMA (prefill path) vs decode", o3, o1); }
         for (int nsplit : {1, 16}) {
             hip::qsa::attend(dq3, kc3, vc3, kvn, max_ctx, dpos, dkv, nullptr, nullptr, T, nsplit, part, out3, xq, s);
             CK(hipDeviceSynchronize()); auto o3 = down(out3, (size_t)T * NQ * HD);

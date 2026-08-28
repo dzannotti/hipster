@@ -17,7 +17,7 @@ MTP because expert reads for the T verify rows overlap. 27B work continues only 
 attention, GDN kernels) or asked for. Order: Flash-Next MTP → multi-slot verify/decode → prefill GEMM path →
 QSA beyond 2K → serving.
 
-## Status 2026-08-28: Phase 1 done (12.5 t/s, 87% of floor), Phase 2 MTP done (35.6 t/s code, exact), Phase 3 prefill v1 done (647 t/s @2K, 475 @32K). Depth gate green at 16K/32K (needle + logprobs vs llama.cpp). Phase 4 Flash-Next: decode exact vs llama.cpp (12/12), 28.2 t/s bare (floor 39), MTP 37.2 t/s exact (n=2), deterministic + T-invariant numerics. Next: multi-slot batching, prefill GEMM path, QSA beyond 2K, requant of the Q8_0 dense tensors.
+## Status 2026-08-28: Phase 1 done (12.5 t/s, 87% of floor), Phase 2 MTP done (35.6 t/s code, exact), Phase 3 prefill v1 done (647 t/s @2K, 475 @32K). Depth gate green at 16K/32K (needle + logprobs vs llama.cpp). Phase 4 Flash-Next: decode exact (12/12), 28 t/s bare (floor 39), MTP 37–40 t/s exact, batching 63/80 t/s at 4/8 slots exact, prefill ~1000 t/s @2K and 795 t/s @16K with QSA sparse attention exact vs llama.cpp at 4K/16K (needle). Next: serving layer (tokenizer, chat template, OpenAI endpoints), 262K validation, dense-tensor requant, PLE gather overlap.
 
 ## Phase 1 — 27B single-token decode at the wall
 Goal: a full forward pass of Qwen3.8-27B at ≥ 13 t/s bare (≥ 90% of floor), bit-comparable to
