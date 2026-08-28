@@ -942,7 +942,8 @@ void attn_decode_mq(float* q_full, float* k, float* v, int T, const float* q_nor
     k_qk_norm_rope_kv<24, 4, false><<<28 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, 0, kc, vc, max_ctx, eps, nullptr, nullptr, nullptr, nullptr, rb, kv_stride, kvt_stride, 0);
     int pmax = 0; for (int r = 0; r < T; ++r) pmax = max(pmax, rb.pos[r]);
     const int nsplit = min(part.nsplit_max, (pmax + 1 + part.spl - 1) / part.spl);
-    k_attn_mq<<<4 * g.n * nsplit, 256, 0, s>>>(q_full, kc, vc, rb, g, kv_stride, kvt_stride, max_ctx, nsplit, part.spl, part.O, part.m, part.l);
+    int tmax = 1; for (int i = 0; i < g.n; ++i) tmax = max(tmax, g.T[i]);
+    k_attn_mq<<<4 * g.n * nsplit, 32 * tmax, 0, s>>>(q_full, kc, vc, rb, g, kv_stride, kvt_stride, max_ctx, nsplit, part.spl, part.O, part.m, part.l);   // one wave per row; rows beyond a group's T write empty partials
     k_attn_mq_merge<<<4 * g.n * 64, 256, 0, s>>>(q_full, part.O, part.m, part.l, rb, g, nsplit, out, xq.q, xq.d, xq.s);
 }
 void attn_prefill(const float* q_full, const uint16_t* kc, const uint16_t* vc, int T, int pos0, int max_ctx, uint16_t* out_bf16, hipStream_t s) {
