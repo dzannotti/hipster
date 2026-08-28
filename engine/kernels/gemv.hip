@@ -1299,8 +1299,8 @@ void repack_wmma_il(WFmt f, const uint8_t* src, uint8_t* dst, int N, int K) {
 }
 // mode: 1/2/4/8 = split-K waves per 16-row tile (row-major weights), 3 = KS 1 on the interleaved layout, 0 = auto by N
 void gemv_wmma(const GemvSeg* segs, int nseg, XQ8 x, int ncol, int mode, hipStream_t s) {
-    for (int c0 = 0; c0 < ncol; c0 += 8) {
-        const int nc = std::min(8, ncol - c0);
+    for (int c0 = 0; c0 < ncol; c0 += 16) {   // the x operand is 16 columns: one launch per 16
+        const int nc = std::min(16, ncol - c0);
         const int K = segs[0].K;
         const int8_t* xq = x.q + (size_t)c0 * K; const float* xd = x.d + (size_t)c0 * K / 32; const float* xs = x.s + (size_t)c0 * K / 32;
         const float2* xds = x.ds ? x.ds + (size_t)c0 * K / 32 : nullptr;
