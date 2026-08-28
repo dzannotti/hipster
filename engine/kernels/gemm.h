@@ -10,7 +10,6 @@
 namespace hip {
 // dequantise a whole weight into bf16 [N][K]
 void dequant_bf16(WFmt f, const void* W, uint16_t* out, int N, int K, hipStream_t s);
-void dequant_f32(WFmt f, const void* W, float* out, int N, int K, hipStream_t s);
 // f32 <-> bf16
 void f32_to_bf16(const float* x, uint16_t* out, size_t n, hipStream_t s);
 void bf16_to_f32(const uint16_t* x, float* out, size_t n, hipStream_t s);

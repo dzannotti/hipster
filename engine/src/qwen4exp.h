@@ -127,7 +127,7 @@ private:
     int max_prefill_ = 0; BlasLt blas_;
     uint16_t *xb_ = nullptr, *xb2_, *gout_, *wscratch_;
     float *pR_, *pxn_, *pmixed_, *py_, *pymoe_, *pqkv_, *pqkvc_, *pz_, *pba_, *pqn_, *praw_, *pao_, *pq_, *pk_, *pv_, *prl_, *prw_, *peg_, *peu_, *pinj_, *pinj2_, *pkey_, *pval_, *pemb_;
-    int *peid_, *pd_tok_, *d_kpos_, *d_rowtok_; MoeTile* d_tiles_; float* pdown_; uint16_t* pxs_; XQ8 pxq_;
+    int *peid_, *pd_tok_, *d_kpos_, *d_rowtok_; MoeTile* d_tiles_; float* pdown_; XQ8 pxq_;
     std::set<int> dbg_layers_; std::map<int, std::vector<float>> dbg_pf_, dbg_dec_; bool dbg_armed_ = false;
     void dbg_capture(int il, const float* y, const float* ymoe, bool pf); void dbg_capture_mix(int il, const float* mixed, bool pf);
     size_t weight_bytes_ = 0; std::string report_; double ple_host_ms_ = 0, gpu_ms_ = 0;

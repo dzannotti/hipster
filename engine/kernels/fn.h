@@ -48,7 +48,6 @@ void moe_gemv(WFmt fmt, WFmt shared_fmt, const MoeSegs& a, int nseg, const int* 
 // h[t][e][640] = silu(g)*u from the fused gate|up output y [T][10][2*640]? (we run gate and up as two
 // segments) -> quantised rows into xq (row index t*10+e)
 void moe_silu_quant(const float* gate, const float* up, XQ8 xq, int rows, int n, hipStream_t s);
-void moe_silu_bf16(const float* gate, const float* up, uint16_t* out, int rows, int n, hipStream_t s);   // bf16 rows [rows][n]
 
 // PLE gate + conv: emb rows gathered on the host. key [T][10240] (W_key . emb), value [T][2560],
 // R [T][4][2560] (the wide residual, updated in place), conv state [9][10240] per sequence.

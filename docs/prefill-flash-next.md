@@ -44,3 +44,20 @@ int8-x kernel 4.5 ms (14.8 TOPS), bf16-x kernel 4.9 ms at 48-column tiles (13.7 
 constant weight fragments (no dequant) **2.1 ms = 32 TOPS / 224 GB/s** — the floor of this tiling. The per-fragment
 dequant (32 values: cvt + FMA + bf16 round) is the remaining cost → next: f16 fragments via packed converts and wider
 column tiles (111 VGPRs at 3 tiles leaves room for 6).
+
+## 2026-08-28 (cont.) — MoE grouped-GEMM kernel: what was tried, with numbers
+`bench_moe` on blk.0 gate experts (Q4_K, 2048 tokens, 512 experts; ms per launch, TOPS):
+| variant | 16-col tiles | 32 | 48 | 64 | 96 |
+|---|---:|---:|---:|---:|---:|
+| int8 x + iu8 WMMA, per-column scale fix-ups (LDS-staged, padded) | **4.5 / 14.8** | 4.7 | 5.2 | | |
+| bf16 x + bf16 WMMA, scales folded into the fragments | 9.3 | 6.8 | 4.9 / 13.7 | | |
+| same with constant fragments (no dequant, no weight loads): the tiling's floor | 2.1 / **32** | 2.5 | 2.2 | | |
+| f16 x, packed converts, runtime sub-tile count | 7.3 | 5.2 | 4.5 | 5.4 | 5.3 |
+| + raw-block register prefetch (spilled: dynamic register indexing) | 7.9 | 5.9 | 5.7 | | |
+| + fully unrolled sub-block loop (no spills) | 5.3 | 4.7 | 5.2 | | |
+Hardware counters (f16, 48-col): ~444 M VALU wave-instructions per launch (≈26% of issue capacity), waves waiting
+≈50% of their cycles → latency-bound on the per-sub-block weight loads at 3–5 waves/SIMD; prefetching them costs
+the registers that the occupancy needed. The two lane-halves of a WMMA fragment dequantise the same row twice
+(the layout mirrors them) — a half-split dequant + lane swap is the remaining structural idea (≤2× on the dequant part).
+Decision: the int8 kernel with 16-column tiles stays (fastest measured, and its activation quantisation is decode's).
+MoE ≈ 1.0 s of the 2.05 s prefill at 2048 tokens; the floor of this tiling would be ≈ 0.45 s.

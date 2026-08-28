@@ -180,7 +180,7 @@ Qwen4Exp::Qwen4Exp(const std::string& path, int max_ctx, int n_slots, int max_pr
         f32(&pkey_, P * D::wide); f32(&pval_, P * D::n_embd); f32(&pemb_, P * D::n_embd);
         CK(hipMalloc(&peid_, P * (D::n_used + 1) * 4)); CK(hipMalloc(&pd_tok_, P * 4));
         CK(hipMalloc(&d_kpos_, P * (D::n_used + 1) * 4)); CK(hipMalloc(&d_rowtok_, P * (D::n_used + 1) * 4)); CK(hipMalloc(&d_tiles_, (P * (D::n_used + 1) / 16 + D::n_exp + 2) * sizeof(MoeTile)));
-        f32(&pdown_, P * (D::n_used + 1) * D::n_embd); CK(hipMalloc(&pxs_, P * (D::n_used + 1) * D::exp_ff * 2));
+        f32(&pdown_, P * (D::n_used + 1) * D::n_embd);
         const size_t xk = P * (size_t)(D::n_used + 1) * D::exp_ff;   // widest int8 rows: the MoE down input [P*11][640] (> [P][2560])
         CK(hipMalloc(&pxq_.q, xk)); CK(hipMalloc(&pxq_.d, xk / 32 * 4)); CK(hipMalloc(&pxq_.s, xk / 32 * 4));
     }
@@ -556,7 +556,7 @@ float Qwen4Exp::prefill(const int* tokens, int T, int pos0) {
             std::vector<int> order(NS), kpos(NS), rowtok(NS); for (int i = 0; i < NS; ++i) order[i] = i;
             std::sort(order.begin(), order.end(), [&](int a, int b) { return eid[a] != eid[b] ? eid[a] < eid[b] : a < b; });
             // column tiles of up to 16*ct sorted positions per expert: the expert's weights are read once per tile
-            static const int ct_env = getenv("HIPSTER_MOE_CT") ? atoi(getenv("HIPSTER_MOE_CT")) : 3;
+            static const int ct_env = getenv("HIPSTER_MOE_CT") ? atoi(getenv("HIPSTER_MOE_CT")) : 1;   // bench_moe: 16-column tiles are the fastest (docs/prefill-flash-next.md)
             const int ct = std::max(1, std::min(3, ct_env)), maxc = 16 * ct;
             std::vector<MoeTile> tiles, stiles; tiles.reserve(NS / maxc + D::n_exp + 2);
             for (int k = 0; k < NS; ++k) {
@@ -569,18 +569,10 @@ float Qwen4Exp::prefill(const int* tokens, int T, int pos0) {
             CK(hipMemcpyAsync(d_tiles_, tiles.data(), (size_t)nt * sizeof(MoeTile), hipMemcpyHostToDevice, s_));
             CK(hipMemcpyAsync(d_tiles_ + nt, stiles.data(), (size_t)nst * sizeof(MoeTile), hipMemcpyHostToDevice, s_)); pt.mark(4);
             const MoeTile* dst = d_tiles_ + nt;
-            static const bool moe_i8 = getenv("HIPSTER_MOE_I8") != nullptr;
-            if (moe_i8) {
-                moe_gemm(L.gate_fmt, L.sh_gate.fmt, L.gate_exps, L.sh_gate.w, L.gate_eb, d_tiles_, nt, dst, nst, ct, d_rowtok_, pxq_, peg_, D::exp_ff, D::n_embd, s_);
-                moe_gemm(L.up_fmt, L.sh_up.fmt, L.up_exps, L.sh_up.w, L.up_eb, d_tiles_, nt, dst, nst, ct, d_rowtok_, pxq_, peu_, D::exp_ff, D::n_embd, s_);
-                fn::moe_silu_quant(peg_, peu_, pxq_, NS, D::exp_ff, s_);
-                moe_gemm(L.down_fmt, L.sh_down.fmt, L.down_exps, L.sh_down.w, L.down_eb, d_tiles_, nt, dst, nst, ct, nullptr, pxq_, pdown_, D::n_embd, D::exp_ff, s_);
-            } else {   // bf16 x (the mixed rows xb_), scales folded into the weight fragments
-                moe_gemm_bf16(L.gate_fmt, L.sh_gate.fmt, L.gate_exps, L.sh_gate.w, L.gate_eb, d_tiles_, nt, dst, nst, ct, d_rowtok_, xb_, peg_, D::exp_ff, D::n_embd, s_);
-                moe_gemm_bf16(L.up_fmt, L.sh_up.fmt, L.up_exps, L.sh_up.w, L.up_eb, d_tiles_, nt, dst, nst, ct, d_rowtok_, xb_, peu_, D::exp_ff, D::n_embd, s_);
-                fn::moe_silu_bf16(peg_, peu_, pxs_, NS, D::exp_ff, s_);   // bf16 rows [NS][640] in sorted order
-                moe_gemm_bf16(L.down_fmt, L.sh_down.fmt, L.down_exps, L.sh_down.w, L.down_eb, d_tiles_, nt, dst, nst, ct, nullptr, pxs_, pdown_, D::n_embd, D::exp_ff, s_);
-            }
+            moe_gemm(L.gate_fmt, L.sh_gate.fmt, L.gate_exps, L.sh_gate.w, L.gate_eb, d_tiles_, nt, dst, nst, ct, d_rowtok_, pxq_, peg_, D::exp_ff, D::n_embd, s_);
+            moe_gemm(L.up_fmt, L.sh_up.fmt, L.up_exps, L.sh_up.w, L.up_eb, d_tiles_, nt, dst, nst, ct, d_rowtok_, pxq_, peu_, D::exp_ff, D::n_embd, s_);
+            fn::moe_silu_quant(peg_, peu_, pxq_, NS, D::exp_ff, s_);   // rows in sorted order (k)
+            moe_gemm(L.down_fmt, L.sh_down.fmt, L.down_exps, L.sh_down.w, L.down_eb, d_tiles_, nt, dst, nst, ct, nullptr, pxq_, pdown_, D::n_embd, D::exp_ff, s_);
             fn::moe_combine_sorted(pdown_, prw_, d_kpos_, pymoe_, T, NE, s_); pt.mark(5);
         }
         pend = Pending{}; pend.y = pymoe_; pend.inject = pinj2_;

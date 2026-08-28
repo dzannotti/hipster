@@ -6,7 +6,6 @@
 
 namespace hip {
 int g_moe_tpr = 0;
-int g_moe_fake = 0;   // bench: bf16 MoE GEMM with constant weight fragments (WMMA + LDS floor)
 int g_persist_blocks = 0;   // 0 = one block per row-block; else cap the grid (persistent loop)
 namespace {
 
@@ -623,120 +622,6 @@ static void moe_gemm_fmt(WFmt f, const void* W, size_t ebytes, const MoeTile* ti
 }
 
 
-// ======================= MoE grouped GEMM, bf16 WMMA (prefill) =======================
-// Same tiling as k_moe_gemm; the quantisation scales are folded into the weight fragments (bf16), the x operand is
-// bf16 rows (no per-32 activation scales) and the WMMA accumulates straight into f32 — no per-column fix-ups.
-typedef short bf16x16_t __attribute__((ext_vector_type(16)));
-typedef float f32x8_t __attribute__((ext_vector_type(8)));
-__device__ __forceinline__ short f2bfs(float f) { uint32_t u = __float_as_uint(f); u += 0x7FFFu + ((u >> 16) & 1); return (short)(u >> 16); }
-template <int CT> struct MoeLdsB { uint16_t x[16 * CT][256 + 8]; };   // padded row stride: no 16-way bank conflicts
-// 32 dequantised weights of sub-block (b, sb) of row rp -> two bf16x16 fragments (k 0..15, 16..31)
-template <WFmt F>
-__device__ __forceinline__ void moe_wfrag(const uint8_t* __restrict__ rp, int b, int sb, int K, bf16x16_t& lo, bf16x16_t& hi) {
-    float v[32];
-    if constexpr (F == WFmt::Q4_K || F == WFmt::Q5_K) {
-        constexpr int BB = F == WFmt::Q4_K ? 144 : 176, QS = F == WFmt::Q4_K ? 16 : 48;
-        const uint8_t* blk = rp + (size_t)b * BB;
-        const uint4 h = ldw((const uint4*)blk); const uint16_t* hdr = (const uint16_t*)&h;
-        const float d = h2f(hdr[0]), dmin = h2f(hdr[1]); const uint8_t* scales = (const uint8_t*)&h + 4;
-        const int j = sb / 2, hiNib = sb % 2;
-        uint8_t sc0, mn0, sc1, mn1; q4k_scales(scales, 2 * j, sc0, mn0, sc1, mn1);
-        const float ds = d * (hiNib ? sc1 : sc0), ms = dmin * (hiNib ? mn1 : mn0);
-        const uint4 q0 = ldw((const uint4*)(blk + QS + 32 * j)), q1 = ldw((const uint4*)(blk + QS + 32 * j + 16));
-        const uint32_t qw[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
-        uint32_t qhw[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-        if constexpr (F == WFmt::Q5_K) { const uint4 a = ldw((const uint4*)(blk + 16)), c = ldw((const uint4*)(blk + 32)); qhw[0] = a.x; qhw[1] = a.y; qhw[2] = a.z; qhw[3] = a.w; qhw[4] = c.x; qhw[5] = c.y; qhw[6] = c.z; qhw[7] = c.w; }
-#pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            const uint32_t nib = hiNib ? (qw[i] >> 4) & 0x0F0F0F0Fu : qw[i] & 0x0F0F0F0Fu;
-            uint32_t q = nib;
-            if constexpr (F == WFmt::Q5_K) q |= ((qhw[i] >> (2 * j + hiNib)) & 0x01010101u) << 4;
-#pragma unroll
-            for (int e = 0; e < 4; ++e) v[4 * i + e] = (float)((q >> (8 * e)) & 0xFF) * ds - ms;
-        }
-    } else if constexpr (F == WFmt::Q5_1_SOA) {
-        const uint8_t* qs = rp + (size_t)b * 128 + sb * 16; const uint32_t hb = ((const uint32_t*)(rp + K / 2))[b * 8 + sb];
-        const uint16_t* dp = (const uint16_t*)(rp + K / 2 + K / 8) + b * 8 + sb; const float d = h2f(dp[0]), m = h2f(dp[K / 32]);
-        const uint4 q4 = ldw((const uint4*)qs); const uint32_t qw[4] = {q4.x, q4.y, q4.z, q4.w};
-#pragma unroll
-        for (int w = 0; w < 4; ++w)
-#pragma unroll
-            for (int e = 0; e < 4; ++e) {
-                const int l = 4 * w + e; const uint32_t byte = (qw[w] >> (8 * e)) & 0xFF;
-                v[l] = (float)((byte & 0xF) | (((hb >> l) & 1u) << 4)) * d + m;
-                v[16 + l] = (float)((byte >> 4) | (((hb >> (16 + l)) & 1u) << 4)) * d + m;
-            }
-    } else {   // Q8_0 SoA
-        const int8_t* q = (const int8_t*)rp + (size_t)b * 256 + sb * 32; const float d = h2f(((const uint16_t*)(rp + K))[b * 8 + sb]);
-        const int32x4_t a = *(const int32x4_t*)q, c = *(const int32x4_t*)(q + 16); const int8_t* qa = (const int8_t*)&a; const int8_t* qc = (const int8_t*)&c;
-#pragma unroll
-        for (int l = 0; l < 16; ++l) { v[l] = (float)qa[l] * d; v[16 + l] = (float)qc[l] * d; }
-    }
-#pragma unroll
-    for (int l = 0; l < 16; ++l) { lo[l] = f2bfs(v[l]); hi[l] = f2bfs(v[16 + l]); }
-}
-template <WFmt F, int CT>
-__global__ void __launch_bounds__(256) k_moe_gemm_bf16(const uint8_t* __restrict__ W, size_t ebytes, const MoeTile* __restrict__ tiles,
-                                                       const int* __restrict__ rowtab, const uint16_t* __restrict__ xb, float* __restrict__ y, int N, int K, int fake) {
-    __shared__ __align__(16) MoeLdsB<CT> L;
-    const int nblkN = (N + 127) / 128;
-    const MoeTile tile = tiles[blockIdx.x / nblkN];
-    const int lane = threadIdx.x % 32, wave = threadIdx.x / 32, r16 = lane % 16, half = lane / 16, tid = threadIdx.x;
-    const int row_real = (blockIdx.x % nblkN) * 128 + wave * 16 + r16, row = min(row_real, N - 1);
-    const int nb = (K + 255) / 256, nsb = K / 32;
-    const uint8_t* Wt = tile.expert >= 0 ? W + (size_t)tile.expert * ebytes : W;
-    const uint8_t* rp = row_ptr<F>(Wt, row, K);
-    f32x8_t C[CT];
-#pragma unroll
-    for (int ct = 0; ct < CT; ++ct) C[ct] = f32x8_t{0, 0, 0, 0, 0, 0, 0, 0};
-    for (int b = 0; b < nb; ++b) {
-        __syncthreads();
-        for (int i = tid; i < 16 * CT * 32; i += 256) {   // 16*CT columns x 32 uint4 (512 B of bf16) per 256-block
-            const int c = i / 32, part = i % 32;
-            const int k = tile.k0 + (c < tile.ncols ? c : 0), xrow = rowtab ? rowtab[k] : k;
-            const int kk = b * 256 + part * 8;
-            uint4 v = {0, 0, 0, 0};
-            if (kk < K) v = *(const uint4*)(xb + (size_t)xrow * K + kk);
-            *(uint4*)&L.x[c][part * 8] = v;
-        }
-        __syncthreads();
-        const int nsb_left = nsb - b * 8;
-        for (int sb = 0; sb < 8; ++sb) {
-            if (sb >= nsb_left) break;
-            bf16x16_t Alo, Ahi;
-            if (fake) { const short v = (short)(0x3F80 + sb + r16); for (int l = 0; l < 16; ++l) { Alo[l] = v; Ahi[l] = v; } } else moe_wfrag<F>(rp, b, sb, K, Alo, Ahi);
-#pragma unroll
-            for (int ct = 0; ct < CT; ++ct) {
-                const bf16x16_t B0 = *(const bf16x16_t*)&L.x[16 * ct + r16][sb * 32], B1 = *(const bf16x16_t*)&L.x[16 * ct + r16][sb * 32 + 16];
-                C[ct] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(B0, Alo, C[ct]);
-                C[ct] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(B1, Ahi, C[ct]);
-            }
-        }
-    }
-    if (row_real < N) {
-#pragma unroll
-        for (int ct = 0; ct < CT; ++ct)
-#pragma unroll
-            for (int l = 0; l < 8; ++l) { const int c = 16 * ct + 2 * l + half; if (c < tile.ncols) y[(size_t)(tile.k0 + c) * N + row] = C[ct][l]; }
-    }
-}
-template <WFmt F> static void launch_moe_gemm_bf16(const void* W, size_t ebytes, const MoeTile* tiles, int ntiles, int ct, const int* rowtab, const uint16_t* xb, float* y, int N, int K, hipStream_t s) {
-    if (ntiles <= 0) return;
-    const int grid = ntiles * ((N + 127) / 128);
-    if (ct == 1) k_moe_gemm_bf16<F, 1><<<grid, 256, 0, s>>>((const uint8_t*)W, ebytes, tiles, rowtab, xb, y, N, K, g_moe_fake);
-    else if (ct == 2) k_moe_gemm_bf16<F, 2><<<grid, 256, 0, s>>>((const uint8_t*)W, ebytes, tiles, rowtab, xb, y, N, K, g_moe_fake);
-    else k_moe_gemm_bf16<F, 3><<<grid, 256, 0, s>>>((const uint8_t*)W, ebytes, tiles, rowtab, xb, y, N, K, g_moe_fake);
-}
-static void moe_gemm_bf16_fmt(WFmt f, const void* W, size_t ebytes, const MoeTile* tiles, int ntiles, int ct, const int* rowtab, const uint16_t* xb, float* y, int N, int K, hipStream_t s) {
-    switch (f) {
-        case WFmt::Q4_K: launch_moe_gemm_bf16<WFmt::Q4_K>(W, ebytes, tiles, ntiles, ct, rowtab, xb, y, N, K, s); break;
-        case WFmt::Q5_K: launch_moe_gemm_bf16<WFmt::Q5_K>(W, ebytes, tiles, ntiles, ct, rowtab, xb, y, N, K, s); break;
-        case WFmt::Q5_1_SOA: launch_moe_gemm_bf16<WFmt::Q5_1_SOA>(W, ebytes, tiles, ntiles, ct, rowtab, xb, y, N, K, s); break;
-        case WFmt::Q8_0_SOA: launch_moe_gemm_bf16<WFmt::Q8_0_SOA>(W, ebytes, tiles, ntiles, ct, rowtab, xb, y, N, K, s); break;
-        default: fprintf(stderr, "moe_gemm_bf16: unsupported expert format\n"); abort();
-    }
-}
-
 // ======================= multi-segment GEMV (ncol = 1) =======================
 struct SegDev { const uint8_t* w; float* y; int N, K, fmt, block0; };
 struct SegArgs { SegDev s[4]; int n; };
@@ -1036,11 +921,6 @@ void moe_gemm(WFmt f, WFmt fs, const void* W, const void* Wsh, size_t ebytes, co
               const int* rowtab, XQ8 x, float* y, int N, int K, hipStream_t s) {
     moe_gemm_fmt(f, W, ebytes, tiles, ntiles, ct, rowtab, x, y, N, K, s);          // routed experts
     moe_gemm_fmt(fs, Wsh, 0, stiles, nstiles, ct, rowtab, x, y, N, K, s);          // the shared expert (its tiles carry expert = -1)
-}
-void moe_gemm_bf16(WFmt f, WFmt fs, const void* W, const void* Wsh, size_t ebytes, const MoeTile* tiles, int ntiles, const MoeTile* stiles, int nstiles, int ct,
-                   const int* rowtab, const uint16_t* xb, float* y, int N, int K, hipStream_t s) {
-    moe_gemm_bf16_fmt(f, W, ebytes, tiles, ntiles, ct, rowtab, xb, y, N, K, s);
-    moe_gemm_bf16_fmt(fs, Wsh, 0, stiles, nstiles, ct, rowtab, xb, y, N, K, s);
 }
 void gemv_moe(WFmt f, WFmt fs, const MoeSegs& a, int nseg, const int* ids, int nexp, XQ8 x, int N, int K, int T, bool xrow_te, hipStream_t s) {
     if (fs != WFmt::Q8_0_SOA && fs != f) { fprintf(stderr, "gemv_moe: unsupported shared-expert format\n"); abort(); }

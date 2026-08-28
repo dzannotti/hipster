@@ -74,15 +74,6 @@ __global__ void k_dequant_bf16(const uint8_t* __restrict__ W, uint16_t* __restri
     uint4 pk; pk.x = v[0] | ((uint32_t)v[1] << 16); pk.y = v[2] | ((uint32_t)v[3] << 16); pk.z = v[4] | ((uint32_t)v[5] << 16); pk.w = v[6] | ((uint32_t)v[7] << 16);
     *(uint4*)(out + (size_t)row * K + b * 256 + e0) = pk;
 }
-template <WFmt F>
-__global__ void k_dequant_f32(const uint8_t* __restrict__ W, float* __restrict__ out, int N, int K) {
-    const int nb = K / 256;
-    const size_t gb = (size_t)blockIdx.x * 8 + threadIdx.x / 32;
-    if (gb >= (size_t)N * nb) return;
-    const int row = (int)(gb / nb), b = (int)(gb % nb), e0 = 8 * (threadIdx.x % 32);
-#pragma unroll
-    for (int i = 0; i < 8; ++i) out[(size_t)row * K + b * 256 + e0 + i] = dq_elem<F>(W, row, b, e0 + i, nb, K);
-}
 // rows m < M of a [M][Nt] bf16 matrix, columns off..off+N -> f32 [M][N]
 __global__ void k_bf16_to_f32_seg(const uint16_t* __restrict__ x, int Nt, int off, int N, float* __restrict__ o, int M) {
     const size_t i = (size_t)blockIdx.x * 256 + threadIdx.x; if (i >= (size_t)M * N) return;
@@ -102,16 +93,6 @@ __global__ void k_f32_to_bf16(const float* __restrict__ x, uint16_t* __restrict_
 void bf16_to_f32_seg2(const uint16_t* x, const uint16_t* x2, int Nt, int off, int N, float* out, int M, hipStream_t s) { k_bf16_to_f32_seg2<<<(unsigned)(((size_t)M * N + 255) / 256), 256, 0, s>>>(x, x2, Nt, off, N, out, M); }
 void bf16_to_f32_seg(const uint16_t* x, int Nt, int off, int N, float* out, int M, hipStream_t s) { k_bf16_to_f32_seg<<<(unsigned)(((size_t)M * N + 255) / 256), 256, 0, s>>>(x, Nt, off, N, out, M); }
 void bf16_to_f32(const uint16_t* x, float* out, size_t n, hipStream_t s) { k_bf16_to_f32<<<(unsigned)((n + 255) / 256), 256, 0, s>>>(x, out, n); }
-void dequant_f32(WFmt f, const void* W, float* out, int N, int K, hipStream_t s) {
-    const int grid = (int)(((size_t)N * (K / 256) + 7) / 8);
-    switch (f) {
-        case WFmt::Q4_K: k_dequant_f32<WFmt::Q4_K><<<grid, 256, 0, s>>>((const uint8_t*)W, out, N, K); break;
-        case WFmt::Q6_K_SOA: k_dequant_f32<WFmt::Q6_K_SOA><<<grid, 256, 0, s>>>((const uint8_t*)W, out, N, K); break;
-        case WFmt::Q5_1_SOA: k_dequant_f32<WFmt::Q5_1_SOA><<<grid, 256, 0, s>>>((const uint8_t*)W, out, N, K); break;
-        case WFmt::Q5_K: k_dequant_f32<WFmt::Q5_K><<<grid, 256, 0, s>>>((const uint8_t*)W, out, N, K); break;
-        default: k_dequant_f32<WFmt::Q8_0_SOA><<<grid, 256, 0, s>>>((const uint8_t*)W, out, N, K); break;
-    }
-}
 void dequant_bf16(WFmt f, const void* W, uint16_t* out, int N, int K, hipStream_t s) {
     const int grid = (N * (K / 256) + 7) / 8;
     switch (f) {

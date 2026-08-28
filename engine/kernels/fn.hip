@@ -215,9 +215,6 @@ __global__ void __launch_bounds__(512) k_moe_route(const float* __restrict__ log
         if (lane == 0) { ids[t * (nexp + 1) + nexp] = -1; w[t * (nexp + 1) + nexp] = sigmoid(logits[t * 513 + 512]); }   // shared expert slot
     }
 }
-__global__ void k_moe_silu_bf16(const float* __restrict__ g, const float* __restrict__ u, uint16_t* __restrict__ out, int total) {
-    const int i = blockIdx.x * 256 + threadIdx.x; if (i < total) out[i] = f2bf(silu(g[i]) * u[i]);
-}
 __global__ void k_moe_silu_quant(const float* __restrict__ g, const float* __restrict__ u, int8_t* __restrict__ q, float* __restrict__ qd, float* __restrict__ qs, int total) {
     const int sb = blockIdx.x * 8 + threadIdx.x / 32, lane = threadIdx.x % 32;
     if (sb * 32 >= total) return;
@@ -317,7 +314,6 @@ void moe_route(const float* logits, int* ids, float* w, int T, hipStream_t s) { 
 void moe_gemv(WFmt fmt, WFmt shared_fmt, const MoeSegs& a, int nseg, const int* ids, int nexp, XQ8 xq, int N, int K, int T, hipStream_t s) {
     hip::gemv_moe(fmt, shared_fmt, a, nseg, ids, nexp, xq, N, K, T, K == 640, s);   // down-proj (K = 640) reads per-(t,e) rows
 }
-void moe_silu_bf16(const float* gate, const float* up, uint16_t* out, int rows, int n, hipStream_t s) { k_moe_silu_bf16<<<(rows * n + 255) / 256, 256, 0, s>>>(gate, up, out, rows * n); }
 void moe_silu_quant(const float* gate, const float* up, XQ8 xq, int rows, int n, hipStream_t s) { k_moe_silu_quant<<<(rows * n / 32 + 7) / 8, 256, 0, s>>>(gate, up, xq.q, xq.d, xq.s, rows * n); }
 void ple_apply(float* R, const float* key, const float* value, const float* w_key, const float* w_query, const float* w_conv_norm,
                const float* conv_w, float* conv_state, int T, float eps, hipStream_t s) {
