@@ -87,3 +87,17 @@ Next: (1) 16-row interleaved weight layout for the WMMA kernel (each wave's load
 2.9 KB apart; interleaving makes it one contiguous 2.3 KB read) — expected to close the 10–15% gap at ncol=1 and most of
 the ncol=8 gap; (2) a Q4_K draft-only LM head (the verify head stays exact); (3) adaptive n on prose (26% acceptance:
 n=7 wastes 5 rows per round; n=3 would give ~3 tokens/round at 75 ms).
+
+### n-gram map (llama.cpp `ngram-map-k4v`) in front of DFlash2
+
+`engine/src/ngram_map.{h,cpp}` ports llama.cpp's `common/ngram-map.cpp` (key = last 12 tokens incl. the sampled one, value
+= the up-to-48-token continuation seen after an earlier occurrence, ≤4 value slots with counts, the dominant one must
+be ≥2× the rest, accepted length fed back). llama.cpp orders speculators by a fixed priority — n-gram types first, draft
+models last — so `--spec-type draft-dflash,ngram-map-k4v` means "map first, DFlash2 when the map has nothing";
+`--spec-draft-n-max 5` caps both at 5. `dflash27b … 7 ngram` does the same (env `NGRAM_N/M/MIN_HITS`).
+
+512-token code generation (`docs/ref/code.json 512 7`): DFlash2 alone 54.3 t/s (79% acceptance, 6.55 tokens/round);
+with the map 55.0 t/s — the map drafted 9 of 78 rounds at 51% acceptance (`NGRAM_M=7`: 11 rounds, 49%). Both EXACT.
+Neutral here because our verify pass takes at most 7 drafts, so a map hit cannot draft more than DFlash2 does; the map
+pays when drafts can be long (repetitive output, re-generated context). The WMMA GEMV computes 16 columns in the same
+launch as 8, so raising the 27B verify pass to T=16 is the way to cash that in — next.
