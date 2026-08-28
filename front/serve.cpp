@@ -51,8 +51,10 @@ struct Server {
             if (id == think_close && reasoning) { reasoning = false; return; }
             if (id == think_open) { reasoning = true; return; }
             pending += T->piece(id);
-            // flush complete UTF-8 sequences
-            size_t ok = pending.size(); while (ok > 0) { unsigned char c = pending[ok - 1]; if ((c & 0xC0) != 0x80) { int need = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1; if (pending.size() - (ok - 1) < (size_t)need) ok -= 1; break; } if (pending.size() - ok >= 3) break; --ok; }
+            // flush complete UTF-8 sequences: keep an incomplete trailing multi-byte character for the next piece
+            size_t ok = pending.size();
+            { size_t p = pending.size(); int back = 0; while (p > 0 && back < 4 && ((unsigned char)pending[p - 1] & 0xC0) == 0x80) { --p; ++back; }   // p: last lead byte (or ascii)
+              if (p > 0) { unsigned char c = pending[p - 1]; int need = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1; if (pending.size() - (p - 1) < (size_t)need) ok = p - 1; } }
             if (ok > 0) { emit(pending.substr(0, ok), reasoning); pending.erase(0, ok); }
         };
         std::vector<float> host; int id_last; { id_last = pick(m->logits(), p, host); }
