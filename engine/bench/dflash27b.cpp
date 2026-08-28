@@ -114,7 +114,11 @@ int main(int argc, char** argv) {
       std::vector<std::vector<int>> batch(n_slots); std::vector<int> nd(n_slots);
       while (total < n_gen * n_slots) {
           double ta = now_ms(); hip::SlotReq reqs[8];
-          for (int s = 0; s < n_slots; ++s) { int dr[8]; nd[s] = m.dflash_draft(s, idl[s], pos[s], n_draft, dr); batch[s].assign(1, idl[s]); for (int i = 0; i < nd[s]; ++i) batch[s].push_back(dr[i]); reqs[s] = {s, batch[s].data(), (int)batch[s].size(), pos[s]}; }
+          { std::vector<int> sl(n_slots), dr((size_t)n_slots * n_draft); for (int s = 0; s < n_slots; ++s) sl[s] = s;
+            static const bool sep = getenv("SEPDRAFT") != nullptr;   // debug: one draft pass per slot
+            if (sep) for (int s = 0; s < n_slots; ++s) nd[s] = m.dflash_draft(s, idl[s], pos[s], n_draft, dr.data() + (size_t)s * n_draft);
+            else { const int k = m.dflash_draft_b(sl.data(), idl.data(), pos.data(), n_slots, n_draft, dr.data()); for (int s = 0; s < n_slots; ++s) nd[s] = k; }
+            for (int s = 0; s < n_slots; ++s) { batch[s].assign(1, idl[s]); for (int i = 0; i < nd[s]; ++i) batch[s].push_back(dr[(size_t)s * n_draft + i]); reqs[s] = {s, batch[s].data(), (int)batch[s].size(), pos[s]}; } }
           t_draft += now_ms() - ta; ta = now_ms();
           int rows = 0; for (int s = 0; s < n_slots; ++s) rows += reqs[s].T;
           static const bool split = getenv("SPLIT") != nullptr;   // debug: one pass per slot instead of one batched pass

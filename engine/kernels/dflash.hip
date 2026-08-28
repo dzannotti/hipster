@@ -25,21 +25,22 @@ __device__ __forceinline__ void dq_q4k_block(const uint8_t* blk, int e, float& o
 }
 
 // ---- conv: block per (row t, 1024 channels); 256 threads x 4 channels ----
-__global__ void __launch_bounds__(256) k_conv(const float* __restrict__ x, const float* __restrict__ delta, const float* __restrict__ base, int side, int T,
+__global__ void __launch_bounds__(256) k_conv(const float* __restrict__ x, const float* __restrict__ delta, const float* __restrict__ base, int side, int T, int B,
                                               float* __restrict__ out, int8_t* __restrict__ q, float* __restrict__ qd, float* __restrict__ qs) {
     const int t = blockIdx.x / (E / 1024), c0 = (blockIdx.x % (E / 1024)) * 1024, lane = threadIdx.x % 32;
     for (int k = 0; k < 4; ++k) {
         const int c = c0 + k * 256 + threadIdx.x, g = c / CONV_G;
         const float* dl = delta + (size_t)t * (2 * 2 * N_GROUPS);
         const float w0 = base[c + E * 0 + 2 * E * side] + dl[g + N_GROUPS * (0 + 2 * side)], w1 = base[c + E * 1 + 2 * E * side] + dl[g + N_GROUPS * (1 + 2 * side)];
-        const float v = w0 * x[(size_t)t * E + c] + (t > 0 ? w1 * x[(size_t)(t - 1) * E + c] : 0.f);
+        const float v = w0 * x[(size_t)t * E + c] + ((t % B) > 0 ? w1 * x[(size_t)(t - 1) * E + c] : 0.f);
         if (out) out[(size_t)t * E + c] = v;
         if (q) wave_quant32(v, q, qd, qs, (int)(((size_t)t * E + c) / 32), lane);
     }
 }
 // ---- norm + rope (128 dims, NEOX pairs (i, i+64)) + cache write: block per (t, head); heads 0..31 = q, 32..39 = k (+ v copy) ----
 __global__ void __launch_bounds__(128) k_qk_rope_kv(float* __restrict__ q, float* __restrict__ k, const float* __restrict__ v, const float* __restrict__ qw, const float* __restrict__ kw,
-                                                    float base, const int* __restrict__ pos, uint16_t* __restrict__ kc, uint16_t* __restrict__ vc, int max_ctx, float eps) {
+                                                    float base, const int* __restrict__ pos, int B, const Blk* __restrict__ blk, size_t slot_stride,
+                                                    uint16_t* __restrict__ kc, uint16_t* __restrict__ vc, int max_ctx, float eps) {
     __shared__ float sh[8]; __shared__ float buf[HD];
     const int nh = q ? NQ + NKV : NKV;
     const int t = blockIdx.x / nh, hh = blockIdx.x % nh, d = threadIdx.x;
@@ -51,15 +52,17 @@ __global__ void __launch_bounds__(128) k_qk_rope_kv(float* __restrict__ q, float
     { const int i = d % 64; const float theta = (float)pos[t] * powf(base, -2.f * i / HD); float s, c; sincosf(theta, &s, &c);
       const float x0 = buf[i], x1 = buf[i + 64]; n = d < 64 ? x0 * c - x1 * s : x0 * s + x1 * c; }
     if (isq) x[d] = n;
-    else { kc[((size_t)h * max_ctx + pos[t]) * HD + d] = f2h(n); vc[((size_t)h * max_ctx + pos[t]) * HD + d] = f2h(v[((size_t)t * NKV + h) * HD + d]); }
+    else { const size_t so = blk ? (size_t)blk[t / B].slot * slot_stride : 0;
+           kc[so + ((size_t)h * max_ctx + pos[t]) * HD + d] = f2h(n); vc[so + ((size_t)h * max_ctx + pos[t]) * HD + d] = f2h(v[((size_t)t * NKV + h) * HD + d]); }
 }
 // ---- attention: block per (t, q head), 256 threads; keys [lo, key_end) ----
-__global__ void __launch_bounds__(256) k_attend(const float* __restrict__ q, const uint16_t* __restrict__ kc, const uint16_t* __restrict__ vc, const int* __restrict__ pos, int key_end, int max_ctx,
-                                                float* __restrict__ out, int8_t* __restrict__ oq, float* __restrict__ od, float* __restrict__ os) {
+__global__ void __launch_bounds__(256) k_attend(const float* __restrict__ q, const uint16_t* __restrict__ kc, const uint16_t* __restrict__ vc, const int* __restrict__ pos, int B, const Blk* __restrict__ blk,
+                                                size_t slot_stride, int max_ctx, float* __restrict__ out, int8_t* __restrict__ oq, float* __restrict__ od, float* __restrict__ os) {
     __shared__ float sh[8]; __shared__ float sq[HD]; __shared__ float sc[2048];
     const int t = blockIdx.x / NQ, h = blockIdx.x % NQ, kh = h / (NQ / NKV), tid = threadIdx.x;
-    const int lo = max(0, pos[t] - WINDOW + 1), n = key_end - lo;
-    const uint16_t* K = kc + (size_t)kh * max_ctx * HD; const uint16_t* V = vc + (size_t)kh * max_ctx * HD;
+    const Blk bk = blk[t / B];
+    const int lo = max(0, pos[t] - WINDOW + 1), n = bk.key_end - lo;
+    const uint16_t* K = kc + (size_t)bk.slot * slot_stride + (size_t)kh * max_ctx * HD; const uint16_t* V = vc + (size_t)bk.slot * slot_stride + (size_t)kh * max_ctx * HD;
     if (tid < HD) sq[tid] = q[((size_t)t * NQ + h) * HD + tid];
     __syncthreads();
     float gmax = -INFINITY, gsum = 0.f, o = 0.f;
@@ -80,12 +83,13 @@ __global__ void __launch_bounds__(256) k_attend(const float* __restrict__ q, con
 }
 // ---- selector: block per position i in 1..T-1, 256 threads ----
 __global__ void __launch_bounds__(256) k_selector(const int* __restrict__ ids, const float* __restrict__ vals, const float* __restrict__ gate, const uint8_t* __restrict__ A, const uint8_t* __restrict__ B,
-                                                  int anchor, float* __restrict__ lattice) {
+                                                  const Blk* __restrict__ blk, int Bsz, float* __restrict__ lattice) {
     __shared__ float sB[TOPK][RANK]; __shared__ float sA[TOPK][RANK]; __shared__ float sg[RANK];
-    const int i = blockIdx.x + 1, tid = threadIdx.x;
-    const int npred = i == 1 ? 1 : TOPK;
+    const int b = blockIdx.x / (Bsz - 1), ii = blockIdx.x % (Bsz - 1) + 1, tid = threadIdx.x;
+    const int i = b * Bsz + ii, anchor = blk[b].anchor;   // row i of block b; position ii inside it
+    const int npred = ii == 1 ? 1 : TOPK;
     for (int e = tid; e < TOPK * RANK; e += 256) { const int c = e / RANK, r = e % RANK; float v; dq_q4k_block(B + (size_t)ids[i * TOPK + c] * 144, r, v); sB[c][r] = v; }
-    for (int e = tid; e < npred * RANK; e += 256) { const int p = e / RANK, r = e % RANK; const int pid = i == 1 ? anchor : ids[(i - 1) * TOPK + p]; float v; dq_q4k_block(A + (size_t)pid * 144, r, v); sA[p][r] = v; }
+    for (int e = tid; e < npred * RANK; e += 256) { const int p = e / RANK, r = e % RANK; const int pid = ii == 1 ? anchor : ids[(i - 1) * TOPK + p]; float v; dq_q4k_block(A + (size_t)pid * 144, r, v); sA[p][r] = v; }
     if (tid < RANK) sg[tid] = gate[(size_t)i * RANK + tid];
     __syncthreads();
     float* row = lattice + (size_t)i * LATTICE;
@@ -94,14 +98,15 @@ __global__ void __launch_bounds__(256) k_selector(const int* __restrict__ ids, c
 }
 }  // namespace
 
-void conv(const float* x, const float* delta, const float* base, int side, int T, float* out, XQ8 xq, hipStream_t s) { k_conv<<<T * (E / 1024), 256, 0, s>>>(x, delta, base, side, T, out, xq.q, xq.d, xq.s); }
-void qk_rope_kv(float* q, float* k, const float* v, const float* qw, const float* kw, float base, const int* pos, int T, uint16_t* kc, uint16_t* vc, int max_ctx, float eps, hipStream_t s) {
-    k_qk_rope_kv<<<T * (q ? NQ + NKV : NKV), HD, 0, s>>>(q, k, v, qw, kw, base, pos, kc, vc, max_ctx, eps);
+void conv(const float* x, const float* delta, const float* base, int side, int T, int B, float* out, XQ8 xq, hipStream_t s) { k_conv<<<T * (E / 1024), 256, 0, s>>>(x, delta, base, side, T, B, out, xq.q, xq.d, xq.s); }
+void qk_rope_kv(float* q, float* k, const float* v, const float* qw, const float* kw, float base, const int* pos, int T, int B, const Blk* blk, size_t slot_stride,
+                uint16_t* kc, uint16_t* vc, int max_ctx, float eps, hipStream_t s) {
+    k_qk_rope_kv<<<T * (q ? NQ + NKV : NKV), HD, 0, s>>>(q, k, v, qw, kw, base, pos, B, blk, slot_stride, kc, vc, max_ctx, eps);
 }
-void attend(const float* q, const uint16_t* kc, const uint16_t* vc, const int* pos, int key_end, int T, int max_ctx, float* out, XQ8 xq, hipStream_t s) {
-    k_attend<<<T * NQ, 256, 0, s>>>(q, kc, vc, pos, key_end, max_ctx, out, xq.q, xq.d, xq.s);
+void attend(const float* q, const uint16_t* kc, const uint16_t* vc, const int* pos, int T, int B, const Blk* blk, size_t slot_stride, int max_ctx, float* out, XQ8 xq, hipStream_t s) {
+    k_attend<<<T * NQ, 256, 0, s>>>(q, kc, vc, pos, B, blk, slot_stride, max_ctx, out, xq.q, xq.d, xq.s);
 }
-void selector(const int* ids, const float* vals, const float* gate, const void* A, const void* B, int anchor, int T, float* lattice, hipStream_t s) {
-    if (T > 1) k_selector<<<T - 1, 256, 0, s>>>(ids, vals, gate, (const uint8_t*)A, (const uint8_t*)B, anchor, lattice);
+void selector(const int* ids, const float* vals, const float* gate, const void* A, const void* Bm, const Blk* blk, int S, int B, float* lattice, hipStream_t s) {
+    if (B > 1) k_selector<<<S * (B - 1), 256, 0, s>>>(ids, vals, gate, (const uint8_t*)A, (const uint8_t*)Bm, blk, B, lattice);
 }
 }  // namespace hip::dfl

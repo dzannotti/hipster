@@ -122,6 +122,10 @@ checked against plain greedy):
 | 2 slots | 194 | **78.0** | 39.0 | 133 / 33 |
 | 2 slots | 1038 | 78.0 | 39.0 | 135 / 34 |
 
-Above Flash-Next's 8-slot plain-decode aggregate (80 t/s) with two streams. Next: one 16-row draft pass for both
-slots (the two 8-row draft calls cost 33 ms; one batched call ≈ 20) → ~85 t/s; a third slot needs a 24-row verify
-(two GEMV launches) and does not pay.
+| 2 slots, one 16-row draft pass (`dflash_draft_b`) | 194 | **84.7** | 42.4 | 133 / 20 |
+| 2 slots, batched draft | 1038 | 84.5 | 42.3 | 135 / 21 |
+
+The draft kernels are block-aware (`dfl::Blk{slot, key_end, anchor}` per block of 1+nd rows: the conv never crosses a
+block, attention/K-V writes address the block's slot cache, the selector uses the block's anchor), so both slots' blocks
+go through one draft pass (16 GEMV columns). Above Flash-Next's 8-slot plain-decode aggregate (80 t/s) with two streams.
+A third slot needs a 24-row verify (two GEMV launches, ≈2.3× a single pass for 3× the tokens) and does not pay.

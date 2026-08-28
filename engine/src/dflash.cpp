@@ -37,8 +37,9 @@ void Qwen35::load_dflash(const std::string& path) {
         L.ffn_gate = upload_lin(g, p + "ffn_gate.weight"); L.ffn_up = upload_lin(g, p + "ffn_up.weight"); L.ffn_down = upload_lin(g, p + "ffn_down.weight");
         dfl_->layers.push_back(L);
     }
-    const int T = D::max_T;
+    const int T = MAXR;
     CK(hipMalloc(&dfl_feat_, (size_t)MAXR * 5 * E * 4)); CK(hipMalloc(&dfl_g_, (size_t)T * E * 4)); CK(hipMalloc(&dfl_x_, (size_t)T * E * 4)); CK(hipMalloc(&dfl_y_, (size_t)T * E * 4));
+    CK(hipMalloc(&dfl_blk_, (size_t)MAXR * sizeof(dfl::Blk)));
     CK(hipMalloc(&dfl_q_, (size_t)T * NQ * HD * 4)); CK(hipMalloc(&dfl_k_, (size_t)T * NKV * HD * 4)); CK(hipMalloc(&dfl_v_, (size_t)T * NKV * HD * 4)); CK(hipMalloc(&dfl_o_, (size_t)T * NQ * HD * 4));
     CK(hipMalloc(&dfl_delta_, (size_t)T * 4 * N_GROUPS * 4)); CK(hipMalloc(&dfl_logits_, (size_t)T * D::n_vocab * 4)); CK(hipMalloc(&dfl_gate_, (size_t)T * RANK * 4));
     CK(hipMalloc(&dfl_lattice_, (size_t)T * LATTICE * 4)); CK(hipMalloc(&dfl_pos_, T * 4)); CK(hipMalloc(&dfl_tok_, T * 4));
@@ -58,49 +59,54 @@ void Qwen35::dflash_encode(int slot, int T, int pos0) {
         const DflashLayer& L = dfl_->layers[l];
         GemvSeg segs[2] = {{L.wk.fmt, L.wk.w, dfl_k_, L.wk.N, L.wk.K}, {L.wv.fmt, L.wv.w, dfl_v_, L.wv.N, L.wv.K}};
         lin_multi(segs, 2, T);
-        qk_rope_kv(nullptr, dfl_k_, dfl_v_, nullptr, L.k_norm, D::rope_base, dfl_pos_, T, kcs + l * dfl_layer_stride_, vcs + l * dfl_layer_stride_, max_ctx_, D::rms_eps, s_);
+        qk_rope_kv(nullptr, dfl_k_, dfl_v_, nullptr, L.k_norm, D::rope_base, dfl_pos_, T, T, nullptr, 0, kcs + l * dfl_layer_stride_, vcs + l * dfl_layer_stride_, max_ctx_, D::rms_eps, s_);
     }
 }
 
-int Qwen35::dflash_draft(int slot, int id_last, int n, int nd, int* out) {
-    const int T = 1 + nd; if (T > D::max_T) throw std::runtime_error("dflash_draft: T > max_T");
-    uint16_t* kcs = dfl_kc_ + (size_t)slot * dfl_slot_stride_; uint16_t* vcs = dfl_vc_ + (size_t)slot * dfl_slot_stride_;
-    std::vector<int> tok(T, dfl_->mask_id), pos(T); tok[0] = id_last; for (int i = 0; i < T; ++i) pos[i] = n + i;
+int Qwen35::dflash_draft_b(const int* slots, const int* id_last, const int* n, int S, int nd, int* out) {
+    const int B = 1 + nd, T = S * B;
+    if (B > D::max_T || T > MAXR || S < 1) throw std::runtime_error("dflash_draft: bad block/rows");
+    std::vector<int> tok(T, dfl_->mask_id), pos(T); std::vector<dfl::Blk> blk(S);
+    for (int b = 0; b < S; ++b) { tok[b * B] = id_last[b]; for (int i = 0; i < B; ++i) pos[b * B + i] = n[b] + i; blk[b] = {slots[b], n[b] + B, id_last[b]}; }
     CK(hipMemcpyAsync(dfl_tok_, tok.data(), T * 4, hipMemcpyHostToDevice, s_)); CK(hipMemcpyAsync(dfl_pos_, pos.data(), T * 4, hipMemcpyHostToDevice, s_));
+    CK(hipMemcpyAsync(dfl_blk_, blk.data(), S * sizeof(dfl::Blk), hipMemcpyHostToDevice, s_));
     embed_q4_K(tok_embd_, dfl_tok_, T, dfl_x_, E, s_);
     const XQ8 noq{nullptr, nullptr, nullptr}; const float* pend = nullptr;
     for (size_t l = 0; l < dfl_->layers.size(); ++l) {
         const DflashLayer& L = dfl_->layers[l];
+        uint16_t* kcl = dfl_kc_ + l * dfl_layer_stride_; uint16_t* vcl = dfl_vc_ + l * dfl_layer_stride_;   // + slot * dfl_slot_stride_ inside the kernels
         add_rmsnorm_quant(dfl_x_, pend, L.attn_norm, xn_, xq_, T, E, D::rms_eps, s_);
         lin(L.attn_conv_proj, dfl_delta_, T);
-        conv(xn_, dfl_delta_, L.attn_conv_base, 0, T, nullptr, xq_, s_);
+        conv(xn_, dfl_delta_, L.attn_conv_base, 0, T, B, nullptr, xq_, s_);
         GemvSeg qkv[3] = {{L.wq.fmt, L.wq.w, dfl_q_, L.wq.N, L.wq.K}, {L.wk.fmt, L.wk.w, dfl_k_, L.wk.N, L.wk.K}, {L.wv.fmt, L.wv.w, dfl_v_, L.wv.N, L.wv.K}};
         lin_multi(qkv, 3, T);
-        qk_rope_kv(dfl_q_, dfl_k_, dfl_v_, L.q_norm, L.k_norm, D::rope_base, dfl_pos_, T, kcs + l * dfl_layer_stride_, vcs + l * dfl_layer_stride_, max_ctx_, D::rms_eps, s_);
-        attend(dfl_q_, kcs + l * dfl_layer_stride_, vcs + l * dfl_layer_stride_, dfl_pos_, n + T, T, max_ctx_, dfl_o_, xq_, s_);
+        qk_rope_kv(dfl_q_, dfl_k_, dfl_v_, L.q_norm, L.k_norm, D::rope_base, dfl_pos_, T, B, dfl_blk_, dfl_slot_stride_, kcl, vcl, max_ctx_, D::rms_eps, s_);
+        attend(dfl_q_, kcl, vcl, dfl_pos_, T, B, dfl_blk_, dfl_slot_stride_, max_ctx_, dfl_o_, xq_, s_);
         lin(L.wo, dfl_y_, T);
-        conv(dfl_y_, dfl_delta_, L.attn_conv_base, 1, T, big2_, noq, s_);
+        conv(dfl_y_, dfl_delta_, L.attn_conv_base, 1, T, B, big2_, noq, s_);
         add_rmsnorm_quant(dfl_x_, big2_, L.ffn_norm, xn_, xq_, T, E, D::rms_eps, s_);
         lin(L.ffn_conv_proj, dfl_delta_, T);
-        conv(xn_, dfl_delta_, L.ffn_conv_base, 0, T, nullptr, xq_, s_);
+        conv(xn_, dfl_delta_, L.ffn_conv_base, 0, T, B, nullptr, xq_, s_);
         GemvSeg gu[2] = {{L.ffn_gate.fmt, L.ffn_gate.w, big0_, L.ffn_gate.N, L.ffn_gate.K}, {L.ffn_up.fmt, L.ffn_up.w, big1_, L.ffn_up.N, L.ffn_up.K}};
         lin_multi(gu, 2, T);
         silu_mul_quant(big0_, big1_, xq_, T * D::n_ff, s_);
         lin(L.ffn_down, dfl_y_, T);
-        conv(dfl_y_, dfl_delta_, L.ffn_conv_base, 1, T, big2_, noq, s_);
+        conv(dfl_y_, dfl_delta_, L.ffn_conv_base, 1, T, B, big2_, noq, s_);
         pend = big2_;
     }
     add_rmsnorm_quant(dfl_x_, pend, dfl_->out_norm, xn_, xq_, T, E, D::rms_eps, s_);
     lin(output_, dfl_logits_, T);
     argmax_topk(dfl_logits_, T, D::n_vocab, TOPK, d_ids_, d_vals_, s_);
     lin(dfl_->selector_hidden, dfl_gate_, T);
-    selector(d_ids_, d_vals_, dfl_gate_, dfl_->sel_pred, dfl_->sel_succ, id_last, T, dfl_lattice_, s_);
+    selector(d_ids_, d_vals_, dfl_gate_, dfl_->sel_pred, dfl_->sel_succ, dfl_blk_, S, B, dfl_lattice_, s_);
     std::vector<float> lat((size_t)T * LATTICE);
     CK(hipMemcpyAsync(lat.data(), dfl_lattice_, lat.size() * 4, hipMemcpyDeviceToHost, s_)); CK(hipStreamSynchronize(s_));
-    int pred = 0;
-    for (int i = 1; i < T; ++i) {
-        const float* row = lat.data() + (size_t)i * LATTICE; const float* sc = row + TOPK + pred * TOPK;
-        pred = (int)(std::max_element(sc, sc + TOPK) - sc); out[i - 1] = (int)row[pred];
+    for (int b = 0; b < S; ++b) {
+        int pred = 0;
+        for (int i = 1; i < B; ++i) {
+            const float* row = lat.data() + (size_t)(b * B + i) * LATTICE; const float* sc = row + TOPK + pred * TOPK;
+            pred = (int)(std::max_element(sc, sc + TOPK) - sc); out[b * nd + i - 1] = (int)row[pred];
+        }
     }
     return nd;
 }

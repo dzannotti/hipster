@@ -75,7 +75,9 @@ public:
     bool has_dflash() const { return dfl_ != nullptr; }
     void dflash_encode(int slot, int T, int pos0);                       // the slot's first T rows of the last forward
     void dflash_encode(int T, int pos0) { dflash_encode(0, T, pos0); }
-    int dflash_draft(int slot, int id_last, int n, int nd, int* out);    // returns the number of drafts (greedy selector walk)
+    // S sequences in one draft pass (S*(1+nd) rows <= MAXR): out[s*nd + i]; returns nd (greedy selector walk per block)
+    int dflash_draft_b(const int* slots, const int* id_last, const int* n, int S, int nd, int* out);
+    int dflash_draft(int slot, int id_last, int n, int nd, int* out) { return dflash_draft_b(&slot, &id_last, &n, 1, nd, out); }
     int dflash_draft(int id_last, int n, int nd, int* out) { return dflash_draft(0, id_last, n, nd, out); }
     const float* logits() const { return logits_; }
     const float* h_nextn() const { return h_; }
@@ -127,7 +129,7 @@ private:
     GemvSeg next_pf_[4], next2_pf_[4]; int next_pfn_ = 0, next2_pfn_ = 0;
     DflashDraft* dfl_ = nullptr; GGUF* dfl_gguf_ = nullptr;
     float *dfl_feat_ = nullptr, *dfl_g_, *dfl_x_, *dfl_y_, *dfl_q_, *dfl_k_, *dfl_v_, *dfl_o_, *dfl_delta_, *dfl_logits_, *dfl_gate_, *dfl_lattice_, *dfl_vals_; int *dfl_ids_, *dfl_pos_, *dfl_tok_;
-    uint16_t *dfl_kc_, *dfl_vc_; size_t dfl_layer_stride_, dfl_slot_stride_;
+    uint16_t *dfl_kc_, *dfl_vc_; size_t dfl_layer_stride_, dfl_slot_stride_; dfl::Blk* dfl_blk_;
     void prefetch(const GemvSeg* segs, int n);
     BlasLt blas_;
     int* d_tok_;
