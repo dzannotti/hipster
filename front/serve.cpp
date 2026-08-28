@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstring>
 #include <chrono>
+#include <ctime>
 #include <random>
 #include <algorithm>
 #include <hip/hip_runtime.h>
@@ -228,11 +229,11 @@ js::Value timings_json(int prompt_n, double prefill_s, int predicted_n, double g
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string model, draft, host = "127.0.0.1", ui_dir = "/models/.work/fn-tree/build/tools/ui/dist"; int port = 8090, ctx = 16384, chunk = 2048, mtp = 2, ndraft = 7, slots = 1;
+    std::string model, draft, host = "127.0.0.1", ui_dir = "/models/.work/fn-tree/build/tools/ui/dist"; int port = 8090, ctx = 16384, chunk = 2048, mtp = 2, ndraft = 7, slots = 1; bool router = true;
     for (int i = 1; i < argc; ++i) { std::string a = argv[i]; auto next = [&] { return std::string(argv[++i]); };
         if (a == "--model") model = next(); else if (a == "--draft") draft = next(); else if (a == "--port") port = atoi(next().c_str()); else if (a == "--host") host = next(); else if (a == "--ctx") ctx = atoi(next().c_str());
-        else if (a == "--chunk") chunk = atoi(next().c_str()); else if (a == "--mtp") mtp = atoi(next().c_str()); else if (a == "--ndraft") ndraft = atoi(next().c_str()); else if (a == "--slots") slots = atoi(next().c_str()); else if (a == "--ui-dir") ui_dir = next(); }
-    if (model.empty()) { fprintf(stderr, "usage: hipster-serve --model <gguf> [--draft <dflash2.gguf>] [--port 8090] [--host 127.0.0.1] [--ctx 16384] [--chunk 2048] [--mtp 2] [--ndraft 7] [--slots 2]\n"); return 2; }
+        else if (a == "--chunk") chunk = atoi(next().c_str()); else if (a == "--mtp") mtp = atoi(next().c_str()); else if (a == "--ndraft") ndraft = atoi(next().c_str()); else if (a == "--slots") slots = atoi(next().c_str()); else if (a == "--ui-dir") ui_dir = next(); else if (a == "--no-router") router = false; }
+    if (model.empty()) { fprintf(stderr, "usage: hipster-serve --model <gguf> [--draft <dflash2.gguf>] [--port 8090] [--host 127.0.0.1] [--ctx 16384] [--chunk 2048] [--mtp 2] [--ndraft 7] [--slots 2] [--no-router]\n"); return 2; }
     std::string arch; { hip::GGUF g(model); arch = g.arch(); }
     const bool is27b = arch == "qwen35";
     if (is27b) chunk = std::min(chunk, hip::Qwen35Dims::max_prefill);
@@ -249,6 +250,7 @@ int main(int argc, char** argv) {
     fprintf(stderr, "ready: %s, ctx %d, chunk %d, drafts %d, slots %d, weights %.1f GiB\n", S.model_name.c_str(), ctx, chunk, mtp, be->n_slots(), be->weight_bytes() / 1073741824.0);
     http::serve(host, port, [&](const http::Request& req0, http::Response& res) {
         http::Request req = req0; { size_t q = req.path.find('?'); if (q != std::string::npos) req.path = req.path.substr(0, q); }   // route without the query string
+        if (getenv("HIPSTER_LOG_REQ")) fprintf(stderr, "[req] %s %s (%zu bytes)%s\n", req.method.c_str(), req0.path.c_str(), req.body.size(), req.headers.count("authorization") ? " auth" : "");
         if (req.method == "OPTIONS") { res.send(200, "text/plain", ""); return; }
         if (req.path == "/health") { res.send(200, "application/json", "{\"status\":\"ok\"}"); return; }
         if (req.path == "/props") {   // what llama.cpp's web UI reads
@@ -257,11 +259,33 @@ int main(int argc, char** argv) {
             js::Value mod = js::Value::object(); mod["vision"] = false; mod["video"] = false; mod["audio"] = false; v["modalities"] = mod;
             v["endpoint_slots"] = false; v["endpoint_props"] = true; v["endpoint_metrics"] = false; v["ui"] = true; v["ui_settings"] = js::Value::object();
             v["chat_template"] = ""; v["chat_template_caps"] = js::Value::object(); v["bos_token"] = ""; v["eos_token"] = "<|im_end|>"; v["build_info"] = "hipster"; v["is_sleeping"] = false; v["cors_proxy_enabled"] = false;
+            if (router) { v["role"] = "router"; v["max_instances"] = 1; v["models_autoload"] = true; }   // one model, always loaded (--no-router hides this)
             res.send(200, "application/json", js::dump(v)); return; }
         static const char* api_paths[] = {"/slots", "/metrics", "/tokenize", "/detokenize", "/apply-template", "/completion", "/infill", "/embedding", "/embeddings", "/rerank", "/models", "/api/", "/props", "/health"};
         bool api = req.path.rfind("/v1", 0) == 0; for (const char* a : api_paths) if (req.path.rfind(a, 0) == 0) api = true;
         if (req.method == "GET" && !api && serve_static(ui_dir, req.path, res)) return;
-        if (req.path == "/v1/models" || req.path == "/models") { js::Value v = js::Value::object(); v["object"] = "list"; js::Value md = js::Value::object(); md["id"] = S.model_name; md["object"] = "model"; md["owned_by"] = "hipster"; v["data"] = js::Value::array(); v["data"].push(md); res.send(200, "application/json", js::dump(v)); return; }
+        if ((req.path == "/v1/models" || req.path == "/models") && req.method == "GET") {   // OpenAI list; with --router also llama.cpp's router fields (status, architecture)
+            js::Value v = js::Value::object(); v["object"] = "list";
+            js::Value md = js::Value::object(); md["id"] = S.model_name; md["object"] = "model"; md["owned_by"] = "hipster"; md["created"] = (double)(long)std::time(nullptr);
+            if (router) {
+                js::Value st = js::Value::object(); st["value"] = "loaded"; st["args"] = js::Value::array(); md["status"] = st;
+                js::Value ar = js::Value::object(); js::Value in = js::Value::array(); in.push(js::Value(std::string("text"))); ar["input_modalities"] = in;
+                js::Value out = js::Value::array(); out.push(js::Value(std::string("text"))); ar["output_modalities"] = out; md["architecture"] = ar;
+                md["aliases"] = js::Value::array(); md["tags"] = js::Value::array(); md["source"] = "models_dir"; md["can_remove"] = false; md["n_ctx"] = ctx;
+            }
+            v["data"] = js::Value::array(); v["data"].push(md); res.send(200, "application/json", js::dump(v)); return; }
+        if (router && req.path == "/models/load") {   // single-model server: loading the model we serve is a no-op
+            const std::string want = js::parse(req.body).str("model");
+            if (want.empty() || want == S.model_name) { res.send(200, "application/json", "{\"success\":true}"); return; }
+            res.send(404, "application/json", "{\"error\":{\"message\":\"this server serves only " + S.model_name + "\",\"type\":\"not_found\"}}"); return; }
+        if (router && (req.path == "/models/unload" || (req.path == "/models" && req.method != "GET"))) {
+            res.send(400, "application/json", "{\"error\":{\"message\":\"hipster serves one fixed model: loading, unloading and adding models are not supported\",\"type\":\"invalid_request_error\"}}"); return; }
+        if (router && req.path == "/models/sse") {   // state stream: one event with the current state, then keepalives until the client goes away
+            res.begin_stream("text/event-stream");
+            js::Value ev = js::Value::object(); ev["model"] = S.model_name; ev["status"] = "loaded";
+            res.chunk("data: " + js::dump(ev) + "\n\n");
+            try { while (true) { std::this_thread::sleep_for(std::chrono::seconds(15)); res.chunk(": keepalive\n\n"); } } catch (...) {}
+            res.end(); return; }
         const bool chat_ep = req.path == "/v1/chat/completions", comp_ep = req.path == "/v1/completions";
         if (!chat_ep && !comp_ep) { res.send(404, "application/json", "{\"error\":{\"message\":\"not found\"}}"); return; }
         js::Value body = js::parse(req.body);

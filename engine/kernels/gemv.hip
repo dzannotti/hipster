@@ -618,33 +618,38 @@ __global__ void __launch_bounds__(256) k_gemv_wmma(SegArgs a, const int8_t* __re
     for (int l = 0; l < 8; ++l) acc[l] = 0.f;
     if (row_base < N) {
         const uint8_t* rp = IL ? W + (size_t)(row_base / 16) * nb * (16 * wfmt_block_bytes(F)) : row_ptr<F>(W, min(row_base + r16, N - 1), K);
-        const int8_t* xcol = xq + (size_t)r16 * K;
+        // per-lane pointers advanced once per block: the loads below use immediate offsets (8 pointer adds per block instead
+        // of a 64-bit address computation per load: 288 VALU of the 932 in the Q5_K loop were address arithmetic)
+        const int8_t* xp = xq + (size_t)r16 * K + (size_t)ks * 256;
+        const float* pd[8]; const float* ps[8]; const float2* pds[8];
+#pragma unroll
+        for (int l = 0; l < 8; ++l) { const int col = 2 * l + half; pd[l] = xd + (size_t)col * nsb + ks * 8; ps[l] = xs + (size_t)col * nsb + ks * 8; pds[l] = DS ? xds + (size_t)col * nsb + ks * 8 : nullptr; }
         Dec cur; if (ks < nb) { if constexpr (IL) cur.load_il(rp, r16, ks, K); else cur.load(rp, ks, K); }
         for (int b = ks; b < nb; b += KS) {
             Dec nxt;   // software pipeline: the next block's weights are in flight while this block is computed
             if (b + KS < nb) { if constexpr (IL) nxt.load_il(rp, r16, b + KS, K); else nxt.load(rp, b + KS, K); }
 #pragma unroll
             for (int sb = 0; sb < 8; ++sb) {
-                const int32x4_t B0 = *(const int32x4_t*)(xcol + b * 256 + sb * 32), B1 = *(const int32x4_t*)(xcol + b * 256 + sb * 32 + 16);
+                const int32x4_t B0 = *(const int32x4_t*)(xp + sb * 32), B1 = *(const int32x4_t*)(xp + sb * 32 + 16);
                 int32x4_t A0, A1; float s0, s1, m; cur.sub(sb, A0, A1, s0, s1, m);
                 int32x8_t C0 = {0, 0, 0, 0, 0, 0, 0, 0};
                 C0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, B0, Dec::SIGNED, A0, C0, false);
                 int32x8_t C1;
                 if constexpr (Dec::HALF) { C1 = {0, 0, 0, 0, 0, 0, 0, 0}; C1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, B1, Dec::SIGNED, A1, C1, false); }
                 else C0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, B1, Dec::SIGNED, A1, C0, false);
-                const int g = b * 8 + sb;
 #pragma unroll
                 for (int l = 0; l < 8; ++l) if (2 * l < ncol) {   // columns >= ncol skipped (wave-uniform)
-                    const int col = 2 * l + half;
                     float xdv, xsv;
-                    if constexpr (DS) { const float2 p = xds[(size_t)col * nsb + g]; xdv = p.x; xsv = p.y; } else { xdv = xd[(size_t)col * nsb + g]; if constexpr (Dec::MIN) xsv = xs[(size_t)col * nsb + g]; }
+                    if constexpr (DS) { const float2 pp = pds[l][sb]; xdv = pp.x; xsv = pp.y; } else { xdv = pd[l][sb]; if constexpr (Dec::MIN) xsv = ps[l][sb]; }
                     float v = s0 * xdv * (float)C0[l];
                     if constexpr (Dec::HALF) v += s1 * xdv * (float)C1[l];
                     if constexpr (Dec::MIN) v -= m * xsv;
                     acc[l] += v;
                 }
             }
-            cur = nxt;
+            cur = nxt; xp += 256 * KS;
+#pragma unroll
+            for (int l = 0; l < 8; ++l) { pd[l] += 8 * KS; ps[l] += 8 * KS; pds[l] += 8 * KS; }
         }
     }
     if constexpr (KS > 1) {

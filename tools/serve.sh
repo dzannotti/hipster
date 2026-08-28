@@ -8,5 +8,5 @@ MODEL=${MODEL:-/models/qwen3.8-flash-next/UD-Q4_K_XL-MTP/Qwen3.8-Flash-Next-UD-Q
 DRAFT=${DRAFT:-}
 PORT=8090; for ((i=1; i<=$#; i++)); do [ "${!i}" = "--port" ] && j=$((i+1)) && PORT=${!j}; done
 exec docker run --rm --name hipster-serve -p ${BIND:-0.0.0.0}:$PORT:$PORT --device /dev/kfd --device /dev/dri --group-add 105 --group-add 39 \
-  --security-opt seccomp=unconfined --security-opt label=disable --ipc host -e HSA_DISABLE_COREDUMP_ON_EXCEPTION=1 \
+  --security-opt seccomp=unconfined --security-opt label=disable --ipc host -e HSA_DISABLE_COREDUMP_ON_EXCEPTION=1 -e HIPSTER_LOG_REQ=${HIPSTER_LOG_REQ:-} \
   -v "$ROOT":/src -v /srv/models:/models:ro -w /src "${IMG:-mimiron/rocm:10.0.0}" ./build/hipster-serve --model "$MODEL" ${DRAFT:+--draft "$DRAFT"} --host 0.0.0.0 --port $PORT "$@"

@@ -87,3 +87,18 @@ round, freeing the slot (a 3000-token streaming request killed after 2 s: the ne
 8-slot Flash-Next server, 8 concurrent 200-token requests (mixed code/prose): 1231 tokens in 26.3 s wall = **46.8 t/s
 aggregate** (7–8 t/s per request while all eight are active ≈ 60 aggregate; the wall number includes eight sequential
 prefills and the tail where replies finish at different times). Engine lockstep with 8 slots: 80 t/s.
+
+### llama.cpp router compatibility
+
+Clients that manage models through llama.cpp's *router mode* (the pi coding agent's "llama.cpp" provider, whose
+multimodal fields llama.cpp's router code names explicitly) probe `GET /props` for `"role": "router"` and refuse to
+configure a server without it — the symptom is `Failed to save API key for llama.cpp: Server is not running in
+llama.cpp router mode` (the key itself is stored client-side; no server endpoint is involved).
+
+`hipster-serve` therefore reports the router role by default, with values that are true for a single-model server:
+`role: router`, `max_instances: 1`, `models_autoload: true`; `GET /models` (and `/v1/models`) returns the router shape
+— `status.value = "loaded"`, `architecture.input_modalities = ["text"]`, `aliases`, `tags`, `source`, `can_remove:
+false`, `n_ctx` — which is a superset of the OpenAI list, so plain OpenAI clients are unaffected;
+`POST /models/load` succeeds for the model we serve and 404s for any other name; `POST /models/unload`, `POST /models`
+and `DELETE /models` return 400 ("hipster serves one fixed model"); `GET /models/sse` streams the state once and then
+keepalives. `--no-router` hides all of it.
