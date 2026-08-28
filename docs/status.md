@@ -13,6 +13,22 @@
 Flash-Next: decode engine runs, **12/12 greedy identical to llama.cpp, 17.5 t/s** (floor 37; llama.cpp
 18–27); prefill/QSA/MTP not yet (docs/decode-flash-next.md).
 
+
+## 2026-08-28 (late) · where the 27B stands after DFlash2, slots and the attention rewrite
+
+| | value | notes |
+|---|---|---|
+| bare decode (T-invariant WMMA GEMV path) | 10.8 t/s (92 ms) | `HIPSTER_GEMV=fast` (old kernels, not T-invariant) 12.5 |
+| verify pass T=8 | 106 ms (short ctx), 120 ms at 16K | was 152 (old kernels) / 265 at 16K (old attention) |
+| DFlash2 n=7, code | **48 t/s**, exact | 22 on prose; 13.5 at 16K context (15% acceptance there) |
+| DFlash2 × 2 slots | **79 t/s aggregate**, both exact | one 16-row verify + one 16-row draft pass per round |
+| served (OpenAI endpoint, DFlash2) | 46 t/s on a 200-token code reply | one slot per server so far |
+| MTP n=5 (WMMA verify) | 33.8 t/s, exact | |
+| T-invariance | max logit diff 0.0000 at T=8 | GEMV (WMMA, fixed reduction order) + attention (per-row V masking) |
+| ngram-map-k4v in front of DFlash2 | neutral at T≤8 | 9 of 78 rounds drafted by the map on 512 tokens of code |
+
+Flash-Next unchanged (36.3 ms/token, MTP 37–41 t/s, 63/80 t/s @4/8 slots, prefill ~1000 t/s @2K).
+
 ## What exists
 `engine/` C++/HIP: GGUF mmap loader; GEMV for Q4_K/Q5_K/IQ4_XS/Q6_K/Q8_0/Q5_1 (dot4 and WMMA paths,
 all validated to 1e-8 vs CPU reference); fused norm/quant kernels; GDN conv+step (state in
