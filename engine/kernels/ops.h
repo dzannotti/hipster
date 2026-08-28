@@ -36,6 +36,8 @@ void silu_mul(const float* gate, const float* up, float* out, int n, hipStream_t
 struct SeqDesc { int r0, T, in, out; };
 struct SeqBatch { SeqDesc s[8]; int n = 0; };
 struct RowBatch { int pos[32]; int kv[32]; int n = 0; };
+// One sequence's contribution to a pass: T tokens (continuing that slot's sequence) at positions pos..pos+T-1.
+struct SlotReq { int slot; const int* tokens; int T; int pos; };
 void gdn_conv(const float* x, int T, const float* st_in, float* st_out, const float* w, float* out, int C, hipStream_t s);
 void gdn_conv_b(const float* x, const SeqBatch& sb, size_t st_stride, const float* st_base, float* st_obase, const float* w, float* out, int C, hipStream_t s);
 // T recurrent steps for all heads, state kept in registers. qkv [T][2048 q | 2048 k | 6144 v]
@@ -59,8 +61,13 @@ void gdn_out(const float* raw, const float* z, const float* norm_w, int T, float
 void gdn_step_sig(const float* qkv, const float* z, const float* beta_raw, const float* alpha_raw, int T, const float* dt_bias, const float* a_neg,
                   const float* state_in, float* state_out, const float* norm_w, float* out, XQ8 xq, float eps, hipStream_t s);
 void gdn_out_sig(const float* raw, const float* z, const float* norm_w, int T, float* out, uint16_t* xb, float eps, hipStream_t s);
+void gdn_step_b(const float* qkv, const float* z, const float* beta_raw, const float* alpha_raw, const SeqBatch& sb, size_t st_stride, const float* dt_bias, const float* a_neg,
+                const float* st_base, float* st_obase, const float* norm_w, float* out, XQ8 xq, float eps, hipStream_t s);   // 27B (silu gate)
 void gdn_step_sig_b(const float* qkv, const float* z, const float* beta_raw, const float* alpha_raw, const SeqBatch& sb, size_t st_stride, const float* dt_bias, const float* a_neg,
                     const float* st_base, float* st_obase, const float* norm_w, float* out, XQ8 xq, float eps, hipStream_t s);
+// 27B geometry (24 q / 4 kv heads, V^T cache with kvt_stride rows per slot), per-row positions / KV slots
+void attn_decode_b(float* q_full, float* k, float* v, int T, const float* q_norm_w, const float* k_norm_w, float rope_base, const RowBatch& rb,
+                   uint16_t* kc, uint16_t* vc, size_t kv_stride, size_t kvt_stride, int max_ctx, float* out, XQ8 xq, float eps, hipStream_t s);
 void attn_decode_24_2_b(float* q_full, float* k, float* v, int T, const float* q_norm_w, const float* k_norm_w, float rope_base, const RowBatch& rb,
                         uint16_t* kc, uint16_t* vc, size_t kv_stride, size_t kvt_stride, int max_ctx, float* out, XQ8 xq, float eps, hipStream_t s);
 void attn_rope_kv_24_2_rowv(float* q_full, float* k, const float* v, int T, const float* q_norm_w, const float* k_norm_w, float rope_base, const RowBatch& rb,

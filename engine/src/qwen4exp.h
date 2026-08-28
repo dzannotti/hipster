@@ -50,7 +50,6 @@ struct FnMtp { FnLayer L; FnLin eh_proj; float *enorm, *hnorm; };   // blk.48: n
 
 // One sequence's contribution to a pass: T tokens (continuing that slot's sequence) at positions pos..pos+T-1.
 void prefill_timing_report(double tokens);   // HIPSTER_TIMING=1: per-phase GPU ms accumulated over prefill() calls (stderr), then reset
-struct SlotReq { int slot; const int* tokens; int T; int pos; };
 
 class Qwen4Exp {
 public:

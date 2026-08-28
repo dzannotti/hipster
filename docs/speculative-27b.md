@@ -101,3 +101,27 @@ with the map 55.0 t/s — the map drafted 9 of 78 rounds at 51% acceptance (`NGR
 Neutral here because our verify pass takes at most 7 drafts, so a map hit cannot draft more than DFlash2 does; the map
 pays when drafts can be long (repetitive output, re-generated context). The WMMA GEMV computes 16 columns in the same
 launch as 8, so raising the 27B verify pass to T=16 is the way to cash that in — next.
+
+## 2026-08-28 · two slots × DFlash2 on the 27B (multi-slot engine)
+
+The WMMA GEMV computes 16 columns per launch at 1.3–1.45× the 8-column time (`bench_gemv … 16 q8`: Q5_K ffn_up 0.338 →
+0.488 ms, ffn_down 0.360 → 0.462, Q4_K 0.312 → 0.445, Q8_0 0.232 → 0.248), so a 2-slot verify pass (2 × [anchor + 7
+drafts]) costs ~1.35× a single one. The 27B engine now has slots like Flash-Next: `Qwen35(path, max_ctx, n_slots)`,
+`forward(SlotReq*, S)` (rows ≤ 16 on the GEMV path; a prefill is one slot), `accept(slot, m)` with per-slot replay,
+per-slot GDN/conv state, KV, MTP KV and DFlash2 draft KV; batched GDN (`gdn_step_b`, silu gate) and attention
+(`attn_decode_b`, 24/4 heads, RowBatch) wrappers. Batched rows are bit-identical to single-slot rows (`DIAG=1 SLOTS=2
+dflash27b …`: max diff 0.0000 for row layouts (1,1), (8,8), (8,1), (1,8)); one replay bug (β/α row stride 48, not 64,
+when a slot's rows start at r0 > 0) showed up only after a partial accept and is fixed.
+
+`SLOTS=2 dflash27b <27B> <draft> docs/ref/code.json N 7` runs both slots in lockstep on the same prompt (each stream is
+checked against plain greedy):
+
+| | tokens | t/s aggregate | per slot | round (ms): verify / draft |
+|---|---:|---:|---:|---|
+| 1 slot | 96 | 52.0 | 52.0 | 106 / 17 |
+| 2 slots | 194 | **78.0** | 39.0 | 133 / 33 |
+| 2 slots | 1038 | 78.0 | 39.0 | 135 / 34 |
+
+Above Flash-Next's 8-slot plain-decode aggregate (80 t/s) with two streams. Next: one 16-row draft pass for both
+slots (the two 8-row draft calls cost 33 ms; one batched call ≈ 20) → ~85 t/s; a third slot needs a 24-row verify
+(two GEMV launches) and does not pay.

@@ -734,6 +734,10 @@ void gdn_step_sig(const float* qkv, const float* z, const float* beta_raw, const
                   const float* state_in, float* state_out, const float* norm_w, float* out, XQ8 xq, float eps, hipStream_t s) {
     k_gdn_step<true><<<dim3(48, 1), 256, 0, s>>>(qkv, z, beta_raw, alpha_raw, one_seq(T), 0, dt_bias, a_neg, state_in, state_out, norm_w, out, xq.q, xq.d, xq.s, eps);
 }
+void gdn_step_b(const float* qkv, const float* z, const float* beta_raw, const float* alpha_raw, const SeqBatch& sb, size_t st_stride, const float* dt_bias, const float* a_neg,
+                const float* st_base, float* st_obase, const float* norm_w, float* out, XQ8 xq, float eps, hipStream_t s) {
+    k_gdn_step<false><<<dim3(48, sb.n), 256, 0, s>>>(qkv, z, beta_raw, alpha_raw, sb, st_stride, dt_bias, a_neg, st_base, st_obase, norm_w, out, xq.q, xq.d, xq.s, eps);
+}
 void gdn_step_sig_b(const float* qkv, const float* z, const float* beta_raw, const float* alpha_raw, const SeqBatch& sb, size_t st_stride, const float* dt_bias, const float* a_neg,
                     const float* st_base, float* st_obase, const float* norm_w, float* out, XQ8 xq, float eps, hipStream_t s) {
     k_gdn_step<true><<<dim3(48, sb.n), 256, 0, s>>>(qkv, z, beta_raw, alpha_raw, sb, st_stride, dt_bias, a_neg, st_base, st_obase, norm_w, out, xq.q, xq.d, xq.s, eps);
@@ -780,6 +784,11 @@ void attn_decode_24_2(float* q_full, float* k, float* v, int T, const float* q_n
                       uint16_t* kc, uint16_t* vc, int max_ctx, float* out, XQ8 xq, float eps, hipStream_t s) {
     k_qk_norm_rope_kv<24, 2, false><<<26 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, pos0, kc, vc, max_ctx, eps, nullptr, nullptr, nullptr, nullptr, RowBatch{}, 0, 0, 0);
     k_attn<24, 2, false><<<24 * T, 256, 0, s>>>(q_full, kc, vc, nullptr, nullptr, nullptr, nullptr, pos0, max_ctx, out, xq.q, xq.d, xq.s, RowBatch{}, 0, 0);
+}
+void attn_decode_b(float* q_full, float* k, float* v, int T, const float* q_norm_w, const float* k_norm_w, float rope_base, const RowBatch& rb,
+                   uint16_t* kc, uint16_t* vc, size_t kv_stride, size_t kvt_stride, int max_ctx, float* out, XQ8 xq, float eps, hipStream_t s) {
+    k_qk_norm_rope_kv<24, 4, false><<<28 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, 0, kc, vc, max_ctx, eps, nullptr, nullptr, nullptr, nullptr, rb, kv_stride, kvt_stride, 0);
+    k_attn<24, 4, false><<<24 * T, 256, 0, s>>>(q_full, kc, vc, nullptr, nullptr, nullptr, nullptr, 0, max_ctx, out, xq.q, xq.d, xq.s, rb, kv_stride, kvt_stride);
 }
 void attn_decode_24_2_b(float* q_full, float* k, float* v, int T, const float* q_norm_w, const float* k_norm_w, float rope_base, const RowBatch& rb,
                         uint16_t* kc, uint16_t* vc, size_t kv_stride, size_t kvt_stride, int max_ctx, float* out, XQ8 xq, float eps, hipStream_t s) {

@@ -73,7 +73,7 @@ AttnBlock Qwen35::upload_attn(const GGUF& g, const std::string& p) {
     return a;
 }
 
-Qwen35::Qwen35(const std::string& path, int max_ctx) : max_ctx_(max_ctx) {
+Qwen35::Qwen35(const std::string& path, int max_ctx, int n_slots) : max_ctx_(max_ctx), n_slots_(n_slots) {
     timing_ = getenv("HIPSTER_TIMING") != nullptr; prefetch_on_ = getenv("HIPSTER_PREFETCH") != nullptr; for (float& t : tacc_) t = 0;
     GGUF g(path);
     if (g.arch() != "qwen35") throw std::runtime_error("not a qwen35 GGUF: " + g.arch());
@@ -107,14 +107,17 @@ Qwen35::Qwen35(const std::string& path, int max_ctx) : max_ctx_(max_ctx) {
     output_norm_ = upload_f32(g, "output_norm.weight", D::n_embd);
     if (!mtp_.head_norm) mtp_.head_norm = output_norm_;
     output_ = upload_lin(g, "output.weight");
-    // state + work
-    const size_t st = (size_t)D::n_gdn * D::gdn_v_heads * D::gdn_dim * D::gdn_dim, cs = (size_t)D::n_gdn * 3 * D::gdn_qkv;
-    for (int i = 0; i < 2; ++i) { CK(hipMalloc(&gdn_state_[i], st * 4)); CK(hipMalloc(&conv_state_[i], cs * 4)); }
+    // state + work (per slot, double-buffered)
+    st_stride_ = (size_t)D::n_gdn * D::gdn_v_heads * D::gdn_dim * D::gdn_dim; cs_stride_ = (size_t)D::n_gdn * 3 * D::gdn_qkv;
+    CK(hipMalloc(&gdn_state_, st_stride_ * 2 * n_slots_ * 4)); CK(hipMalloc(&conv_state_, cs_stride_ * 2 * n_slots_ * 4));
+    cur_.assign(n_slots_, 0); lr0_.assign(n_slots_, 0); lT_.assign(n_slots_, 0);
     const size_t kv = (size_t)D::n_attn * max_ctx_ * D::n_head_kv * D::head_dim;
     const size_t kvt = (size_t)D::n_attn * (max_ctx_ + 128) * D::n_head_kv * D::head_dim;   // V^T rows padded
+    kv_slot_ = kv; kvt_slot_ = kvt;
     kv8_ = getenv("HIPSTER_KV8") != nullptr;
+    if (kv8_ && n_slots_ > 1) throw std::runtime_error("HIPSTER_KV8 is single-slot");
     if (!kv8_) {
-        CK(hipMalloc(&kc_, kv * 2)); CK(hipMalloc(&vc_, kvt * 2)); CK(hipMemset(vc_, 0, kvt * 2));
+        CK(hipMalloc(&kc_, kv * 2 * n_slots_)); CK(hipMalloc(&vc_, kvt * 2 * n_slots_)); CK(hipMemset(vc_, 0, kvt * 2 * n_slots_));
         CK(hipMalloc(&mkc_, kv / D::n_attn * 2)); CK(hipMalloc(&mvc_, kvt / D::n_attn * 2)); CK(hipMemset(mvc_, 0, kvt / D::n_attn * 2));
     } else {   // int8: K + 8 scales per row, V^T + 1 scale per position (half the bytes of f16)
         auto alloc8 = [&](KV8& c, int layers) {
@@ -123,8 +126,8 @@ Qwen35::Qwen35(const std::string& path, int max_ctx) : max_ctx_(max_ctx) {
         };
         alloc8(kv8c_, D::n_attn); alloc8(mkv8c_, 1);
     }
-    CK(hipMalloc(&sv_qkv_, (size_t)D::n_gdn * D::max_T * D::gdn_qkv * 4));
-    CK(hipMalloc(&sv_beta_, (size_t)D::n_gdn * D::max_T * 64 * 4)); CK(hipMalloc(&sv_alpha_, (size_t)D::n_gdn * D::max_T * 64 * 4));
+    CK(hipMalloc(&sv_qkv_, (size_t)D::n_gdn * MAXR * D::gdn_qkv * 4));
+    CK(hipMalloc(&sv_beta_, (size_t)D::n_gdn * MAXR * 64 * 4)); CK(hipMalloc(&sv_alpha_, (size_t)D::n_gdn * MAXR * 64 * 4));
     const int T = D::max_prefill;
     CK(hipMalloc(&pf_qkv_, (size_t)T * D::gdn_qkv * 4)); CK(hipMalloc(&pf_qn_, (size_t)T * (4096 + 96) * 4));
     CK(hipMalloc(&pf_raw_, (size_t)T * D::gdn_z * 4)); CK(hipMalloc(&pf_ao_, (size_t)T * D::gdn_z * 4));
@@ -137,26 +140,24 @@ Qwen35::Qwen35(const std::string& path, int max_ctx) : max_ctx_(max_ctx) {
     CK(hipMalloc(&x_, (size_t)T * D::n_embd * 4)); CK(hipMalloc(&xn_, (size_t)T * D::n_embd * 4)); CK(hipMalloc(&y_, (size_t)T * D::n_embd * 4));
     CK(hipMalloc(&h_, (size_t)T * D::n_embd * 4)); CK(hipMalloc(&mh_, (size_t)T * D::n_embd * 4)); CK(hipMalloc(&cat_, (size_t)T * 2 * D::n_embd * 4));
     CK(hipMalloc(&big0_, (size_t)T * D::n_ff * 4)); CK(hipMalloc(&big1_, (size_t)T * D::n_ff * 4)); CK(hipMalloc(&big2_, (size_t)T * D::n_ff * 4));
-    CK(hipMalloc(&logits_, (size_t)D::max_T * D::n_vocab * 4)); CK(hipMalloc(&mlogits_, (size_t)D::max_T * D::n_vocab * 4));
+    CK(hipMalloc(&logits_, (size_t)MAXR * D::n_vocab * 4)); CK(hipMalloc(&mlogits_, (size_t)D::max_T * D::n_vocab * 4));
     const size_t xk = (size_t)T * D::n_ff;   // sized for prefill (in-kernel quantisers write T rows)
     CK(hipMalloc(&xq_.q, xk)); CK(hipMalloc(&xq_.d, xk / 32 * 4)); CK(hipMalloc(&xq_.s, xk / 32 * 4));
     CK(hipMemset(xq_.q, 0, xk)); CK(hipMemset(xq_.d, 0, xk / 32 * 4)); CK(hipMemset(xq_.s, 0, xk / 32 * 4));
-    CK(hipMalloc(&d_tok_, T * 4)); CK(hipMalloc(&d_ids_, D::max_T * 16 * 4)); CK(hipMalloc(&d_vals_, D::max_T * 16 * 4));
+    CK(hipMalloc(&d_tok_, T * 4)); CK(hipMalloc(&d_ids_, MAXR * 16 * 4)); CK(hipMalloc(&d_vals_, MAXR * 16 * 4));
     reset();
 }
 
 Qwen35::~Qwen35() {}
 
 void Qwen35::reset() {
-    for (int i = 0; i < 2; ++i) {
-        CK(hipMemset(gdn_state_[i], 0, (size_t)D::n_gdn * D::gdn_v_heads * D::gdn_dim * D::gdn_dim * 4));
-        CK(hipMemset(conv_state_[i], 0, (size_t)D::n_gdn * 3 * D::gdn_qkv * 4));
-    }
-    cur_ = 0; last_T_ = 0;
+    CK(hipMemset(gdn_state_, 0, st_stride_ * 2 * n_slots_ * 4)); CK(hipMemset(conv_state_, 0, cs_stride_ * 2 * n_slots_ * 4));
+    for (int s = 0; s < n_slots_; ++s) { cur_[s] = 0; lT_[s] = 0; }
+    last_T_ = 0;
 }
 
 void Qwen35::gemv(const Lin& l, float* y, int ncol) {
-    if (ncol <= D::max_T) { lin(l, y, ncol); return; }   // same T-invariant kernel selection as every other GEMV (LM head incl.)
+    if (!gm_) { lin(l, y, ncol); return; }   // same T-invariant kernel selection as every other GEMV (LM head incl.)
     // measured policy (docs/decode-gemv.md): 1 column -> direct tpr=32; 2..4 -> LDS-x tpr=4; >4 -> WMMA (Q4_K only so far)
     static const int pol = getenv("HIPSTER_GEMV_POLICY") ? atoi(getenv("HIPSTER_GEMV_POLICY")) : 0;   // debug: 1 = direct for all, 2 = LDS for all
     if (ncol == 1) gemv_q8(l.fmt, l.w, xq_, y, l.N, l.K, 1, 32, 1, s_);
@@ -189,7 +190,7 @@ void Qwen35::lin(const Lin& l, float* y, int M) {
 // Several weights sharing the input: GEMV path -> gemv_multi; GEMM path -> dequant all segments into
 // one [sum N][K] bf16 matrix, one GEMM, then split the bf16 output rows into the f32 targets.
 void Qwen35::lin_multi(const GemvSeg* segs, int n, int M) {
-    if (M <= D::max_T) {
+    if (!gm_) {
         // one kernel shape for every T: each column is reduced in the same order as the T=1 pass (T-invariant numerics,
         // the verify pass is bit-identical to T single passes). HIPSTER_GEMV_FAST=1 restores the old ncol-tuned kernel.
         // HIPSTER_GEMV=wmma (default): int8-WMMA kernel for every T (T-invariant, ~the T=1 cost at T=8); multi: the
@@ -231,21 +232,23 @@ KV8 Qwen35::layer_kv8(int ai) const {
 }
 
 // xq_ (GEMV) / xb_ (GEMM) hold the normalised input [T]; writes the projected output into y [T][n_embd]
-void Qwen35::attn_block(const AttnBlock& a, int T, int pos0, uint16_t* kc, uint16_t* vc, float* y, const KV8* c8) {
+void Qwen35::attn_block(const AttnBlock& a, int T, int pos0, uint16_t* kc, uint16_t* vc, float* y, const KV8* c8, const RowBatch* rb) {
     float* qf = big0_; float* k = big1_; float* v = big1_ + (size_t)T * 1024; float* ao = big2_;
     GemvSeg segs[3] = {{a.wq.fmt, a.wq.w, qf, a.wq.N, a.wq.K}, {a.wk.fmt, a.wk.w, k, a.wk.N, a.wk.K}, {a.wv.fmt, a.wv.w, v, a.wv.N, a.wv.K}};
-    if (T > D::max_T) { GemvSeg keep[2]; int kn = next_pfn_; for (int i = 0; i < kn; ++i) keep[i] = next_pf_[i];   // gate+up set by caller; o-proj must come first
+    if (gm_) { GemvSeg keep[2]; int kn = next_pfn_; for (int i = 0; i < kn; ++i) keep[i] = next_pf_[i];   // gate+up set by caller; o-proj must come first
                         next_pf_[0] = {a.wo.fmt, a.wo.w, nullptr, a.wo.N, a.wo.K}; next_pfn_ = 1; next2_pfn_ = kn; for (int i = 0; i < kn; ++i) next2_pf_[i] = keep[i]; }
     lin_multi(segs, 3, T);
-    if (T > D::max_T && next2_pfn_ > 0) { for (int i = 0; i < next2_pfn_; ++i) next_pf_[i] = next2_pf_[i]; next_pfn_ = next2_pfn_; next2_pfn_ = 0; }
+    if (gm_ && next2_pfn_ > 0) { for (int i = 0; i < next2_pfn_; ++i) next_pf_[i] = next2_pf_[i]; next_pfn_ = next2_pfn_; next2_pfn_ = 0; }
     if (kv8_) {   // int8 KV path (kc/vc are unused; c8 selects the layer's caches)
-        if (T <= D::max_T) attn_decode_i8(qf, k, v, T, a.q_norm, a.k_norm, D::rope_base, pos0, *c8, max_ctx_, ao, xq_, D::rms_eps, s_);
+        if (!gm_) attn_decode_i8(qf, k, v, T, a.q_norm, a.k_norm, D::rope_base, pos0, *c8, max_ctx_, ao, xq_, D::rms_eps, s_);
         else { attn_stage1_i8(qf, k, v, T, a.q_norm, a.k_norm, D::rope_base, pos0, *c8, max_ctx_, D::rms_eps, s_); attn_prefill_i8(qf, *c8, T, pos0, max_ctx_, xb_, s_); }
-    } else if (T <= D::max_T && getenv("HIPSTER_GQA_ATTN")) {   // experimental: slower at 32K and not yet exact (docs/decode-27b.md)
+    } else if (!gm_ && getenv("HIPSTER_GQA_ATTN")) {   // experimental: slower at 32K and not yet exact (docs/decode-27b.md)
         attn_decode_gqa(qf, k, v, T, a.q_norm, a.k_norm, D::rope_base, pos0, kc, vc, max_ctx_, ao, xq_, pO_, pm_, pl_, D::rms_eps, s_);
-    } else if (T <= D::max_T || getenv("HIPSTER_SCALAR_ATTN")) {
+    } else if (rb) {   // batched rows (several slots): per-row positions and KV slots
+        attn_decode_b(qf, k, v, T, a.q_norm, a.k_norm, D::rope_base, *rb, kc, vc, kv_slot_, kvt_slot_, max_ctx_, ao, xq_, D::rms_eps, s_);
+    } else if (!gm_ || getenv("HIPSTER_SCALAR_ATTN")) {
         attn_decode(qf, k, v, T, a.q_norm, a.k_norm, D::rope_base, pos0, kc, vc, max_ctx_, ao, xq_, D::rms_eps, s_);
-        if (T > D::max_T) f32_to_bf16(ao, xb_, (size_t)T * D::n_head * D::head_dim, s_);
+        if (gm_) f32_to_bf16(ao, xb_, (size_t)T * D::n_head * D::head_dim, s_);
     } else {
         attn_stage1(qf, k, v, T, a.q_norm, a.k_norm, D::rope_base, pos0, kc, vc, max_ctx_, D::rms_eps, s_);
         attn_prefill(qf, kc, vc, T, pos0, max_ctx_, xb_, s_);
@@ -256,23 +259,37 @@ void Qwen35::attn_block(const AttnBlock& a, int T, int pos0, uint16_t* kc, uint1
 
 void Qwen35::ffn_block(const Lin& g, const Lin& u, const Lin& d, int T, float* y) {
     GemvSeg fs[2] = {{g.fmt, g.w, big0_, g.N, g.K}, {u.fmt, u.w, big1_, u.N, u.K}};
-    if (T > D::max_T) { fs[0].y = nullptr; fs[1].y = nullptr; }   // GEMM path: silu reads the bf16 GEMM output directly, no split
+    if (gm_) { fs[0].y = nullptr; fs[1].y = nullptr; }   // GEMM path: silu reads the bf16 GEMM output directly, no split
     lin_multi(fs, 2, T);   // consumes next_pf_ (= down)
     if (next2_pfn_ > 0) { for (int i = 0; i < next2_pfn_; ++i) next_pf_[i] = next2_pf_[i]; next_pfn_ = next2_pfn_; next2_pfn_ = 0; }
-    if (T <= D::max_T) silu_mul_quant(big0_, big1_, xq_, T * D::n_ff, s_);
+    if (!gm_) silu_mul_quant(big0_, big1_, xq_, T * D::n_ff, s_);
     else silu_mul_bf16_seg(gout_, 2 * D::n_ff, 0, D::n_ff, xb_, T, s_);
     tmark(T_OTHER);
     lin(d, y, T);   // consumes next_pf_ (= next layer's first group)
 }
 
-float Qwen35::forward(const int* tokens, int T, int pos0) {
-    if (T < 1 || T > D::max_prefill) throw std::runtime_error("bad T");
-    if (pos0 + T > max_ctx_) throw std::runtime_error("pos >= max_ctx");
-    const bool gm = T > D::max_T;   // GEMM (prefill) path
+float Qwen35::forward(const SlotReq* reqs, int S) {
+    if (S < 1 || S > n_slots_) throw std::runtime_error("bad S");
+    int T = 0; for (int i = 0; i < S; ++i) T += reqs[i].T;
+    const bool gm = S == 1 && T > D::max_T;   // GEMM (prefill) path: one slot
+    if (T < 1 || T > D::max_prefill || (!gm && T > MAXR) || (S > 1 && reqs[0].T > D::max_T)) throw std::runtime_error("bad T");
+    for (int i = 0; i < S; ++i) if (reqs[i].T > D::max_T && !gm) throw std::runtime_error("a batched request has more than max_T rows");
+    gm_ = gm;
+    const int slot0 = reqs[0].slot, pos0 = reqs[0].pos;   // used by the single-sequence paths
+    SeqBatch sb; RowBatch rb; std::vector<int> toks(T);
+    { int r0 = 0; for (int i = 0; i < S; ++i) { const SlotReq& r = reqs[i];
+        if (r.slot < 0 || r.slot >= n_slots_ || r.T < 1 || r.pos + r.T > max_ctx_) throw std::runtime_error("bad request");
+        sb.s[i] = {r0, r.T, r.slot * 2 + cur_[r.slot], r.slot * 2 + (cur_[r.slot] ^ 1)};
+        for (int t = 0; t < r.T; ++t) { toks[r0 + t] = r.tokens[t]; if (!gm) { rb.pos[r0 + t] = r.pos + t; rb.kv[r0 + t] = r.slot; } }
+        lr0_[r.slot] = r0; lT_[r.slot] = r.T; r0 += r.T; }
+      sb.n = S; rb.n = gm ? 0 : T; }
+    const bool batched = !gm && (S > 1 || slot0 != 0);
+    const RowBatch* rbp = batched ? &rb : nullptr;
+    const float* cs_in = conv_state_ + (size_t)(slot0 * 2 + cur_[slot0]) * cs_stride_; float* cs_out = conv_state_ + (size_t)(slot0 * 2 + (cur_[slot0] ^ 1)) * cs_stride_;
+    const float* gs_in = gdn_state_ + (size_t)(slot0 * 2 + cur_[slot0]) * st_stride_; float* gs_out = gdn_state_ + (size_t)(slot0 * 2 + (cur_[slot0] ^ 1)) * st_stride_;
     CK(hipEventRecord(ev0_, s_));
-    CK(hipMemcpyAsync(d_tok_, tokens, T * 4, hipMemcpyHostToDevice, s_));
+    CK(hipMemcpyAsync(d_tok_, toks.data(), T * 4, hipMemcpyHostToDevice, s_));
     embed_q4_K(tok_embd_, d_tok_, T, x_, D::n_embd, s_);
-    const int nxt = cur_ ^ 1;
     const float* pending = nullptr;
     auto norm_in = [&](const float* y, const float* w) {   // residual add + norm -> GEMV/GEMM input
         if (gm) add_rmsnorm_bf16(x_, y, w, xb_, T, D::n_embd, D::rms_eps, s_);
@@ -297,20 +314,25 @@ float Qwen35::forward(const int* tokens, int T, int pos0) {
         if (gm) { next_pf_[0] = {proj_out.fmt, proj_out.w, nullptr, proj_out.N, proj_out.K}; next_pfn_ = 1; }
         if (!D::is_attn(il)) {
             const int gi = gdn_index(il);
-            float* qkv_raw = gm ? pf_qkv_ : sv_qkv_ + (size_t)gi * D::max_T * D::gdn_qkv;
-            float* b = gm ? big2_ : sv_beta_ + (size_t)gi * D::max_T * 64; float* a = gm ? big2_ + (size_t)T * 64 : sv_alpha_ + (size_t)gi * D::max_T * 64;
+            float* qkv_raw = gm ? pf_qkv_ : sv_qkv_ + (size_t)gi * MAXR * D::gdn_qkv;
+            float* b = gm ? big2_ : sv_beta_ + (size_t)gi * MAXR * 64; float* a = gm ? big2_ + (size_t)T * 64 : sv_alpha_ + (size_t)gi * MAXR * 64;
             float* z = big1_; float* qkv = big0_; float* ao = gm ? pf_ao_ : big2_;
             GemvSeg segs[4] = {{L.qkv.fmt, L.qkv.w, qkv_raw, L.qkv.N, L.qkv.K}, {L.zgate.fmt, L.zgate.w, z, L.zgate.N, L.zgate.K},
                                {L.beta.fmt, L.beta.w, b, L.beta.N, L.beta.K}, {L.alpha.fmt, L.alpha.w, a, L.alpha.N, L.alpha.K}};
             lin_multi(segs, 4, T);
             const size_t cso = (size_t)gi * 3 * D::gdn_qkv, gso = (size_t)gi * D::gdn_v_heads * D::gdn_dim * D::gdn_dim;
-            gdn_conv(qkv_raw, T, conv_state_[cur_] + cso, conv_state_[nxt] + cso, L.conv_w, qkv, D::gdn_qkv, s_);
-            if (!gm) gdn_step(qkv, z, b, a, T, L.dt_bias, L.a_neg, gdn_state_[cur_] + gso, gdn_state_[nxt] + gso, L.ssm_norm, ao, xq_, D::rms_eps, s_);
-            else {   // prefill: prep -> tiled scan -> out (writes bf16 into xb_ directly)
-                float* qn = pf_qn_; float* kn = pf_qn_ + (size_t)T * 2048; float* bt = pf_qn_ + (size_t)T * 4096; float* dc = bt + (size_t)T * 48; float* raw = pf_raw_;
-                gdn_prep(qkv, b, a, L.dt_bias, L.a_neg, T, qn, kn, bt, dc, D::rms_eps, s_);
-                gdn_scan(qn, kn, qkv, bt, dc, T, gdn_state_[cur_] + gso, gdn_state_[nxt] + gso, raw, s_);
-                gdn_out(raw, z, L.ssm_norm, T, ao, xb_, D::rms_eps, s_);
+            if (batched) {
+                gdn_conv_b(qkv_raw, sb, cs_stride_, conv_state_ + cso, conv_state_ + cso, L.conv_w, qkv, D::gdn_qkv, s_);
+                gdn_step_b(qkv, z, b, a, sb, st_stride_, L.dt_bias, L.a_neg, gdn_state_ + gso, gdn_state_ + gso, L.ssm_norm, ao, xq_, D::rms_eps, s_);
+            } else {
+                gdn_conv(qkv_raw, T, cs_in + cso, cs_out + cso, L.conv_w, qkv, D::gdn_qkv, s_);
+                if (!gm) gdn_step(qkv, z, b, a, T, L.dt_bias, L.a_neg, gs_in + gso, gs_out + gso, L.ssm_norm, ao, xq_, D::rms_eps, s_);
+                else {   // prefill: prep -> tiled scan -> out (writes bf16 into xb_ directly)
+                    float* qn = pf_qn_; float* kn = pf_qn_ + (size_t)T * 2048; float* bt = pf_qn_ + (size_t)T * 4096; float* dc = bt + (size_t)T * 48; float* raw = pf_raw_;
+                    gdn_prep(qkv, b, a, L.dt_bias, L.a_neg, T, qn, kn, bt, dc, D::rms_eps, s_);
+                    gdn_scan(qn, kn, qkv, bt, dc, T, gs_in + gso, gs_out + gso, raw, s_);
+                    gdn_out(raw, z, L.ssm_norm, T, ao, xb_, D::rms_eps, s_);
+                }
             }
             tmark(T_GDN);
             if (gm) { next_pf_[0] = {L.ffn_gate.fmt, L.ffn_gate.w, nullptr, L.ffn_gate.N, L.ffn_gate.K}; next_pf_[1] = {L.ffn_up.fmt, L.ffn_up.w, nullptr, L.ffn_up.N, L.ffn_up.K}; next_pfn_ = 2; }
@@ -319,7 +341,7 @@ float Qwen35::forward(const int* tokens, int T, int pos0) {
             const size_t off = (size_t)attn_index(il) * max_ctx_ * D::n_head_kv * D::head_dim, offv = (size_t)attn_index(il) * (max_ctx_ + 128) * D::n_head_kv * D::head_dim;
             if (gm) { next_pf_[0] = {L.ffn_gate.fmt, L.ffn_gate.w, nullptr, L.ffn_gate.N, L.ffn_gate.K}; next_pf_[1] = {L.ffn_up.fmt, L.ffn_up.w, nullptr, L.ffn_up.N, L.ffn_up.K}; next_pfn_ = 2; }
             KV8 c8 = kv8_ ? layer_kv8(attn_index(il)) : KV8{};
-            attn_block(L.attn, T, pos0, kc_ + off, vc_ + offv, y_, &c8);
+            attn_block(L.attn, T, pos0, kc_ + (batched ? 0 : (size_t)slot0 * kv_slot_) + off, vc_ + (batched ? 0 : (size_t)slot0 * kvt_slot_) + offv, y_, &c8, rbp);
         }
         norm_in(y_, L.post_norm);
         if (gm) { next_pf_[0] = {L.ffn_down.fmt, L.ffn_down.w, nullptr, L.ffn_down.N, L.ffn_down.K}; next_pfn_ = 1;
@@ -335,34 +357,37 @@ float Qwen35::forward(const int* tokens, int T, int pos0) {
         CK(hipMemcpyAsync(xq_.s, xq_.s + (size_t)(T - 1) * (D::n_embd / 32), D::n_embd / 32 * 4, hipMemcpyDeviceToDevice, s_));
         gemv(output_, logits_, 1);
     } else gemv(output_, logits_, T);
-    last_T_ = T;
+    last_T_ = T; last_gm_ = gm; gm_ = false;
     CK(hipEventRecord(ev1_, s_)); CK(hipEventSynchronize(ev1_));
     CK(hipEventElapsedTime(&last_ms_, ev0_, ev1_));
     return last_ms_;
 }
 
-void Qwen35::accept(int m) {
-    if (m < 1 || m > last_T_) throw std::runtime_error("bad accept");
-    if (last_T_ > D::max_T && m != last_T_) throw std::runtime_error("prefill must accept all tokens");
-    const int nxt = cur_ ^ 1;
-    if (m < last_T_) {   // replay: recompute the state after m tokens from the saved inputs (cur_ is intact)
+void Qwen35::accept(int slot, int m) {
+    if (slot < 0 || slot >= n_slots_ || lT_[slot] == 0) throw std::runtime_error("accept: slot had no rows in the last pass");
+    const int T = lT_[slot], r0 = lr0_[slot];
+    if (m < 1 || m > T) throw std::runtime_error("bad accept");
+    if (last_gm_ && m != T) throw std::runtime_error("prefill must accept all tokens");
+    const int cur = slot * 2 + cur_[slot], nxt = slot * 2 + (cur_[slot] ^ 1);
+    if (m < T) {   // replay: recompute the state after m tokens from the saved inputs (cur is intact)
         float* qkv = big0_;
         for (int il = 0; il < D::n_layer; ++il) {
             if (D::is_attn(il)) continue;
             const auto& L = layers_[il]; const int gi = gdn_index(il);
             const size_t cso = (size_t)gi * 3 * D::gdn_qkv, gso = (size_t)gi * D::gdn_v_heads * D::gdn_dim * D::gdn_dim;
-            const float* qkv_raw = sv_qkv_ + (size_t)gi * D::max_T * D::gdn_qkv;
-            gdn_conv(qkv_raw, m, conv_state_[cur_] + cso, conv_state_[nxt] + cso, L.conv_w, qkv, D::gdn_qkv, s_);
-            gdn_step(qkv, nullptr, sv_beta_ + (size_t)gi * D::max_T * 64, sv_alpha_ + (size_t)gi * D::max_T * 64, m, L.dt_bias, L.a_neg,
-                     gdn_state_[cur_] + gso, gdn_state_[nxt] + gso, L.ssm_norm, nullptr, xq_, D::rms_eps, s_);
+            const float* qkv_raw = sv_qkv_ + ((size_t)gi * MAXR + r0) * D::gdn_qkv;
+            gdn_conv(qkv_raw, m, conv_state_ + cur * cs_stride_ + cso, conv_state_ + nxt * cs_stride_ + cso, L.conv_w, qkv, D::gdn_qkv, s_);
+            gdn_step(qkv, nullptr, sv_beta_ + (size_t)gi * MAXR * 64 + (size_t)r0 * D::gdn_v_heads, sv_alpha_ + (size_t)gi * MAXR * 64 + (size_t)r0 * D::gdn_v_heads, m, L.dt_bias, L.a_neg,   // rows are [T][48]
+                     gdn_state_ + cur * st_stride_ + gso, gdn_state_ + nxt * st_stride_ + gso, L.ssm_norm, nullptr, xq_, D::rms_eps, s_);
         }
     }
-    cur_ = nxt; last_T_ = 0;
+    cur_[slot] ^= 1; lT_[slot] = 0;
+    bool any = false; for (int s = 0; s < n_slots_; ++s) any |= lT_[s] != 0; if (!any) last_T_ = 0;
 }
 
 void Qwen35::mtp_forward(const int* tokens, const float* h, int T, int pos0) {
     if (T < 1 || T > D::max_prefill) throw std::runtime_error("bad T");
-    const bool gm = T > D::max_T;
+    const bool gm = T > D::max_T; gm_ = gm;
     CK(hipMemcpyAsync(d_tok_, tokens, T * 4, hipMemcpyHostToDevice, s_));
     embed_q4_K(tok_embd_, d_tok_, T, xn_, D::n_embd, s_);                          // e [T][5120]
     if (gm) norm2_concat_bf16(xn_, mtp_.enorm, D::n_embd, h, mtp_.hnorm, D::n_embd, xb_, T, D::rms_eps, s_);
@@ -378,6 +403,7 @@ void Qwen35::mtp_forward(const int* tokens, const float* h, int T, int pos0) {
     ffn_block(mtp_.ffn_gate, mtp_.ffn_up, mtp_.ffn_down, T, y_);
     add_rmsnorm_quant(x_, y_, mtp_.head_norm, mh_, xq_, T, D::n_embd, D::rms_eps, s_);
     if (!gm) gemv(output_, mlogits_, T);   // prefill catch-up needs no draft logits
+    gm_ = false;
 }
 
 void Qwen35::topk(const float* logits, int T, int k, int* ids, float* vals) {

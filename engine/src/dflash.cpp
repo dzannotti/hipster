@@ -38,31 +38,33 @@ void Qwen35::load_dflash(const std::string& path) {
         dfl_->layers.push_back(L);
     }
     const int T = D::max_T;
-    CK(hipMalloc(&dfl_feat_, (size_t)T * 5 * E * 4)); CK(hipMalloc(&dfl_g_, (size_t)T * E * 4)); CK(hipMalloc(&dfl_x_, (size_t)T * E * 4)); CK(hipMalloc(&dfl_y_, (size_t)T * E * 4));
+    CK(hipMalloc(&dfl_feat_, (size_t)MAXR * 5 * E * 4)); CK(hipMalloc(&dfl_g_, (size_t)T * E * 4)); CK(hipMalloc(&dfl_x_, (size_t)T * E * 4)); CK(hipMalloc(&dfl_y_, (size_t)T * E * 4));
     CK(hipMalloc(&dfl_q_, (size_t)T * NQ * HD * 4)); CK(hipMalloc(&dfl_k_, (size_t)T * NKV * HD * 4)); CK(hipMalloc(&dfl_v_, (size_t)T * NKV * HD * 4)); CK(hipMalloc(&dfl_o_, (size_t)T * NQ * HD * 4));
     CK(hipMalloc(&dfl_delta_, (size_t)T * 4 * N_GROUPS * 4)); CK(hipMalloc(&dfl_logits_, (size_t)T * D::n_vocab * 4)); CK(hipMalloc(&dfl_gate_, (size_t)T * RANK * 4));
     CK(hipMalloc(&dfl_lattice_, (size_t)T * LATTICE * 4)); CK(hipMalloc(&dfl_pos_, T * 4)); CK(hipMalloc(&dfl_tok_, T * 4));
-    dfl_layer_stride_ = (size_t)NKV * max_ctx_ * HD;
-    CK(hipMalloc(&dfl_kc_, dfl_layer_stride_ * nl * 2)); CK(hipMalloc(&dfl_vc_, dfl_layer_stride_ * nl * 2));
+    dfl_layer_stride_ = (size_t)NKV * max_ctx_ * HD; dfl_slot_stride_ = dfl_layer_stride_ * nl;
+    CK(hipMalloc(&dfl_kc_, dfl_slot_stride_ * n_slots_ * 2)); CK(hipMalloc(&dfl_vc_, dfl_slot_stride_ * n_slots_ * 2));
     report_ += "  dflash draft: " + std::to_string(nl) + " layers, targets " + std::to_string(dfl_->target_layers[0]) + ".." + std::to_string(dfl_->target_layers[4]) + ", mask " + std::to_string(dfl_->mask_id) + "\n";
 }
 
-void Qwen35::dflash_encode(int T, int pos0) {
+void Qwen35::dflash_encode(int slot, int T, int pos0) {
     std::vector<int> pos(T); for (int i = 0; i < T; ++i) pos[i] = pos0 + i;
     CK(hipMemcpyAsync(dfl_pos_, pos.data(), T * 4, hipMemcpyHostToDevice, s_));
-    quantize_x_q8(dfl_feat_, xq_, T, 5 * E, s_);
+    quantize_x_q8(dfl_feat_ + (size_t)lr0_[slot] * 5 * E, xq_, T, 5 * E, s_);
+    uint16_t* kcs = dfl_kc_ + (size_t)slot * dfl_slot_stride_; uint16_t* vcs = dfl_vc_ + (size_t)slot * dfl_slot_stride_;
     lin(dfl_->fc, dfl_g_, T);
     add_rmsnorm_quant(dfl_g_, nullptr, dfl_->enc_norm, xn_, xq_, T, E, D::rms_eps, s_);
     for (size_t l = 0; l < dfl_->layers.size(); ++l) {
         const DflashLayer& L = dfl_->layers[l];
         GemvSeg segs[2] = {{L.wk.fmt, L.wk.w, dfl_k_, L.wk.N, L.wk.K}, {L.wv.fmt, L.wv.w, dfl_v_, L.wv.N, L.wv.K}};
         lin_multi(segs, 2, T);
-        qk_rope_kv(nullptr, dfl_k_, dfl_v_, nullptr, L.k_norm, D::rope_base, dfl_pos_, T, dfl_kc_ + l * dfl_layer_stride_, dfl_vc_ + l * dfl_layer_stride_, max_ctx_, D::rms_eps, s_);
+        qk_rope_kv(nullptr, dfl_k_, dfl_v_, nullptr, L.k_norm, D::rope_base, dfl_pos_, T, kcs + l * dfl_layer_stride_, vcs + l * dfl_layer_stride_, max_ctx_, D::rms_eps, s_);
     }
 }
 
-int Qwen35::dflash_draft(int id_last, int n, int nd, int* out) {
+int Qwen35::dflash_draft(int slot, int id_last, int n, int nd, int* out) {
     const int T = 1 + nd; if (T > D::max_T) throw std::runtime_error("dflash_draft: T > max_T");
+    uint16_t* kcs = dfl_kc_ + (size_t)slot * dfl_slot_stride_; uint16_t* vcs = dfl_vc_ + (size_t)slot * dfl_slot_stride_;
     std::vector<int> tok(T, dfl_->mask_id), pos(T); tok[0] = id_last; for (int i = 0; i < T; ++i) pos[i] = n + i;
     CK(hipMemcpyAsync(dfl_tok_, tok.data(), T * 4, hipMemcpyHostToDevice, s_)); CK(hipMemcpyAsync(dfl_pos_, pos.data(), T * 4, hipMemcpyHostToDevice, s_));
     embed_q4_K(tok_embd_, dfl_tok_, T, dfl_x_, E, s_);
@@ -74,8 +76,8 @@ int Qwen35::dflash_draft(int id_last, int n, int nd, int* out) {
         conv(xn_, dfl_delta_, L.attn_conv_base, 0, T, nullptr, xq_, s_);
         GemvSeg qkv[3] = {{L.wq.fmt, L.wq.w, dfl_q_, L.wq.N, L.wq.K}, {L.wk.fmt, L.wk.w, dfl_k_, L.wk.N, L.wk.K}, {L.wv.fmt, L.wv.w, dfl_v_, L.wv.N, L.wv.K}};
         lin_multi(qkv, 3, T);
-        qk_rope_kv(dfl_q_, dfl_k_, dfl_v_, L.q_norm, L.k_norm, D::rope_base, dfl_pos_, T, dfl_kc_ + l * dfl_layer_stride_, dfl_vc_ + l * dfl_layer_stride_, max_ctx_, D::rms_eps, s_);
-        attend(dfl_q_, dfl_kc_ + l * dfl_layer_stride_, dfl_vc_ + l * dfl_layer_stride_, dfl_pos_, n + T, T, max_ctx_, dfl_o_, xq_, s_);
+        qk_rope_kv(dfl_q_, dfl_k_, dfl_v_, L.q_norm, L.k_norm, D::rope_base, dfl_pos_, T, kcs + l * dfl_layer_stride_, vcs + l * dfl_layer_stride_, max_ctx_, D::rms_eps, s_);
+        attend(dfl_q_, kcs + l * dfl_layer_stride_, vcs + l * dfl_layer_stride_, dfl_pos_, n + T, T, max_ctx_, dfl_o_, xq_, s_);
         lin(L.wo, dfl_y_, T);
         conv(dfl_y_, dfl_delta_, L.attn_conv_base, 1, T, big2_, noq, s_);
         add_rmsnorm_quant(dfl_x_, big2_, L.ffn_norm, xn_, xq_, T, E, D::rms_eps, s_);
