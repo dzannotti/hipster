@@ -83,3 +83,7 @@ count above 8 rows, which broke exactness for any multi-slot pass with more than
 
 Client disconnects: an `emit` that fails (socket gone) marks the job and the scheduler finishes it at the end of the
 round, freeing the slot (a 3000-token streaming request killed after 2 s: the next request was served 0.7 s later).
+
+8-slot Flash-Next server, 8 concurrent 200-token requests (mixed code/prose): 1231 tokens in 26.3 s wall = **46.8 t/s
+aggregate** (7–8 t/s per request while all eight are active ≈ 60 aggregate; the wall number includes eight sequential
+prefills and the tail where replies finish at different times). Engine lockstep with 8 slots: 80 t/s.
