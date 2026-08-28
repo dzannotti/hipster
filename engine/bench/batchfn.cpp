@@ -27,6 +27,21 @@ int main(int argc, char** argv) {
     const int n_gen = argc > 3 ? atoi(argv[3]) : 64, S = argc > 4 ? atoi(argv[4]) : 4;
     hip::Qwen4Exp m(argv[1], 8192, S);
     std::vector<int> ids(64 * 16); std::vector<float> vals(64 * 16);
+    if (getenv("ROWS_DIAG")) {   // which rows of a >8-row batched pass differ from the same rows in a single-slot pass?
+        const int V = hip::FnDims::n_vocab; std::vector<int> toks(prompt.begin(), prompt.begin() + 9);
+        for (auto Ts : std::vector<std::vector<int>>{{8, 1}, {1, 8}, {5, 4}, {4, 5}, {8, 2}, {2, 2, 2, 2, 1}, {7, 1}, {3, 3, 2}}) {
+            const int S2 = (int)Ts.size(); if (S2 > S) continue;
+            m.reset(); for (int s = 0; s < S2; ++s) for (int i = 0; i < 20; ++i) { hip::SlotReq r{s, &prompt[i], 1, i}; m.forward(&r, 1); m.accept(s, 1); }
+            std::vector<hip::SlotReq> rq; int rows = 0; for (int s = 0; s < S2; ++s) { rq.push_back({s, toks.data(), Ts[s], 20}); rows += Ts[s]; }
+            m.forward(rq.data(), S2); std::vector<float> lb((size_t)rows * V); hipMemcpy(lb.data(), m.logits(), lb.size() * 4, hipMemcpyDeviceToHost);
+            printf("batched T=("); for (int s = 0; s < S2; ++s) printf("%d%s", Ts[s], s + 1 < S2 ? "," : ""); printf(") %d rows: per-row max diff:", rows);
+            int r0 = 0;
+            for (int s = 0; s < S2; ++s) { hip::SlotReq r{s, toks.data(), Ts[s], 20}; m.forward(&r, 1); std::vector<float> l1((size_t)Ts[s] * V); hipMemcpy(l1.data(), m.logits(), l1.size() * 4, hipMemcpyDeviceToHost);
+                for (int t = 0; t < Ts[s]; ++t) { double md = 0; for (int v = 0; v < V; ++v) md = fmax(md, fabs(lb[(size_t)(r0 + t) * V + v] - l1[(size_t)t * V + v])); printf(" %.3f", md); } r0 += Ts[s]; printf(" |"); }
+            printf("\n");
+        }
+        return 0;
+    }
 
     // BATCH_DISTINCT=1: slot s runs the prompt without its first s tokens (distinct sequences -> distinct experts);
     // each slot is checked against its own single-slot run. Default: all slots on the same prompt (experts overlap!).
@@ -54,6 +69,39 @@ int main(int argc, char** argv) {
       m.topk(m.logits(), S, 1, ids.data(), vals.data()); for (int s = 0; s < S; ++s) cur[s] = ids[s];   // the last prompt step had all S slots
       std::vector<int> pos(S); for (int s = 0; s < S; ++s) pos[s] = (int)prompts[s].size();
       double t0 = now_ms(), gpu = 0;
+      const int mtp = getenv("BATCH_MTP") ? atoi(getenv("BATCH_MTP")) : 0;   // BATCH_MTP=n: lockstep MTP rounds over the S slots (the serving loop)
+      if (mtp > 0) {
+          const int W = hip::FnDims::wide; float *hp, *hb; hipMalloc(&hp, (size_t)S * W * 4); hipMalloc(&hb, (size_t)S * W * 4);
+          // the MTP KV over the prompts: token by token per slot, h = the trunk's h of the previous position (zeros at 0)
+          for (int s = 0; s < S; ++s) { m.reset_slot(s); hipMemset(hp + (size_t)s * W, 0, (size_t)W * 4);
+              for (int i = 0; i < (int)prompts[s].size(); ++i) { hip::SlotReq r{s, &prompts[s][i], 1, i}; m.forward(&r, 1); m.accept(s, 1); m.mtp_forward(&r, 1, hp + (size_t)s * W); hipMemcpy(hp + (size_t)s * W, m.h_nextn(), (size_t)W * 4, hipMemcpyDeviceToDevice); }
+              m.topk(m.logits(), 1, 1, ids.data(), vals.data()); cur[s] = ids[0]; }
+          int rounds = 0, drafted = 0, accepted = 0; t0 = now_ms(); std::vector<int> r0s(S), mms(S); std::vector<std::vector<int>> dr(S, std::vector<int>(mtp)), batch(S);
+          while (true) {
+              bool any = false; for (int s = 0; s < S; ++s) any |= (int)streams[s].size() < n_gen; if (!any) break;
+              std::vector<int> tok(cur);
+              for (int s = 0; s < S; ++s) hipMemcpy(hb + (size_t)s * W, hp + (size_t)s * W, (size_t)W * 4, hipMemcpyDeviceToDevice);
+              for (int i = 0; i < mtp; ++i) {
+                  for (int s = 0; s < S; ++s) reqs[s] = {s, &tok[s], 1, pos[s] + i};
+                  m.mtp_forward(reqs.data(), S, hb); m.topk(m.mtp_logits(), S, 1, ids.data(), vals.data());
+                  for (int s = 0; s < S; ++s) { tok[s] = ids[s]; dr[s][i] = ids[s]; }
+                  if (i + 1 < mtp) hipMemcpy(hb, m.mtp_h(), (size_t)S * W * 4, hipMemcpyDeviceToDevice);
+              }
+              int rows = 0; for (int s = 0; s < S; ++s) { batch[s].assign(1, cur[s]); for (int i = 0; i < mtp; ++i) batch[s].push_back(dr[s][i]); reqs[s] = {s, batch[s].data(), 1 + mtp, pos[s]}; r0s[s] = rows; rows += 1 + mtp; }
+              gpu += m.forward(reqs.data(), S); m.topk(m.logits(), rows, 1, ids.data(), vals.data());
+              for (int s = 0; s < S; ++s) {
+                  int mm = 0; while (mm < mtp && ids[r0s[s] + mm] == dr[s][mm]) ++mm;
+                  streams[s].push_back(cur[s]); for (int i = 0; i < mm; ++i) streams[s].push_back(dr[s][i]);
+                  m.accept(s, mm + 1);
+                  if (mm > 0) { hip::SlotReq r{s, dr[s].data(), mm, pos[s] + 1}; m.mtp_forward(&r, 1, m.h_nextn() + (size_t)r0s[s] * W); }
+                  hipMemcpy(hp + (size_t)s * W, m.h_nextn() + (size_t)(r0s[s] + mm) * W, (size_t)W * 4, hipMemcpyDeviceToDevice);
+                  cur[s] = ids[r0s[s] + mm]; pos[s] += mm + 1; drafted += mtp; accepted += mm;
+              }
+              ++rounds;
+          }
+          const double dt = now_ms() - t0; int ntok = 0; for (int s = 0; s < S; ++s) { streams[s].resize(n_gen); ntok += n_gen; }
+          printf("%d slots, MTP n=%d: %d tokens in %.0f ms = %.2f t/s aggregate | %d rounds, acceptance %d/%d\n", S, mtp, ntok, dt, ntok * 1000.0 / dt, rounds, accepted, drafted);
+      } else
       for (int i = 0; i < n_gen; ++i) {
           for (int s = 0; s < S; ++s) { streams[s].push_back(cur[s]); reqs[s] = {s, &cur[s], 1, pos[s]}; }
           gpu += m.forward(reqs.data(), S); for (int s = 0; s < S; ++s) { m.accept(s, 1); ++pos[s]; }

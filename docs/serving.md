@@ -74,3 +74,9 @@ each of 4 concurrent requests matches its solo output.
 | 1 request, MTP n=2 | 43.5 t/s | 43.5 |
 | 1 request on a 4-slot server (plain) | 27.4 | 27.4 |
 | 4 concurrent (200-token replies, 40-token prompts) | 14.4–16.3 | **50.2** (63 while all four are active; one reply ended at 85 tokens) |
+
+Flash-Next drafts over slots: batched MTP rounds (`FnBackend::draft`, one MTP pass per draft step over the active slots)
+with the measured policy n=2 / n=1 / 0 for 1 / 2 / ≥3 active slots (docs/decode-flash-next.md). A 4-slot server:
+1 request 43.7 t/s, 2 concurrent 48.1 aggregate (24.8 / 25.5), 4 concurrent 50.8 aggregate (13–17 each), every output
+identical to the plain-batched and solo runs. The fix behind it: Flash-Next decode attention used a different key-split
+count above 8 rows, which broke exactness for any multi-slot pass with more than 8 rows.

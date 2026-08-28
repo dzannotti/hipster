@@ -73,7 +73,7 @@ public:
     const GGUF& gguf() const { return *gguf_; }
     // after prefill(tokens, T, pos0): run the MTP block over the same rows (h for row p = the trunk residual after row p-1,
     // the previous chunk's last row for the first one) so the draft KV covers the prompt
-    void mtp_catchup(const int* tokens, int T, int pos0);
+    void mtp_catchup(const int* tokens, int T, int pos0, int slot = 0);   // chunks of one prompt must follow each other (hprev_)
     bool has_mtp() const { return has_mtp_; }
     double ple_host_ms() const { return ple_host_ms_; }   // host time spent hashing + gathering n-gram rows from the mmap (SSD)
     double gpu_ms() const { return gpu_ms_; }             // accumulated forward() GPU time

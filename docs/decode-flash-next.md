@@ -117,3 +117,23 @@ Bytes/token 6.1 → 5.5 GB, quality fine (12/12 greedy, Δlogprob 0.58, 4K needl
 39.7 vs 36.3 ms/token. The Q5_1 decoder (bit-shuffling the 5th bits per word) costs more per byte on these shapes
 than the Q8_0 path saves in bytes. Lesson: the floor only moves if the decoder keeps the lane efficiency; a lower-bit
 dense format needs a decoder measured at ≥ 200 GB/s on the K=2560/6144 shapes first (bench_gemv), not a byte count.
+
+## 2026-08-28 (late) · multi-slot MTP rounds, and a T-invariance hole above 8 rows
+
+`batchfn BATCH_DISTINCT=1 BATCH_MTP=n` runs the serving loop over S slots (one batched MTP pass per draft step, one
+verify pass over all rows, per-slot accept + catch-up) and checks each slot against its single-slot greedy stream.
+First result: 2 slots exact, 3+ slots wrong — any pass with more than 8 rows *and* more than one sequence differed from
+the ≤ 8-row passes by 0.5–1.3 logits in every row. `ROWS_DIAG=1 batchfn` (rows of a batched pass vs the same rows in a
+single-slot pass) pinned it: `qsa_attention` used 16 key splits for ≤ 8 rows and a single split above, and the split
+count is the summation order. Now a constant 16 for decode (the prefill WMMA path keeps nsplit = 1). After the fix:
+
+| slots × drafts | aggregate t/s (64 tokens per slot, distinct prompts) | exact |
+|---|---:|---|
+| 1 × plain / 1 × MTP n=2 | 27.4 / 35–43 | ✓ |
+| 2 × plain / n=1 / n=2 | 43.0 / **47.0** / 43.1 | ✓ |
+| 3 × plain / n=1 | 53.6 / 51.3 | ✓ |
+| 4 × plain / n=2 | 63 / 42.0 | ✓ |
+| 8 × plain / n=1 | 80 / 55.8 | ✓ |
+
+The MoE cost grows ~7.5 ms per row, so drafts only pay with few active slots: the server drafts n=2 with one active slot,
+n=1 with two, none with three or more (`FnBackend::draft_n`).

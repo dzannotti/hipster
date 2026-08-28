@@ -32,33 +32,49 @@ struct Backend {
     virtual const float* logits() = 0;                                              // rows of the last pass, in request order
     virtual void topk(const float* l, int T, int k, int* ids, float* vals) = 0;
     virtual int max_draft() = 0;                                                    // 0: no drafts
-    virtual int draft(const int* slots, const int* id_last, const int* pos, int S, int* out) = 0;   // out[s*max_draft + i]; returns the count per slot
+    virtual int draft_n(int active) = 0;                                            // drafts per slot this round given the number of active slots (0: plain)
+    virtual int draft(const int* slots, const int* id_last, const int* pos, int S, int n, int* out) = 0;   // n drafts per slot: out[s*max_draft + i]
     virtual void verify(const hip::SlotReq* reqs, int S) = 0;                       // one pass over the active slots
     virtual void accept(int s, int mm, const int* drafts, int pos) = 0;             // commit mm drafts + bonus on slot s, draft catch-up
     virtual size_t weight_bytes() = 0;
 };
-struct FnBackend : Backend {   // Flash-Next: MTP drafts with one slot, plain batched decode with several (MTP over slots: later)
-    hip::Qwen4Exp m; int mtp, ns; float* h_pending = nullptr; std::vector<int> ids = std::vector<int>(16); std::vector<float> vals = std::vector<float>(16);
+struct FnBackend : Backend {   // Flash-Next + MTP drafts, up to 8 slots (batched draft rows, one verify pass over all slots)
+    hip::Qwen4Exp m; int mtp, ns; float *hp_ = nullptr, *hb_ = nullptr;   // per-slot pending h [8][wide]; batch scratch [8][wide]
+    std::vector<int> ids = std::vector<int>(256); std::vector<float> vals = std::vector<float>(256); int r0s[8] = {};
+    static constexpr int W = hip::FnDims::wide;
     FnBackend(const std::string& path, int ctx, int chunk, int mtp_, int slots) : m(path, ctx, slots, chunk), mtp(mtp_), ns(slots) {
         if (mtp > 0 && !m.has_mtp()) { fprintf(stderr, "no MTP block in this GGUF: decoding without drafts\n"); mtp = 0; }
-        if (ns > 1 && mtp > 0) { fprintf(stderr, "Flash-Next with %d slots: plain batched decode (no MTP)\n", ns); mtp = 0; }
-        hipMalloc(&h_pending, (size_t)hip::FnDims::wide * 4);
+        hipMalloc(&hp_, (size_t)8 * W * 4); hipMalloc(&hb_, (size_t)8 * W * 4);
     }
     int n_slots() override { return ns; }
     void reset_slot(int s) override { if (ns == 1) m.reset(); else m.reset_slot(s); }
-    const float* prefill(int s, const int* t, int n, int p, bool spec) override { m.prefill(t, n, p, s); if (spec && mtp > 0) m.mtp_catchup(t, n, p); if (mtp > 0) hipMemcpy(h_pending, m.h_nextn(), (size_t)hip::FnDims::wide * 4, hipMemcpyDeviceToDevice); return m.logits(); }
+    const float* prefill(int s, const int* t, int n, int p, bool spec) override {
+        m.prefill(t, n, p, s); if (spec && mtp > 0) m.mtp_catchup(t, n, p, s);
+        hipMemcpy(hp_ + (size_t)s * W, m.h_nextn(), (size_t)W * 4, hipMemcpyDeviceToDevice); return m.logits();
+    }
     const float* logits() override { return m.logits(); }
     void topk(const float* l, int T, int k, int* i, float* v) override { m.topk(l, T, k, i, v); }
     int max_draft() override { return mtp; }
-    int draft(const int*, const int* id_last, const int* pos, int, int* out) override {
-        int tok = id_last[0]; const float* h = h_pending;
-        for (int i = 0; i < mtp; ++i) { m.mtp_forward(&tok, h, 1, pos[0] + i); m.topk(m.mtp_logits(), 1, 1, ids.data(), vals.data()); tok = ids[0]; out[i] = tok; h = m.mtp_h(); }
-        return mtp;
+    // measured (batchfn BATCH_MTP, docs/decode-flash-next.md): 1 slot n=2 43 vs 27 t/s plain; 2 slots n=1 47 vs 43; 3 slots n=1 51 vs 54 plain
+    int draft_n(int active) override { return mtp == 0 ? 0 : active <= 1 ? mtp : active == 2 ? std::min(mtp, 1) : 0; }
+    int draft(const int* slots, const int* id_last, const int* pos, int S, int n, int* out) override {   // S slots x n chained draft steps, one batched MTP pass per step
+        std::vector<int> tok(id_last, id_last + S); hip::SlotReq reqs[8];
+        for (int q = 0; q < S; ++q) hipMemcpy(hb_ + (size_t)q * W, hp_ + (size_t)slots[q] * W, (size_t)W * 4, hipMemcpyDeviceToDevice);
+        for (int i = 0; i < n; ++i) {
+            for (int q = 0; q < S; ++q) reqs[q] = {slots[q], &tok[q], 1, pos[q] + i};
+            m.mtp_forward(reqs, S, hb_); m.topk(m.mtp_logits(), S, 1, ids.data(), vals.data());
+            for (int q = 0; q < S; ++q) { tok[q] = ids[q]; out[q * mtp + i] = ids[q]; }
+            if (i + 1 < n) hipMemcpy(hb_, m.mtp_h(), (size_t)S * W * 4, hipMemcpyDeviceToDevice);
+        }
+        return n;
     }
-    void verify(const hip::SlotReq* r, int S) override { m.forward(r, S); }
+    void verify(const hip::SlotReq* r, int S) override { int r0 = 0; for (int q = 0; q < S; ++q) { r0s[r[q].slot] = r0; r0 += r[q].T; } m.forward(r, S); }
     void accept(int s, int mm, const int* drafts, int pos) override {
         m.accept(s, mm + 1);
-        if (mtp > 0) { if (mm > 0) m.mtp_forward(drafts, m.h_nextn(), mm, pos + 1); hipMemcpy(h_pending, m.h_nextn() + (size_t)mm * hip::FnDims::wide, (size_t)hip::FnDims::wide * 4, hipMemcpyDeviceToDevice); }
+        if (mtp > 0) {   // MTP catch-up for the accepted drafts with the target's h of the previous position (h_nextn rows of this slot are intact)
+            if (mm > 0) { hip::SlotReq r{s, drafts, mm, pos + 1}; m.mtp_forward(&r, 1, m.h_nextn() + (size_t)r0s[s] * W); }
+            hipMemcpy(hp_ + (size_t)s * W, m.h_nextn() + (size_t)(r0s[s] + mm) * W, (size_t)W * 4, hipMemcpyDeviceToDevice);
+        }
     }
     size_t weight_bytes() override { return m.weight_bytes(); }
 };
@@ -81,7 +97,8 @@ struct B27Backend : Backend {   // 27B + DFlash2, n slots (rows per pass <= 16)
     const float* logits() override { return m.logits(); }
     void topk(const float* l, int T, int k, int* i, float* v) override { m.topk(l, T, k, i, v); }
     int max_draft() override { return nd; }
-    int draft(const int* slots, const int* id_last, const int* pos, int S, int* out) override { return m.dflash_draft_b(slots, id_last, pos, S, nd, out); }
+    int draft_n(int) override { return nd; }   // DFlash2 pays with both slots (docs/speculative-27b.md)
+    int draft(const int* slots, const int* id_last, const int* pos, int S, int n, int* out) override { return m.dflash_draft_b(slots, id_last, pos, S, n, out); }
     void verify(const hip::SlotReq* r, int S) override { m.forward(r, S); }
     void accept(int s, int mm, const int*, int pos) override { m.accept(s, mm + 1); if (nd > 0) m.dflash_encode(s, mm + 1, pos); }
     size_t weight_bytes() override { return m.weight_bytes(); }
@@ -158,10 +175,11 @@ struct Server {
             // one round over the active slots
             std::vector<Job*> spec_jobs; for (Job* j : active) if (j->spec) spec_jobs.push_back(j);
             std::vector<int> drafts((size_t)ns * 8, 0), ndr(ns, 0);
-            if (!spec_jobs.empty()) {
+            const int n_round = m->draft_n((int)active.size());
+            if (!spec_jobs.empty() && n_round > 0) {
                 std::vector<int> sl, il, pl; for (Job* j : spec_jobs) { sl.push_back(j->slot); il.push_back(j->id_last); pl.push_back(j->pos); }
                 std::vector<int> dr((size_t)spec_jobs.size() * nd);
-                const int k = m->draft(sl.data(), il.data(), pl.data(), (int)spec_jobs.size(), dr.data());
+                const int k = m->draft(sl.data(), il.data(), pl.data(), (int)spec_jobs.size(), n_round, dr.data());
                 for (size_t q = 0; q < spec_jobs.size(); ++q) { ndr[spec_jobs[q]->slot] = k; for (int i = 0; i < k; ++i) drafts[(size_t)spec_jobs[q]->slot * 8 + i] = dr[q * nd + i]; }
             }
             std::vector<std::vector<int>> batch(active.size()); std::vector<hip::SlotReq> reqs; int rows = 0;

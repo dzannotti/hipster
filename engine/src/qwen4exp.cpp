@@ -328,7 +328,7 @@ void Qwen4Exp::qsa_attention(const FnLayer& L, int rows, const std::vector<int>&
     }
     if (rb) attn_rope_kv_24_2_rowv(qf, k, v, rows, L.q_norm, L.k_norm, D::rope_base, *rb, kc, vc, kvs, max_ctx_, D::rms_eps, s_);
     else attn_rope_kv_24_2_rowv_pos0(qf, k, v, rows, L.q_norm, L.k_norm, D::rope_base, pos[0], kc + (size_t)kv[0] * kvs, vc + (size_t)kv[0] * kvs, max_ctx_, D::rms_eps, s_);   // one slot's rows: write into that slot's cache (attend reads kc + kv*kvs)
-    const int nsplit = rows <= 8 ? 16 : 1;   // decode: split the key list across blocks for parallelism
+    const int nsplit = xq.q ? 16 : 1;   // decode: a constant split count (T-invariant summation order for any row count); prefill (no xq): the WMMA kernel
     qsa::attend(qf, kc, vc, kvs, max_ctx_, d_pos_, d_kv_, qsa ? d_idx_ : nullptr, d_cnt_, rows, nsplit, part_, ao, xq, s_);
 }
 void Qwen4Exp::attn_layer_b(const FnLayer& L, int rows, const RowBatch& rb, uint16_t* kc, uint16_t* vc, size_t kvs, int ai, bool qsa) {
@@ -448,7 +448,7 @@ void Qwen4Exp::mtp_forward(const SlotReq* reqs, int S, const float* h) {
     head(rows, pend, R_mtp_, mlogits_);
 }
 
-void Qwen4Exp::mtp_catchup(const int* tokens, int T, int pos0) {
+void Qwen4Exp::mtp_catchup(const int* tokens, int T, int pos0, int slot) {
     if (!has_mtp_) return;
     if (pos0 == 0) CK(hipMemsetAsync(hprev_, 0, D::wide * 4, s_));
     for (int w0 = 0; w0 < T; w0 += MAXR) {
@@ -457,7 +457,7 @@ void Qwen4Exp::mtp_catchup(const int* tokens, int T, int pos0) {
         if (w0 == 0) CK(hipMemcpyAsync(mtp_h_, hprev_, D::wide * 4, hipMemcpyDeviceToDevice, s_));
         else CK(hipMemcpyAsync(mtp_h_, pR_ + (size_t)(w0 - 1) * D::wide, D::wide * 4, hipMemcpyDeviceToDevice, s_));
         if (n > 1) CK(hipMemcpyAsync(mtp_h_ + D::wide, pR_ + (size_t)w0 * D::wide, (size_t)(n - 1) * D::wide * 4, hipMemcpyDeviceToDevice, s_));
-        SlotReq r{0, tokens + w0, n, pos0 + w0}; mtp_forward(&r, 1, mtp_h_);
+        SlotReq r{slot, tokens + w0, n, pos0 + w0}; mtp_forward(&r, 1, mtp_h_);
     }
     CK(hipMemcpyAsync(hprev_, pR_ + (size_t)(T - 1) * D::wide, D::wide * 4, hipMemcpyDeviceToDevice, s_));
 }
