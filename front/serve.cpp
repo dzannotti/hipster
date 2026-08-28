@@ -1,7 +1,9 @@
-// hipster-serve: OpenAI-compatible endpoints over the Flash-Next engine (one slot). Prefill in chunks (GEMM path),
-// decode greedy with the in-checkpoint MTP drafts (exact) or sampled (temperature > 0, plain decode).
-//   hipster-serve --model <shard1.gguf> [--port 8090] [--host 127.0.0.1] [--ctx 16384] [--chunk 2048] [--mtp 2]
+// hipster-serve: OpenAI-compatible endpoints over either engine (one slot). Prefill in chunks (GEMM path), decode greedy
+// with drafts (Flash-Next: the in-checkpoint MTP block; 27B: the DFlash2 block draft) — exact — or sampled (temperature > 0,
+// plain decode). The engine is picked from the GGUF architecture.
+//   hipster-serve --model <gguf> [--draft <dflash2.gguf>] [--port 8090] [--host 127.0.0.1] [--ctx 16384] [--chunk 2048] [--mtp 2] [--ndraft 7]
 #include "../engine/src/qwen4exp.h"
+#include "../engine/src/qwen35.h"
 #include "tokenizer.h"
 #include "chat.h"
 #include "http.h"
@@ -16,10 +18,64 @@
 #include <sstream>
 
 namespace {
-using D = hip::FnDims;
+constexpr int N_VOCAB = 248320;
+// token-level view of an engine for the serving loop: prompt in chunks, then either plain steps or spec rounds
+struct Backend {
+    virtual ~Backend() {}
+    virtual void reset() = 0;
+    virtual void prefill(const int* toks, int n, int pos0, bool spec) = 0;     // one chunk (+ draft catch-up when spec)
+    virtual const float* logits() = 0;                                          // rows of the last pass
+    virtual void topk(const float* l, int T, int k, int* ids, float* vals) = 0;
+    virtual int max_draft() = 0;                                                // 0: no drafts
+    virtual int draft(int id_last, int pos, int* out) = 0;                      // drafts after id_last at pos, returns their count
+    virtual void verify(const int* batch, int T, int pos) = 0;                  // target pass over [id_last, drafts...]
+    virtual void accept(int mm, const int* drafts, int pos) = 0;                // commit mm drafts + bonus, draft catch-up
+    virtual void step(int id, int pos) = 0;                                     // plain: one token
+    virtual size_t weight_bytes() = 0;
+};
+struct FnBackend : Backend {   // Flash-Next + MTP
+    hip::Qwen4Exp m; int mtp; float* h_pending = nullptr; std::vector<int> ids = std::vector<int>(16); std::vector<float> vals = std::vector<float>(16);
+    FnBackend(const std::string& path, int ctx, int chunk, int mtp_) : m(path, ctx, 1, chunk), mtp(mtp_) {
+        if (mtp > 0 && !m.has_mtp()) { fprintf(stderr, "no MTP block in this GGUF: decoding without drafts\n"); mtp = 0; }
+        hipMalloc(&h_pending, (size_t)hip::FnDims::wide * 4);
+    }
+    void reset() override { m.reset(); }
+    void prefill(const int* t, int n, int p, bool spec) override { m.prefill(t, n, p); if (spec && mtp > 0) m.mtp_catchup(t, n, p); hipMemcpy(h_pending, m.h_nextn(), (size_t)hip::FnDims::wide * 4, hipMemcpyDeviceToDevice); }
+    const float* logits() override { return m.logits(); }
+    void topk(const float* l, int T, int k, int* i, float* v) override { m.topk(l, T, k, i, v); }
+    int max_draft() override { return mtp; }
+    int draft(int id_last, int pos, int* out) override {
+        int tok = id_last; const float* h = h_pending;
+        for (int i = 0; i < mtp; ++i) { m.mtp_forward(&tok, h, 1, pos + i); m.topk(m.mtp_logits(), 1, 1, ids.data(), vals.data()); tok = ids[0]; out[i] = tok; h = m.mtp_h(); }
+        return mtp;
+    }
+    void verify(const int* b, int T, int pos) override { m.forward(b, T, pos); }
+    void accept(int mm, const int* drafts, int pos) override {
+        m.accept(mm + 1); if (mm > 0) m.mtp_forward(drafts, m.h_nextn(), mm, pos + 1);
+        hipMemcpy(h_pending, m.h_nextn() + (size_t)mm * hip::FnDims::wide, (size_t)hip::FnDims::wide * 4, hipMemcpyDeviceToDevice);
+    }
+    void step(int id, int pos) override { m.forward(&id, 1, pos); m.accept(1); }
+    size_t weight_bytes() override { return m.weight_bytes(); }
+};
+struct B27Backend : Backend {   // 27B + DFlash2
+    hip::Qwen35 m; int nd;
+    B27Backend(const std::string& path, const std::string& draft_path, int ctx, int nd_) : m(path, ctx, 1), nd(nd_) {
+        if (!draft_path.empty()) m.load_dflash(draft_path); else { fprintf(stderr, "no --draft: 27B decodes without drafts\n"); nd = 0; }
+    }
+    void reset() override { m.reset(); }
+    void prefill(const int* t, int n, int p, bool spec) override { m.forward(t, n, p); m.accept(n); if (spec && nd > 0) m.dflash_encode(n, p); }
+    const float* logits() override { return m.logits(); }
+    void topk(const float* l, int T, int k, int* i, float* v) override { m.topk(l, T, k, i, v); }
+    int max_draft() override { return nd; }
+    int draft(int id_last, int pos, int* out) override { return m.dflash_draft(id_last, pos, nd, out); }
+    void verify(const int* b, int T, int pos) override { m.forward(b, T, pos); }
+    void accept(int mm, const int*, int pos) override { m.accept(mm + 1); if (nd > 0) m.dflash_encode(mm + 1, pos); }
+    void step(int id, int pos) override { m.forward(&id, 1, pos); m.accept(1); if (nd > 0) m.dflash_encode(1, pos); }
+    size_t weight_bytes() override { return m.weight_bytes(); }
+};
 struct Params { int max_tokens = 4096; float temperature = 0.f, top_p = 1.f; int top_k = 0; bool stream = false; };
 struct Server {
-    hip::Qwen4Exp* m; tok::Tokenizer* T; int ctx, chunk, mtp; std::string model_name;
+    Backend* m; tok::Tokenizer* T; int ctx, chunk, mtp; std::string model_name;
     int eos, im_end, think_open, think_close;
     std::mt19937 rng{42};
     static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
@@ -27,9 +83,9 @@ struct Server {
     // greedy top-1 / sampled next token from the logits on device
     int pick(const float* dlogits, const Params& p, std::vector<float>& host) {
         if (p.temperature <= 0.f) { int id; float v; m->topk(dlogits, 1, 1, &id, &v); return id; }
-        host.resize(D::n_vocab); hipMemcpy(host.data(), dlogits, (size_t)D::n_vocab * 4, hipMemcpyDeviceToHost);
-        std::vector<int> idx(D::n_vocab); for (int i = 0; i < D::n_vocab; ++i) idx[i] = i;
-        const int k = p.top_k > 0 ? std::min(p.top_k, D::n_vocab) : std::min(D::n_vocab, 4096);
+        host.resize(N_VOCAB); hipMemcpy(host.data(), dlogits, (size_t)N_VOCAB * 4, hipMemcpyDeviceToHost);
+        std::vector<int> idx(N_VOCAB); for (int i = 0; i < N_VOCAB; ++i) idx[i] = i;
+        const int k = p.top_k > 0 ? std::min(p.top_k, N_VOCAB) : std::min(N_VOCAB, 4096);
         std::partial_sort(idx.begin(), idx.begin() + k, idx.end(), [&](int a, int b) { return host[a] > host[b]; });
         std::vector<double> pr(k); double mx = host[idx[0]], s = 0; for (int i = 0; i < k; ++i) { pr[i] = exp((host[idx[i]] - mx) / p.temperature); s += pr[i]; }
         double cum = 0; int n = k; for (int i = 0; i < k; ++i) { cum += pr[i] / s; if (cum >= p.top_p) { n = i + 1; break; } }
@@ -42,7 +98,7 @@ struct Server {
         if ((int)prompt.size() + 8 > ctx) throw std::runtime_error("prompt longer than the context (" + std::to_string(prompt.size()) + " > " + std::to_string(ctx - 8) + ")");
         m->reset();
         const double t0 = now();
-        for (int c0 = 0; c0 < (int)prompt.size(); c0 += chunk) { const int n = std::min(chunk, (int)prompt.size() - c0); m->prefill(&prompt[c0], n, c0); if (mtp > 0 && p.temperature <= 0.f) m->mtp_catchup(&prompt[c0], n, c0); }
+        for (int c0 = 0; c0 < (int)prompt.size(); c0 += chunk) { const int n = std::min(chunk, (int)prompt.size() - c0); m->prefill(&prompt[c0], n, c0, mtp > 0 && p.temperature <= 0.f); }
         r.prefill_s = now() - t0;
         int pos = (int)prompt.size(); bool reasoning = thinking_open;
         std::string pending;   // incomplete UTF-8 tail
@@ -59,29 +115,24 @@ struct Server {
         };
         std::vector<float> host; int id_last; { id_last = pick(m->logits(), p, host); }
         const double t1 = now();
-        float* h_pending = nullptr; hipMalloc(&h_pending, (size_t)D::wide * 4); hipMemcpy(h_pending, m->h_nextn(), (size_t)D::wide * 4, hipMemcpyDeviceToDevice);
-        std::vector<int> ids(16 * 8); std::vector<float> vals(16 * 8);
+        std::vector<int> ids(16 * 16); std::vector<float> vals(16 * 16); int drafts[16];
         auto stop = [&](int id) { return id == eos || id == im_end; };
         bool done = false;
         while (!done && (int)r.ids.size() < p.max_tokens) {
             if (stop(id_last)) { r.finish = "stop"; done = true; break; }
             out(id_last);
-            if (mtp > 0 && p.temperature <= 0.f) {   // MTP round: draft n, verify n+1, accept the matching prefix + bonus
-                std::vector<int> drafts; int tok = id_last; const float* h = h_pending; int pp = pos;
-                for (int i = 0; i < mtp; ++i) { m->mtp_forward(&tok, h, 1, pp); m->topk(m->mtp_logits(), 1, 1, ids.data(), vals.data()); tok = ids[0]; drafts.push_back(tok); h = m->mtp_h(); ++pp; }
-                std::vector<int> batch; batch.push_back(id_last); for (int d : drafts) batch.push_back(d);
-                const int Tn = (int)batch.size(); m->forward(batch.data(), Tn, pos); m->topk(m->logits(), Tn, 1, ids.data(), vals.data());
-                int mm = 0; while (mm < (int)drafts.size() && ids[mm] == drafts[mm] && !stop(drafts[mm])) ++mm;
-                m->accept(mm + 1);
+            if (mtp > 0 && p.temperature <= 0.f) {   // spec round: draft n, verify n+1, accept the matching prefix + bonus
+                const int nd = m->draft(id_last, pos, drafts);
+                std::vector<int> batch; batch.push_back(id_last); for (int i = 0; i < nd; ++i) batch.push_back(drafts[i]);
+                const int Tn = (int)batch.size(); m->verify(batch.data(), Tn, pos); m->topk(m->logits(), Tn, 1, ids.data(), vals.data());
+                int mm = 0; while (mm < nd && ids[mm] == drafts[mm] && !stop(drafts[mm])) ++mm;
+                m->accept(mm, drafts, pos);
                 for (int i = 0; i < mm; ++i) { if ((int)r.ids.size() >= p.max_tokens) { done = true; break; } out(drafts[i]); }
-                if (mm > 0) m->mtp_forward(drafts.data(), m->h_nextn(), mm, pos + 1);
-                hipMemcpy(h_pending, m->h_nextn() + (size_t)mm * D::wide, (size_t)D::wide * 4, hipMemcpyDeviceToDevice);
-                id_last = ids[mm]; pos += mm + 1; ++r.rounds; r.drafted += mtp; r.accepted += mm;
+                id_last = ids[mm]; pos += mm + 1; ++r.rounds; r.drafted += nd; r.accepted += mm;
             } else {
-                m->forward(&id_last, 1, pos); m->accept(1); ++pos; id_last = pick(m->logits(), p, host);
+                m->step(id_last, pos); ++pos; id_last = pick(m->logits(), p, host);
             }
         }
-        hipFree(h_pending);
         if (!pending.empty()) emit(pending, reasoning);
         if (r.finish.empty()) r.finish = "length";
         r.gen_s = now() - t1;
@@ -110,19 +161,23 @@ js::Value timings_json(int prompt_n, double prefill_s, int predicted_n, double g
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string model, host = "127.0.0.1", ui_dir = "/models/.work/fn-tree/build/tools/ui/dist"; int port = 8090, ctx = 16384, chunk = 2048, mtp = 2;
+    std::string model, draft, host = "127.0.0.1", ui_dir = "/models/.work/fn-tree/build/tools/ui/dist"; int port = 8090, ctx = 16384, chunk = 2048, mtp = 2, ndraft = 7;
     for (int i = 1; i < argc; ++i) { std::string a = argv[i]; auto next = [&] { return std::string(argv[++i]); };
-        if (a == "--model") model = next(); else if (a == "--port") port = atoi(next().c_str()); else if (a == "--host") host = next(); else if (a == "--ctx") ctx = atoi(next().c_str()); else if (a == "--chunk") chunk = atoi(next().c_str()); else if (a == "--mtp") mtp = atoi(next().c_str()); else if (a == "--ui-dir") ui_dir = next(); }
-    if (model.empty()) { fprintf(stderr, "usage: hipster-serve --model <shard1.gguf> [--port 8090] [--host 127.0.0.1] [--ctx 16384] [--chunk 2048] [--mtp 2]\n"); return 2; }
-    hip::Qwen4Exp m(model, ctx, 1, chunk);
-    tok::Tokenizer T(m.gguf());
-    if (mtp > 0 && !m.has_mtp()) { fprintf(stderr, "no MTP block in this GGUF: decoding without drafts\n"); mtp = 0; }
-    Server S{&m, &T, ctx, chunk, mtp, "qwen3.8-flash-next", T.eos(), T.special("<|im_end|>"), T.special("<think>"), T.special("</think>")};
+        if (a == "--model") model = next(); else if (a == "--draft") draft = next(); else if (a == "--port") port = atoi(next().c_str()); else if (a == "--host") host = next(); else if (a == "--ctx") ctx = atoi(next().c_str());
+        else if (a == "--chunk") chunk = atoi(next().c_str()); else if (a == "--mtp") mtp = atoi(next().c_str()); else if (a == "--ndraft") ndraft = atoi(next().c_str()); else if (a == "--ui-dir") ui_dir = next(); }
+    if (model.empty()) { fprintf(stderr, "usage: hipster-serve --model <gguf> [--draft <dflash2.gguf>] [--port 8090] [--host 127.0.0.1] [--ctx 16384] [--chunk 2048] [--mtp 2] [--ndraft 7]\n"); return 2; }
+    std::string arch; { hip::GGUF g(model); arch = g.arch(); }
+    const bool is27b = arch == "qwen35";
+    if (is27b) chunk = std::min(chunk, hip::Qwen35Dims::max_prefill);
+    Backend* be = is27b ? (Backend*)new B27Backend(model, draft, ctx, std::min(ndraft, 7)) : (Backend*)new FnBackend(model, ctx, chunk, mtp);
+    mtp = be->max_draft();
+    tok::Tokenizer* Tp; { hip::GGUF g(model); Tp = new tok::Tokenizer(g); } tok::Tokenizer& T = *Tp;
+    Server S{be, &T, ctx, chunk, mtp, is27b ? "qwen3.8-27b" : "qwen3.8-flash-next", T.eos(), T.special("<|im_end|>"), T.special("<think>"), T.special("</think>")};
     {   // warm-up: the GEMM shapes of a short and a full chunk (hipBLASLt autotune), then reset
-        std::vector<int> w(chunk, 1); m.reset(); m.prefill(w.data(), 128, 0); m.reset(); m.prefill(w.data(), chunk, 0); m.reset();
-        std::vector<int> one(1, 1); m.forward(one.data(), 1, 0); m.accept(1); m.reset();
+        std::vector<int> w(chunk, 1); be->reset(); be->prefill(w.data(), 128, 0, false); be->reset(); be->prefill(w.data(), chunk, 0, false); be->reset();
+        be->step(1, 0); be->reset();
     }
-    fprintf(stderr, "ready: ctx %d, chunk %d, mtp %d, weights %.1f GiB\n", ctx, chunk, mtp, m.weight_bytes() / 1073741824.0);
+    fprintf(stderr, "ready: %s, ctx %d, chunk %d, drafts %d, weights %.1f GiB\n", S.model_name.c_str(), ctx, chunk, mtp, be->weight_bytes() / 1073741824.0);
     http::serve(host, port, [&](const http::Request& req0, http::Response& res) {
         http::Request req = req0; { size_t q = req.path.find('?'); if (q != std::string::npos) req.path = req.path.substr(0, q); }   // route without the query string
         if (req.method == "OPTIONS") { res.send(200, "text/plain", ""); return; }

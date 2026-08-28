@@ -30,3 +30,15 @@ First measurements (2026-08-28): generation 41 t/s with MTP n=2 (acceptance ~80%
 265-token prompt (short prompts are launch-bound; 2K chunks run at ~1000 t/s, 16K prompts at ~800 t/s).
 Not there yet: prompt/prefix caching across turns, concurrent requests (the engine has multi-slot decode; the server
 does not use it yet), `stop` strings, `logprobs`, `n > 1`, vision, the 27B behind the same endpoints.
+
+## 2026-08-28 · the 27B behind the same endpoints (DFlash2 drafts)
+
+`hipster-serve` picks the engine from the GGUF architecture (`qwen35` → 27B, `qwen4exp` → Flash-Next) behind one
+token-level `Backend` interface (prefill chunk, draft, verify, accept, step). 27B: `--draft <DFlash2 gguf>` enables the
+block draft (`--ndraft 7`), otherwise plain decode; prefill chunks are capped at 4096 (its GEMM path).
+
+    MODEL=/models/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_XL.gguf DRAFT=models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf tools/serve.sh --ctx 8192
+
+First measurement (chat completion, 37-token prompt, 200 tokens of Python, greedy): `prompt_ms 1135`,
+`predicted_per_second 45.9` (DFlash2 n=7), UI/streaming/thinking/tools unchanged. Still one slot per server; the
+engine's 2-slot lockstep mode (79 t/s aggregate in `dflash27b`) is not scheduled from the HTTP layer yet.
