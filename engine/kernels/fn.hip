@@ -52,10 +52,6 @@ __global__ void __launch_bounds__(256) k_hc_norm(HcNormArgs a, float eps) {
     float* r = a.R + ((size_t)t * HC + s) * E;
     const bool comb = a.y != nullptr;
     const float ws = comb ? inject_w(a.inject, t, s) : 0.f;
-    if (s == 0) {
-        if (a.zero_lo) for (int i = threadIdx.x; i < 320; i += 256) a.zero_lo[t * 320 + i] = 0.f;
-        if (a.zero_y) for (int i = threadIdx.x; i < E; i += 256) a.zero_y[t * E + i] = 0.f;
-    }
     float ss = 0.f;
     for (int i = threadIdx.x; i < E; i += 256) {
         float v = r[i];
@@ -78,11 +74,14 @@ __global__ void __launch_bounds__(256) k_hc_norm(HcNormArgs a, float eps) {
         wave_quant32(v, a.q, a.qd, a.qs, (int)(oi / 32), lane);
     }
 }
-__global__ void k_hc_silu_quant(const float* __restrict__ lo, int8_t* __restrict__ q, float* __restrict__ qd, float* __restrict__ qs, int T) {
+// lo = sum over the ksplit partials (fixed order) -> silu(lo/4) -> quantised 320-wide rows
+__global__ void k_hc_silu_quant(const float* __restrict__ part, int ksplit, int8_t* __restrict__ q, float* __restrict__ qd, float* __restrict__ qs, int T) {
     const int sb = blockIdx.x * 8 + threadIdx.x / 32, lane = threadIdx.x % 32;   // 320 = 10 sub-blocks per token
     if (sb >= T * 10) return;
-    const int i = sb * 32 + lane;
-    wave_quant32(silu(lo[i] * 0.25f), q, qd, qs, sb, lane);
+    const int t = sb / 10, i = (sb % 10) * 32 + lane;
+    float v = 0.f;
+    for (int ks = 0; ks < ksplit; ++ks) v += part[((size_t)t * ksplit + ks) * 320 + i];
+    wave_quant32(silu(v * 0.25f), q, qd, qs, sb, lane);
 }
 // hc_mix: block per (t, 128 dims): 4 waves; 20 blocks per token. inject written as per-block partials
 // [T][INJ_PART][4] (summed by the consumer) instead of contended atomics (4 addresses: 13 us).
@@ -127,6 +126,30 @@ __global__ void k_init_wide(const float* __restrict__ x, float* __restrict__ R) 
     for (int i = threadIdx.x; i < E; i += 256) R[((size_t)t * HC + s) * E + i] = x[(size_t)t * E + i];
 }
 
+// ---- MTP input: block per token. e_norm = rmsnorm(e[2560])*enorm; h_norm = rmsnorm(h[10240], whole row)*hnorm;
+// per stream s: xq row t*4+s = [e_norm | h_norm[s*2560..]] (5120), quantised (input of eh_proj) ----
+__global__ void __launch_bounds__(256) k_mtp_prep(const float* __restrict__ e, const float* __restrict__ enorm, const float* __restrict__ h,
+                                                  const float* __restrict__ hnorm, int8_t* __restrict__ q, float* __restrict__ qd, float* __restrict__ qs, float eps) {
+    __shared__ float sh[2][8];
+    const int t = blockIdx.x, wave = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const float* et = e + (size_t)t * E; const float* ht = h + (size_t)t * W;
+    float se = 0.f, shh = 0.f;
+    for (int i = threadIdx.x; i < E; i += 256) se += et[i] * et[i];
+    for (int i = threadIdx.x; i < W; i += 256) shh += ht[i] * ht[i];
+    se = wave_sum(se); shh = wave_sum(shh);
+    if (lane == 0) { sh[0][wave] = se; sh[1][wave] = shh; }
+    __syncthreads();
+    se = 0.f; shh = 0.f; for (int i = 0; i < 8; ++i) { se += sh[0][i]; shh += sh[1][i]; }
+    const float sce = rsqrtf(se / E + eps), sch = rsqrtf(shh / W + eps);
+    for (int s = 0; s < HC; ++s) {
+        const size_t row = (size_t)t * HC + s;
+        for (int sb = wave; sb < 2 * E / 32; sb += 8) {   // 160 sub-blocks of 32 per row
+            const int i = sb * 32 + lane;
+            const float v = i < E ? et[i] * sce * enorm[i] : ht[s * E + (i - E)] * sch * hnorm[s * E + (i - E)];
+            wave_quant32(v, q, qd, qs, (int)(row * (2 * E / 32) + sb), lane);
+        }
+    }
+}
 // ---- MoE routing: block per token, 512 logits, 16 waves. softmax, then top-10 by repeated argmax (ties -> smaller
 // index): each wave takes its 32 values' top-10 with shuffles, wave 0 merges the 160 candidates. No block-wide
 // argmax rounds (the 10 x 9 __syncthreads version took 11.5 us).
@@ -241,9 +264,12 @@ void hc_norm(const HcNormArgs& a0, XQ8 xq, int T, float eps, hipStream_t s) {
     HcNormArgs a = a0; a.q = xq.q; a.qd = xq.d; a.qs = xq.s;
     k_hc_norm<<<T * HC, 256, 0, s>>>(a, eps);
 }
-void hc_silu_quant(const float* lo_raw, XQ8 xq, int T, hipStream_t s) { k_hc_silu_quant<<<(T * 10 + 7) / 8, 256, 0, s>>>(lo_raw, xq.q, xq.d, xq.s, T); }
+void hc_silu_quant(const float* part, int ksplit, XQ8 xq, int T, hipStream_t s) { k_hc_silu_quant<<<(T * 10 + 7) / 8, 256, 0, s>>>(part, ksplit, xq.q, xq.d, xq.s, T); }
 void hc_mix(const float* xn, const float* up, const float* w_inject, float* mixed, float* inject, XQ8 xq, int T, hipStream_t s) {
     k_hc_mix<<<T * INJ_PART, 128, 0, s>>>(xn, up, w_inject, mixed, inject, xq.q, xq.d, xq.s);
+}
+void mtp_prep(const float* e, const float* enorm, const float* h, const float* hnorm, XQ8 xq, int T, float eps, hipStream_t s) {
+    k_mtp_prep<<<T, 256, 0, s>>>(e, enorm, h, hnorm, xq.q, xq.d, xq.s, eps);
 }
 void moe_route(const float* logits, int* ids, float* w, int T, hipStream_t s) { k_moe_route<<<T, 512, 0, s>>>(logits, ids, w, 10); }
 void moe_gemv(WFmt fmt, WFmt shared_fmt, const MoeSegs& a, int nseg, const int* ids, int nexp, XQ8 xq, int N, int K, int T, hipStream_t s) {

@@ -54,3 +54,39 @@ on ~1 GB-class launches plus ~2.5 ms of small kernels — no single item above 2
 the MTP block (blk.48 in `/srv/models/qwen3.8-flash-next/mtp/*.gguf`: attention + indexer + MoE + hc +
 `nextn.eh_proj/enorm/hnorm`), then requantising the 1.96 GB/token of Q8_0 dense projections (32% of the bytes).
 Todo noted: `k_topk` over 248K logits takes 270 µs — needs a proper two-stage argmax before serving.
+
+## 2026-08-28 · MTP speculative decoding, deterministic + T-invariant numerics
+Driver: `./build.sh './build/specfn <XL-MTP shard1> docs/ref/fn-code.json 96 2,3,4,5,6,7'` (plain greedy first, then one
+MTP run per draft length; the streams must be identical). Model: the 5-shard `UD-Q4_K_XL-MTP` file (trunk 12/12 vs
+llama.cpp as before; blk.48 = attention + indexer (unused, dense) + MoE + hc + `nextn.eh_proj/enorm/hnorm`, 1.9 GB;
+its `hc_*_up` are Q5_0, repacked exactly onto our Q5_1 SoA path with m = −16·d).
+
+MTP block per franken's graph: h = the trunk's wide residual after the last combine (our head-norm fold leaves exactly
+that in `R_`), `hnorm` over the whole 10240 row, `e_norm` repeated per stream, `eh_proj` per stream → a fresh 4-stream
+residual, one hc/attention/hc/MoE layer, the trunk's head. Draft = 5.6 ms wall (LM head 2.8 of it).
+
+**Exactness required three fixes, each found by a test:**
+1. Float atomics (MoE combine, split-K) made the trunk itself run-to-run nondeterministic (64/64 then 63/64).
+   Replaced by fixed-order reductions: the down-projection kernel loops over the 11 slots per row (no atomics, and
+   cheaper: 130 → 112 µs), split-K writes partials summed by the consumer.
+2. Lane counts depended on ncol, so a T-token pass reduced rows in a different order than T single passes.
+   The lane policy is now a function of the tensor only; `HIPSTER_LOGIT_DIFF=1 HIPSTER_BATCH=3` reports
+   **max |logits(T=3) − logits(T=1)| = 0.0000 over 96 tokens** — bit-identical.
+3. Partial accept replays GDN/conv/PLE state for the accepted prefix from saved inputs; the PLE conv history
+   depends on the layer-1 residual through the gate, so the residual is snapshotted per pass and replayed on a scratch
+   copy (replaying on `R_` corrupted both the history and the `h` handed to the next drafts → divergence at token 63
+   with a 0.63 logit gap).
+Also: `MADV_WILLNEED` on the 16 n-gram rows before decoding them: host gather 4 → 0.4 ms/token.
+
+| n | t/s | acceptance | tokens/round | verify pass (T=n+1) | draft |
+|---|---|---|---|---|---|
+| plain | 27.4 | | | 35 ms | |
+| 2 | **37.2** | 69% | 2.38 | 53 ms | 5.6 ms |
+| 3 | 35.0 | 55% | 2.64 | 61 | |
+| 4 | 32.7 | 47% | 2.88 | 70 | |
+| 5 | 31.7 | 43% | 3.17 | 78 | |
+| 7 | 28.6 | 36% | 3.52 | 93 | |
+All 96/96 identical to plain greedy. The MoE verify pass costs ~7.5 ms per extra row (1.8 GB of experts per token,
+near roof), so long drafts cannot pay at this acceptance; the 27B (dense: verify ≈ free) is the opposite regime.
+Single-stream ceiling for this model ≈ 40 t/s; the concurrency ceiling is far higher (dense 4.3 GB amortised across
+slots, experts 7.5 ms/token → 83 t/s at 4 slots, 105 at 8) and MTP adds little there. **Next: multi-slot batching.**

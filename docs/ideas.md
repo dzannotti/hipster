@@ -96,7 +96,10 @@ the value is elsewhere:
 | PLE gather: hash on the host at sampling time, issue the 16-row gather + key/value GEMVs so it lands by layer 1; hot-row LRU | partially (host hash + sync gather); prefetch untested |
 | gated residual: read/write as two fused kernels; residual streams in FP8 (Qwen: negligible loss) | write folded into the next read's norm (0 launches); read = norm + split-K down + silu + up + mix; FP8 streams untested |
 | MoE prefill: sort tokens by expert, per-expert GEMM tiles sized by average rows/expert, shared activation quant for gate/up | untested |
-| MTP block (QSA + MoE + hc) with the frozen top-k across draft steps | next: blk.48 in /srv/models/qwen3.8-flash-next/mtp (attention + indexer + MoE + hc + nextn.eh_proj/enorm/hnorm) |
+| MTP block (QSA + MoE + hc) with the frozen top-k across draft steps | done (dense attention): 27.4 → 37.2 t/s at n=2, exact; acceptance 69% first draft, decays fast (docs/decode-flash-next.md) |
+| multi-slot batched decode (S sequences × T rows; per-row state/KV/position) — the concurrency ceiling: 83 t/s at 4 slots, 105 at 8 | next |
+| draft-only Q4_K LM head for the MTP (2.8 of 5.6 ms per draft) | untested |
+| deterministic, T-invariant numerics as a contract (no float atomics, lane policy by tensor only) | done, tested bit-exact T=3 vs T=1 |
 | lanes-per-row policy per tensor shape (short K rows are issue-bound, not bandwidth-bound) | measured, applied: docs/decode-flash-next.md table |
 | hc read chain as one persistent kernel (norm → 320-wide down → silu → up → mix; 5 launches + 3.3 MB weights each) | untested |
 | `k_topk` over 248K logits: two-stage argmax (270 µs today) | untested |
@@ -111,7 +114,7 @@ the value is elsewhere:
 ## Speculation
 | idea | status |
 |---|---|
-| MTP n=1..5 | measured: 35.6 t/s code at n=5, exact |
+| MTP n=1..5 | 27B: 35.6 t/s code at n=5, exact · Flash-Next: 37.2 t/s at n=2, exact (MoE verify cost grows with T) |
 | DFlash2 drafter (27B; docs/forks/dflash2.md) | researched: 1.8–2.3× on llama.cpp vs our MTP 2.85×; ≈1.3× over MTP if τ=5.4 holds; measure our per-position acceptance first |
 | draft-only LM head at Q4_K / shortlisted rows | untested |
 | adaptive n from acceptance EMA | untested |

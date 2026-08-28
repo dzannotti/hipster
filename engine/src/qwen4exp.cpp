@@ -1,4 +1,6 @@
 #include "qwen4exp.h"
+#include <chrono>
+#include <sys/mman.h>
 #include "quant.h"
 #include "../kernels/ops.h"
 #include "../kernels/fn.h"
@@ -10,6 +12,8 @@
 #define CK(x) do { hipError_t e = (x); if (e != hipSuccess) throw std::runtime_error(std::string("HIP: ") + hipGetErrorString(e) + " @" + __FILE__ + ":" + std::to_string(__LINE__)); } while (0)
 
 namespace hip {
+
+static constexpr int KSPLIT = 8;   // split-K partials of the 320-row hc down GEMVs
 using D = FnDims;
 
 static int gdn_index(int il) { return il - (il + 1) / 4; }
@@ -34,6 +38,8 @@ static FnLin to_lin(const GTensor& t, int K, int N, const uint8_t* src_rows, siz
             parallel_rows(N, [&](int r) { repack_row_q6_K(src_rows + (size_t)r * rb_src, tmp.data() + (size_t)r * rb_src, K); }); src = tmp.data(); break;
         case GType::Q8_0: l.fmt = WFmt::Q8_0_SOA; l.bytes = rb_src * N; tmp.resize(l.bytes);
             parallel_rows(N, [&](int r) { repack_row_q8_0(src_rows + (size_t)r * rb_src, tmp.data() + (size_t)r * rb_src, K); }); src = tmp.data(); break;
+        case GType::Q5_0: l.fmt = WFmt::Q5_1_SOA; l.bytes = wfmt_row_bytes(WFmt::Q5_1_SOA, K) * N; tmp.resize(l.bytes);   // exact: m = -16 d
+            parallel_rows(N, [&](int r) { repack_row_q5_0(src_rows + (size_t)r * rb_src, tmp.data() + (size_t)r * (l.bytes / N), K); }); src = tmp.data(); break;
         case GType::Q5_1: l.fmt = WFmt::Q5_1_SOA; l.bytes = rb_src * N; tmp.resize(l.bytes);
             parallel_rows(N, [&](int r) { repack_row_q5_1(src_rows + (size_t)r * rb_src, tmp.data() + (size_t)r * rb_src, K); }); src = tmp.data(); break;
         default: {   // F32/BF16/Q5_0/... -> Q8_0 SoA
@@ -47,6 +53,37 @@ static FnLin to_lin(const GTensor& t, int K, int N, const uint8_t* src_rows, siz
     return l;
 }
 static const GGUF* g_release_gguf = nullptr;   // set by the loader so uploads can drop their page cache
+void Qwen4Exp::load_layer(const GGUF& g, int il, FnLayer& L, bool attn) {
+    const std::string p = "blk." + std::to_string(il) + ".";
+        L.hc_attn_norm = upload_f32(g, p + "hc_attn_norm.weight", D::wide); L.hc_attn_inject = upload_f32(g, p + "hc_attn_inject.weight", (size_t)D::wide * 4, true);
+        L.hc_ffn_norm = upload_f32(g, p + "hc_ffn_norm.weight", D::wide); L.hc_ffn_inject = upload_f32(g, p + "hc_ffn_inject.weight", (size_t)D::wide * 4, true);
+        L.hc_attn_down = upload_lin(g, p + "hc_attn_down.weight"); L.hc_attn_up = upload_lin(g, p + "hc_attn_up.weight");
+        L.hc_ffn_down = upload_lin(g, p + "hc_ffn_down.weight"); L.hc_ffn_up = upload_lin(g, p + "hc_ffn_up.weight");
+        if (attn) {
+            L.wq = upload_lin(g, p + "attn_q.weight"); L.wk = upload_lin(g, p + "attn_k.weight"); L.wv = upload_lin(g, p + "attn_v.weight"); L.wo = upload_lin(g, p + "attn_output.weight");
+            L.q_norm = upload_f32(g, p + "attn_q_norm.weight", D::head_dim); L.k_norm = upload_f32(g, p + "attn_k_norm.weight", D::head_dim);
+        } else {
+            L.qkv = upload_lin(g, p + "attn_qkv.weight"); L.zgate = upload_lin(g, p + "attn_gate.weight");
+            L.beta = upload_lin(g, p + "ssm_beta.weight"); L.alpha = upload_lin(g, p + "ssm_alpha.weight"); L.ssm_out = upload_lin(g, p + "ssm_out.weight");
+            L.conv_w = upload_f32(g, p + "ssm_conv1d.weight", (size_t)4 * D::gdn_qkv); L.dt_bias = upload_f32(g, p + "ssm_dt.bias", D::gdn_v_heads);
+            L.a_neg = upload_f32(g, p + "ssm_a", D::gdn_v_heads); L.ssm_norm = upload_f32(g, p + "ssm_norm.weight", D::gdn_dim);
+        }
+        {   // router [512][2560] + shared-expert gate [1][2560] concatenated -> one f32 GEMV of 513 rows
+            const GTensor& tr = g.get(p + "ffn_gate_inp.weight"); const GTensor& ts = g.get(p + "ffn_gate_inp_shexp.weight");
+            if (tr.type != GType::F32 || ts.type != GType::F32) throw std::runtime_error("router must be f32");
+            std::vector<uint8_t> a(tr.nbytes + ts.nbytes); g.read_tensor(tr, a.data()); g.read_tensor(ts, a.data() + tr.nbytes);
+            CK(hipMalloc(&L.router, a.size())); CK(hipMemcpy(L.router, a.data(), a.size(), hipMemcpyHostToDevice)); weight_bytes_ += a.size(); L.shexp_gate = nullptr;
+        }
+        upload_experts(g, p + "ffn_gate_exps.weight", &L.gate_exps, &L.gate_fmt, &L.gate_eb);
+        upload_experts(g, p + "ffn_up_exps.weight", &L.up_exps, &L.up_fmt, &L.up_eb);
+        upload_experts(g, p + "ffn_down_exps.weight", &L.down_exps, &L.down_fmt, &L.down_eb);
+        L.sh_gate = upload_lin(g, p + "ffn_gate_shexp.weight"); L.sh_up = upload_lin(g, p + "ffn_up_shexp.weight"); L.sh_down = upload_lin(g, p + "ffn_down_shexp.weight");
+        if (il == D::ple_layer) {
+            L.ple_key = upload_lin(g, p + "ple_key.weight"); L.ple_value = upload_lin(g, p + "ple_value.weight");
+            L.ple_nk = upload_f32(g, p + "ple_norm_key.weight", D::wide); L.ple_nq = upload_f32(g, p + "ple_norm_query.weight", D::wide);
+            L.ple_nc = upload_f32(g, p + "ple_norm_conv.weight", D::wide); L.ple_conv = upload_f32(g, p + "ple_conv1d.weight", (size_t)4 * D::wide);
+        }
+}
 
 FnLin Qwen4Exp::upload_lin(const GGUF& g, const std::string& name) {
     const GTensor& t = g.get(name);
@@ -85,36 +122,15 @@ Qwen4Exp::Qwen4Exp(const std::string& path, int max_ctx) : max_ctx_(max_ctx) {
       ple_table_ = &g.get("per_layer_token_embd.weight"); }
     layers_.resize(D::n_layer);
     for (int il = 0; il < D::n_layer; ++il) {
-        auto& L = layers_[il]; const std::string p = "blk." + std::to_string(il) + ".";
-        L.hc_attn_norm = upload_f32(g, p + "hc_attn_norm.weight", D::wide); L.hc_attn_inject = upload_f32(g, p + "hc_attn_inject.weight", (size_t)D::wide * 4, true);
-        L.hc_ffn_norm = upload_f32(g, p + "hc_ffn_norm.weight", D::wide); L.hc_ffn_inject = upload_f32(g, p + "hc_ffn_inject.weight", (size_t)D::wide * 4, true);
-        L.hc_attn_down = upload_lin(g, p + "hc_attn_down.weight"); L.hc_attn_up = upload_lin(g, p + "hc_attn_up.weight");
-        L.hc_ffn_down = upload_lin(g, p + "hc_ffn_down.weight"); L.hc_ffn_up = upload_lin(g, p + "hc_ffn_up.weight");
-        if (D::is_attn(il)) {
-            L.wq = upload_lin(g, p + "attn_q.weight"); L.wk = upload_lin(g, p + "attn_k.weight"); L.wv = upload_lin(g, p + "attn_v.weight"); L.wo = upload_lin(g, p + "attn_output.weight");
-            L.q_norm = upload_f32(g, p + "attn_q_norm.weight", D::head_dim); L.k_norm = upload_f32(g, p + "attn_k_norm.weight", D::head_dim);
-        } else {
-            L.qkv = upload_lin(g, p + "attn_qkv.weight"); L.zgate = upload_lin(g, p + "attn_gate.weight");
-            L.beta = upload_lin(g, p + "ssm_beta.weight"); L.alpha = upload_lin(g, p + "ssm_alpha.weight"); L.ssm_out = upload_lin(g, p + "ssm_out.weight");
-            L.conv_w = upload_f32(g, p + "ssm_conv1d.weight", (size_t)4 * D::gdn_qkv); L.dt_bias = upload_f32(g, p + "ssm_dt.bias", D::gdn_v_heads);
-            L.a_neg = upload_f32(g, p + "ssm_a", D::gdn_v_heads); L.ssm_norm = upload_f32(g, p + "ssm_norm.weight", D::gdn_dim);
-        }
-        {   // router [512][2560] + shared-expert gate [1][2560] concatenated -> one f32 GEMV of 513 rows
-            const GTensor& tr = g.get(p + "ffn_gate_inp.weight"); const GTensor& ts = g.get(p + "ffn_gate_inp_shexp.weight");
-            if (tr.type != GType::F32 || ts.type != GType::F32) throw std::runtime_error("router must be f32");
-            std::vector<uint8_t> a(tr.nbytes + ts.nbytes); g.read_tensor(tr, a.data()); g.read_tensor(ts, a.data() + tr.nbytes);
-            CK(hipMalloc(&L.router, a.size())); CK(hipMemcpy(L.router, a.data(), a.size(), hipMemcpyHostToDevice)); weight_bytes_ += a.size(); L.shexp_gate = nullptr;
-        }
-        upload_experts(g, p + "ffn_gate_exps.weight", &L.gate_exps, &L.gate_fmt, &L.gate_eb);
-        upload_experts(g, p + "ffn_up_exps.weight", &L.up_exps, &L.up_fmt, &L.up_eb);
-        upload_experts(g, p + "ffn_down_exps.weight", &L.down_exps, &L.down_fmt, &L.down_eb);
-        L.sh_gate = upload_lin(g, p + "ffn_gate_shexp.weight"); L.sh_up = upload_lin(g, p + "ffn_up_shexp.weight"); L.sh_down = upload_lin(g, p + "ffn_down_shexp.weight");
-        if (il == D::ple_layer) {
-            L.ple_key = upload_lin(g, p + "ple_key.weight"); L.ple_value = upload_lin(g, p + "ple_value.weight");
-            L.ple_nk = upload_f32(g, p + "ple_norm_key.weight", D::wide); L.ple_nq = upload_f32(g, p + "ple_norm_query.weight", D::wide);
-            L.ple_nc = upload_f32(g, p + "ple_norm_conv.weight", D::wide); L.ple_conv = upload_f32(g, p + "ple_conv1d.weight", (size_t)4 * D::wide);
-        }
+        load_layer(g, il, layers_[il], D::is_attn(il));
         if (il % 8 == 7) fprintf(stderr, "  loaded %d layers, %.1f GiB\n", il + 1, weight_bytes_ / 1073741824.0);
+    }
+    if (g.has("blk.48.nextn.eh_proj.weight")) {   // the UD-Q4_K_XL-MTP shards carry the draft block; the 4-shard file does not
+        const std::string p = "blk.48.";
+        load_layer(g, 48, mtp_.L, true);
+        mtp_.eh_proj = upload_lin(g, p + "nextn.eh_proj.weight");
+        mtp_.enorm = upload_f32(g, p + "nextn.enorm.weight", D::n_embd); mtp_.hnorm = upload_f32(g, p + "nextn.hnorm.weight", D::wide);
+        has_mtp_ = true; fprintf(stderr, "  loaded the MTP block, %.1f GiB\n", weight_bytes_ / 1073741824.0);
     }
     { const GTensor& t = g.get("token_embd.weight"); if (t.type != GType::Q8_0) throw std::runtime_error("token_embd must be Q8_0");
       std::vector<uint8_t> stage(t.nbytes); g.read_tensor(t, stage.data());
@@ -123,14 +139,19 @@ Qwen4Exp::Qwen4Exp(const std::string& path, int max_ctx) : max_ctx_(max_ctx) {
     output_ = upload_lin(g, "output.weight");
     // state
     const size_t st = (size_t)D::n_gdn * D::gdn_v_heads * D::gdn_dim * D::gdn_dim, cs = (size_t)D::n_gdn * 3 * D::gdn_qkv;
-    for (int i = 0; i < 2; ++i) { CK(hipMalloc(&gdn_state_[i], st * 4)); CK(hipMalloc(&conv_state_[i], cs * 4)); }
-    CK(hipMalloc(&ple_state_, (size_t)D::ple_hist * D::wide * 4));
+    for (int i = 0; i < 2; ++i) { CK(hipMalloc(&gdn_state_[i], st * 4)); CK(hipMalloc(&conv_state_[i], cs * 4)); CK(hipMalloc(&ple_state_[i], (size_t)D::ple_hist * D::wide * 4)); }
+    CK(hipMalloc(&sv_qkv_, (size_t)D::n_gdn * D::max_T * D::gdn_qkv * 4)); CK(hipMalloc(&sv_beta_, (size_t)D::n_gdn * D::max_T * 64 * 4)); CK(hipMalloc(&sv_alpha_, (size_t)D::n_gdn * D::max_T * 64 * 4));
+    CK(hipMalloc(&sv_plekey_, (size_t)D::max_T * D::wide * 4)); CK(hipMalloc(&sv_pleval_, (size_t)D::max_T * D::n_embd * 4));
+    CK(hipMalloc(&sv_pleR_, (size_t)D::max_T * D::wide * 4)); CK(hipMalloc(&ple_scratch_, (size_t)D::max_T * D::wide * 4));
     const size_t kv = (size_t)D::n_attn * max_ctx_ * D::n_head_kv * D::head_dim, kvt = (size_t)D::n_attn * (max_ctx_ + 128) * D::n_head_kv * D::head_dim;
     CK(hipMalloc(&kc_, kv * 2)); CK(hipMalloc(&vc_, kvt * 2)); CK(hipMemset(vc_, 0, kvt * 2));
     const int T = D::max_T;
-    CK(hipMalloc(&R_, (size_t)T * D::wide * 4)); CK(hipMalloc(&xn_, (size_t)T * D::wide * 4)); CK(hipMalloc(&lo_, (size_t)T * D::hc_lr * 4)); CK(hipMalloc(&up_, (size_t)T * D::wide * 4));
+    CK(hipMalloc(&R_, (size_t)T * D::wide * 4)); CK(hipMalloc(&R_mtp_, (size_t)T * D::wide * 4)); CK(hipMalloc(&mlogits_, (size_t)T * D::n_vocab * 4));
+    if (has_mtp_) { const size_t kv = (size_t)max_ctx_ * D::n_head_kv * D::head_dim, kvt = (size_t)(max_ctx_ + 128) * D::n_head_kv * D::head_dim;
+                    CK(hipMalloc(&mkc_, kv * 2)); CK(hipMalloc(&mvc_, kvt * 2)); CK(hipMemset(mvc_, 0, kvt * 2)); } CK(hipMalloc(&xn_, (size_t)T * D::wide * 4)); CK(hipMalloc(&lo_, (size_t)T * KSPLIT * D::hc_lr * 4)); CK(hipMalloc(&up_, (size_t)T * D::wide * 4));
     CK(hipMalloc(&mixed_, (size_t)T * D::n_embd * 4)); CK(hipMalloc(&inject_, (size_t)T * 20 * 4 * 4)); CK(hipMalloc(&inject2_, (size_t)T * 20 * 4 * 4)); CK(hipMalloc(&ymoe_, (size_t)T * D::n_embd * 4)); CK(hipMalloc(&y_, (size_t)T * D::n_embd * 4));
-    CK(hipMalloc(&big0_, (size_t)T * D::gdn_qkv * 4)); CK(hipMalloc(&big1_, (size_t)T * D::gdn_qkv * 4)); CK(hipMalloc(&big2_, (size_t)T * D::gdn_qkv * 4));
+    const size_t bigw = (size_t)T * 12288;   // largest per-token row: attention q (24 x 512); qkv is 10240
+    CK(hipMalloc(&big0_, bigw * 4)); CK(hipMalloc(&big1_, bigw * 4)); CK(hipMalloc(&big2_, bigw * 4));
     CK(hipMalloc(&logits_, (size_t)T * D::n_vocab * 4)); CK(hipMalloc(&emb_, (size_t)T * D::n_embd * 4));
     CK(hipMalloc(&rlogits_, (size_t)T * (D::n_exp + 1) * 4)); CK(hipMalloc(&rw_, (size_t)T * (D::n_used + 1) * 4)); CK(hipMalloc(&eid_, (size_t)T * (D::n_used + 1) * 4));
     CK(hipMalloc(&eg_, (size_t)T * (D::n_used + 1) * D::exp_ff * 4)); CK(hipMalloc(&eu_, (size_t)T * (D::n_used + 1) * D::exp_ff * 4));
@@ -146,8 +167,9 @@ void Qwen4Exp::reset() {
     for (int i = 0; i < 2; ++i) {
         CK(hipMemset(gdn_state_[i], 0, (size_t)D::n_gdn * D::gdn_v_heads * D::gdn_dim * D::gdn_dim * 4));
         CK(hipMemset(conv_state_[i], 0, (size_t)D::n_gdn * 3 * D::gdn_qkv * 4));
+        CK(hipMemset(ple_state_[i], 0, (size_t)D::ple_hist * D::wide * 4));
     }
-    CK(hipMemset(ple_state_, 0, (size_t)D::ple_hist * D::wide * 4));
+
     hist_.clear(); cur_ = 0; last_T_ = 0;
 }
 
@@ -159,31 +181,33 @@ static int fn_tpr(const FnLin& l) {
     if (l.K == 6144) return 2;
     return 32;
 }
-void Qwen4Exp::gemv(const FnLin& l, float* y, int ncol) {
-    if (ncol == 1) gemv_q8(l.fmt, l.w, xq_, y, l.N, l.K, 1, fn_tpr(l), 1, s_);
-    else gemv_q8(l.fmt, l.w, xq_, y, l.N, l.K, ncol, 4, 3, s_);
-}
+// The lane count depends on the tensor only, never on ncol: a row's reduction order is then identical for every T,
+// so a T-token verify pass produces bit-identical logits to T single-token passes (the exactness contract).
+void Qwen4Exp::gemv(const FnLin& l, float* y, int ncol) { gemv_q8(l.fmt, l.w, xq_, y, l.N, l.K, ncol, fn_tpr(l), 1, s_); }
 
-// gated-residual read: (pending write of the previous block folded into the norm) R -> mixed (f32 + xq) and inject [T][4]
-void Qwen4Exp::hc_block(const FnLayer& L, bool ffn, int T, const Pending& p, float* mixed, float* inject_out) {
-    fn::HcNormArgs na; na.R = R_; na.y = p.y; na.inject = p.inject;
-    na.w_norm = ffn ? L.hc_ffn_norm : L.hc_attn_norm; na.xn = xn_; na.zero_lo = lo_; na.zero_y = ffn ? ymoe_ : nullptr;   // the ffn read zeroes the MoE accumulator
-    (void)inject_out;
+// gated-residual read: (pending write of the previous block folded into the norm) R -> mixed (f32 + xq) and inject partials
+void Qwen4Exp::hc_block(const FnLayer& L, bool ffn, int T, const Pending& p, float* mixed, float* inject_out, float* R) {
+    fn::HcNormArgs na; na.R = R; na.y = p.y; na.inject = p.inject;
+    na.w_norm = ffn ? L.hc_ffn_norm : L.hc_attn_norm; na.xn = xn_;
     fn::hc_norm(na, xq_, T, D::rms_eps, s_);
     const FnLin& dn = ffn ? L.hc_ffn_down : L.hc_attn_down; const FnLin& up = ffn ? L.hc_ffn_up : L.hc_attn_up;
-    if (T == 1) gemv_splitk(dn.fmt, dn.w, xq_, lo_, dn.N, dn.K, 8, false, s_);   // 320 rows x 10240: fill the GPU with 8 K-splits
-    else gemv(dn, lo_, T);
-    fn::hc_silu_quant(lo_, xq_, T, s_);
+    gemv_splitk(dn.fmt, dn.w, xq_, lo_, dn.N, dn.K, KSPLIT, T, s_);   // 320 rows x 10240: 8 K-splits fill the GPU
+    fn::hc_silu_quant(lo_, KSPLIT, xq_, T, s_);
     gemv(up, up_, T);
     fn::hc_mix(xn_, up_, ffn ? L.hc_ffn_inject : L.hc_attn_inject, mixed, inject_out, xq_, T, s_);
 }
 
-// n-gram rows for T tokens: host hash + IQ4_NL dequant from the mmap'd table, then key/value GEMVs and the gate/conv kernel
+// PLE (layer 1): n-gram rows hashed on the host and gathered from the mmap; key/value GEMVs land in the replay buffers
 void Qwen4Exp::ple(const int* tokens, int T) {
+    const auto t0 = std::chrono::steady_clock::now();
     const auto& L = layers_[D::ple_layer];
     std::vector<float> emb((size_t)T * D::n_embd);
     std::vector<int> seq = hist_; for (int i = 0; i < T; ++i) seq.push_back(tokens[i]);
     const int base = (int)hist_.size();
+    // 16 rows per token, random over a 28.8 GB mmap on NVMe: hash them all, tell the kernel to fetch the pages in
+    // parallel (MADV_WILLNEED), then decode — serial page faults cost ~250 us each (4 ms/token measured).
+    const size_t rb = gtype_row_bytes(ple_table_->type, D::ple_dim);
+    std::vector<const uint8_t*> rows((size_t)T * D::ple_heads);
     for (int i = 0; i < T; ++i) {
         const int pos = base + i;
         int64_t ctx[3]; ctx[0] = seq[pos]; bool cut = false;
@@ -194,15 +218,54 @@ void Qwen4Exp::ple(const int* tokens, int T) {
             for (int h8 = 0; h8 < 8; ++h8) {
                 const int h = (n - 2) * 8 + h8;
                 const int64_t row = (int64_t)(mixed % (uint64_t)ple_vocab_[h]) + ple_off_[h];
-                dequant_row((int)ple_table_->type, ple_table_->data + (size_t)row * gtype_row_bytes(ple_table_->type, D::ple_dim), emb.data() + (size_t)i * D::n_embd + h * D::ple_dim, D::ple_dim);
+                rows[(size_t)i * D::ple_heads + h] = ple_table_->data + (size_t)row * rb;
             }
         }
     }
+    for (const uint8_t* r : rows) { const uintptr_t a = (uintptr_t)r & ~(uintptr_t)4095; madvise((void*)a, ((uintptr_t)r + rb) - a, MADV_WILLNEED); }
+    for (int i = 0; i < T; ++i)
+        for (int h = 0; h < D::ple_heads; ++h)
+            dequant_row((int)ple_table_->type, rows[(size_t)i * D::ple_heads + h], emb.data() + (size_t)i * D::n_embd + h * D::ple_dim, D::ple_dim);
+    ple_host_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     CK(hipMemcpyAsync(emb_, emb.data(), emb.size() * 4, hipMemcpyHostToDevice, s_));
     quantize_x_q8(emb_, xq_, T, D::n_embd, s_);
-    gemv(L.ple_key, up_, T);       // key [T][10240]
-    gemv(L.ple_value, y_, T);      // value [T][2560]
-    fn::ple_apply(R_, up_, y_, L.ple_nk, L.ple_nq, L.ple_nc, L.ple_conv, ple_state_, T, D::rms_eps, s_);
+    gemv(L.ple_key, sv_plekey_, T);       // key [T][10240]
+    gemv(L.ple_value, sv_pleval_, T);     // value [T][2560]
+    const int nxt = cur_ ^ 1;
+    CK(hipMemcpyAsync(ple_state_[nxt], ple_state_[cur_], (size_t)D::ple_hist * D::wide * 4, hipMemcpyDeviceToDevice, s_));
+    CK(hipMemcpyAsync(sv_pleR_, R_, (size_t)T * D::wide * 4, hipMemcpyDeviceToDevice, s_));   // the gate reads R: replay needs this R
+    fn::ple_apply(R_, sv_plekey_, sv_pleval_, L.ple_nk, L.ple_nq, L.ple_nc, L.ple_conv, ple_state_[nxt], T, D::rms_eps, s_);
+}
+
+void Qwen4Exp::attn_layer(const FnLayer& L, int T, int pos0, uint16_t* kc, uint16_t* vc) {
+    float* qf = big0_; float* k = big1_; float* v = big1_ + (size_t)T * 512; float* ao = big2_;
+    GemvSeg segs[3] = {{L.wq.fmt, L.wq.w, qf, L.wq.N, L.wq.K}, {L.wk.fmt, L.wk.w, k, L.wk.N, L.wk.K}, {L.wv.fmt, L.wv.w, v, L.wv.N, L.wv.K}};
+    if (T == 1) gemv_multi(segs, 3, xq_, s_); else for (auto& sg : segs) gemv_q8(sg.fmt, sg.w, xq_, sg.y, sg.N, sg.K, T, 32, 1, s_);
+    attn_decode_24_2(qf, k, v, T, L.q_norm, L.k_norm, D::rope_base, pos0, kc, vc, max_ctx_, ao, xq_, D::rms_eps, s_);
+    gemv(L.wo, y_, T);
+}
+
+// MoE: router (exact f32, row 512 = shared-expert gate) -> top-10 -> gate|up (+ shared) in one launch -> silu -> down with the
+// weighted combine accumulated into ymoe_ (zeroed by the ffn read's norm)
+void Qwen4Exp::moe_layer(const FnLayer& L, int T) {
+    fn::f32_gemv(L.router, mixed_, rlogits_, D::n_exp + 1, D::n_embd, T, s_);
+    fn::moe_route(rlogits_, eid_, rw_, T, s_);                                   // 11 slots per token: 10 routed + shared (-1)
+    MoeSegs gu = {{L.gate_exps, L.up_exps}, {L.sh_gate.w, L.sh_up.w}, {eg_, eu_}, L.gate_eb};
+    if (L.sh_gate.fmt != L.sh_up.fmt || L.up_fmt != L.gate_fmt) throw std::runtime_error("gate/up format mismatch");
+    fn::moe_gemv(L.gate_fmt, L.sh_gate.fmt, gu, 2, eid_, D::n_used + 1, xq_, D::exp_ff, D::n_embd, T, s_);
+    fn::moe_silu_quant(eg_, eu_, xq_, T * (D::n_used + 1), D::exp_ff, s_);
+    MoeSegs dn = {{L.down_exps, nullptr}, {L.sh_down.w, nullptr}, {ymoe_, nullptr}, L.down_eb, rw_};
+    fn::moe_gemv(L.down_fmt, L.sh_down.fmt, dn, 1, eid_, D::n_used + 1, xq_, D::n_embd, D::exp_ff, T, s_);
+}
+
+// head: final gated-residual read (the pending write folded in, so R ends as the wide residual after the last combine), LM head
+void Qwen4Exp::head(int T, const Pending& p, float* R, float* logits_out) {
+    { fn::HcNormArgs na; na.R = R; na.y = p.y; na.inject = p.inject; na.w_norm = head_norm_; na.xn = xn_;
+      fn::hc_norm(na, xq_, T, D::rms_eps, s_); }
+    gemv_splitk(head_down_.fmt, head_down_.w, xq_, lo_, head_down_.N, head_down_.K, KSPLIT, T, s_);
+    fn::hc_silu_quant(lo_, KSPLIT, xq_, T, s_); gemv(head_up_, up_, T);
+    fn::hc_mix(xn_, up_, nullptr, mixed_, nullptr, xq_, T, s_);
+    gemv(output_, logits_out, T);
 }
 
 float Qwen4Exp::forward(const int* tokens, int T, int pos0) {
@@ -222,58 +285,81 @@ float Qwen4Exp::forward(const int* tokens, int T, int pos0) {
             pend = Pending{};
             ple(tokens, T);
         }
-        hc_block(L, false, T, pend, mixed_, inject_);
+        hc_block(L, false, T, pend, mixed_, inject_, R_);
         if (!D::is_attn(il)) {
             const int gi = gdn_index(il);
-            float* qkv_raw = big0_; float* z = big1_; float* b = big2_; float* a = big2_ + (size_t)T * 64; float* qkv = big2_ + (size_t)T * 128; float* ao = big1_ + (size_t)T * D::gdn_z;
+            // raw qkv / beta / alpha land in the replay buffers (accept(m < T) recomputes the state from them)
+            float* qkv_raw = sv_qkv_ + (size_t)gi * D::max_T * D::gdn_qkv; float* b = sv_beta_ + (size_t)gi * D::max_T * 64; float* a = sv_alpha_ + (size_t)gi * D::max_T * 64;
+            float* z = big1_; float* qkv = big2_; float* ao = big0_;   // z [T][6144], qkv [T][10240], ao [T][6144]
             GemvSeg segs[4] = {{L.qkv.fmt, L.qkv.w, qkv_raw, L.qkv.N, L.qkv.K}, {L.zgate.fmt, L.zgate.w, z, L.zgate.N, L.zgate.K},
                                {L.beta.fmt, L.beta.w, b, L.beta.N, L.beta.K}, {L.alpha.fmt, L.alpha.w, a, L.alpha.N, L.alpha.K}};
-            if (T == 1) gemv_multi(segs, 4, xq_, s_); else for (auto& sg : segs) gemv_q8(sg.fmt, sg.w, xq_, sg.y, sg.N, sg.K, T, 4, 3, s_);
+            if (T == 1) gemv_multi(segs, 4, xq_, s_); else for (auto& sg : segs) gemv_q8(sg.fmt, sg.w, xq_, sg.y, sg.N, sg.K, T, 32, 1, s_);   // K=2560: 32 lanes, as in the multi kernel
             const size_t cso = (size_t)gi * 3 * D::gdn_qkv, gso = (size_t)gi * D::gdn_v_heads * D::gdn_dim * D::gdn_dim;
             gdn_conv(qkv_raw, T, conv_state_[cur_] + cso, conv_state_[nxt] + cso, L.conv_w, qkv, D::gdn_qkv, s_);
             gdn_step_sig(qkv, z, b, a, T, L.dt_bias, L.a_neg, gdn_state_[cur_] + gso, gdn_state_[nxt] + gso, L.ssm_norm, ao, xq_, D::rms_eps, s_);
             gemv(L.ssm_out, y_, T);
         } else {
             const int ai = attn_index(il);
-            float* qf = big0_; float* k = big1_; float* v = big1_ + (size_t)T * 512; float* ao = big2_;
-            GemvSeg segs[3] = {{L.wq.fmt, L.wq.w, qf, L.wq.N, L.wq.K}, {L.wk.fmt, L.wk.w, k, L.wk.N, L.wk.K}, {L.wv.fmt, L.wv.w, v, L.wv.N, L.wv.K}};
-            if (T == 1) gemv_multi(segs, 3, xq_, s_); else for (auto& sg : segs) gemv_q8(sg.fmt, sg.w, xq_, sg.y, sg.N, sg.K, T, 4, 3, s_);
             const size_t off = (size_t)ai * max_ctx_ * D::n_head_kv * D::head_dim, offv = (size_t)ai * (max_ctx_ + 128) * D::n_head_kv * D::head_dim;
-            attn_decode_24_2(qf, k, v, T, L.q_norm, L.k_norm, D::rope_base, pos0, kc_ + off, vc_ + offv, max_ctx_, ao, xq_, D::rms_eps, s_);
-            gemv(L.wo, y_, T);
+            attn_layer(L, T, pos0, kc_ + off, vc_ + offv);
         }
         pend = Pending{}; pend.y = y_; pend.inject = inject_;
-        hc_block(L, true, T, pend, mixed_, inject2_);
-        // MoE: router (exact f32) -> top-10 -> expert GEMVs -> combine with the shared expert
-        fn::f32_gemv(L.router, mixed_, rlogits_, D::n_exp + 1, D::n_embd, T, s_);   // row 512 = the shared-expert gate
-        fn::moe_route(rlogits_, eid_, rw_, T, s_);                                   // writes 11 slots per token: 10 routed + shared (-1)
-        // gate|up for the 10 routed experts and the shared expert in ONE launch (same shapes; shared uses ids == -1)
-        MoeSegs gu = {{L.gate_exps, L.up_exps}, {L.sh_gate.w, L.sh_up.w}, {eg_, eu_}, L.gate_eb};
-        if (L.sh_gate.fmt != L.sh_up.fmt || L.up_fmt != L.gate_fmt) throw std::runtime_error("gate/up format mismatch");
-        fn::moe_gemv(L.gate_fmt, L.sh_gate.fmt, gu, 2, eid_, D::n_used + 1, xq_, D::exp_ff, D::n_embd, T, s_);
-        fn::moe_silu_quant(eg_, eu_, xq_, T * (D::n_used + 1), D::exp_ff, s_);
-        MoeSegs dn = {{L.down_exps, nullptr}, {L.sh_down.w, nullptr}, {ymoe_, nullptr}, L.down_eb, rw_};   // down + weighted combine into ymoe_
-        fn::moe_gemv(L.down_fmt, L.sh_down.fmt, dn, 1, eid_, D::n_used + 1, xq_, D::n_embd, D::exp_ff, T, s_);
+        hc_block(L, true, T, pend, mixed_, inject2_, R_);
+        moe_layer(L, T);
         pend = Pending{}; pend.y = ymoe_; pend.inject = inject2_;   // the write half is folded into the next read's norm
     }
-    // head: final gated-residual read (no inject), then the LM head
-    { fn::HcNormArgs na; na.R = R_; na.y = pend.y; na.inject = pend.inject; na.w_norm = head_norm_; na.xn = xn_; na.zero_lo = lo_;
-      fn::hc_norm(na, xq_, T, D::rms_eps, s_); }
-    if (T == 1) gemv_splitk(head_down_.fmt, head_down_.w, xq_, lo_, head_down_.N, head_down_.K, 8, false, s_); else gemv(head_down_, lo_, T);
-    fn::hc_silu_quant(lo_, xq_, T, s_); gemv(head_up_, up_, T);
-    fn::hc_mix(xn_, up_, nullptr, mixed_, nullptr, xq_, T, s_);
-    gemv(output_, logits_, T);
-    for (int i = 0; i < T; ++i) hist_.push_back(tokens[i]);
-    if (hist_.size() > 2) hist_.erase(hist_.begin(), hist_.end() - 2);
+    head(T, pend, R_, logits_);
+    pend_tokens_.assign(tokens, tokens + T);
     last_T_ = T;
     CK(hipEventRecord(ev1_, s_)); CK(hipEventSynchronize(ev1_));
     float ms; CK(hipEventElapsedTime(&ms, ev0_, ev1_));
+    gpu_ms_ += ms;
     return ms;
 }
 
+void Qwen4Exp::mtp_forward(const int* tokens, const float* h, int T, int pos0) {
+    if (!has_mtp_) throw std::runtime_error("no MTP block in this GGUF (use the UD-Q4_K_XL-MTP shards)");
+    if (T < 1 || T > D::max_T) throw std::runtime_error("bad T");
+    const auto& ML = mtp_.L;
+    CK(hipMemcpyAsync(d_tok_, tokens, T * 4, hipMemcpyHostToDevice, s_));
+    fn::embed_q8_0(tok_embd_, d_tok_, T, emb_, D::n_embd, s_);
+    fn::mtp_prep(emb_, mtp_.enorm, h, mtp_.hnorm, xq_, T, D::rms_eps, s_);              // xq rows [T*4][5120]
+    for (int c0 = 0; c0 < 4 * T; c0 += 8) {                                              // eh_proj per stream: R_mtp[t][s] = W . [e_norm | h_norm_s]
+        const int nc = std::min(8, 4 * T - c0); const int K = mtp_.eh_proj.K;
+        XQ8 xs = {xq_.q + (size_t)c0 * K, xq_.d + (size_t)c0 * K / 32, xq_.s + (size_t)c0 * K / 32};
+        gemv_q8(mtp_.eh_proj.fmt, mtp_.eh_proj.w, xs, R_mtp_ + (size_t)c0 * D::n_embd, mtp_.eh_proj.N, K, nc, 32, 1, s_);
+    }
+    Pending pend;
+    hc_block(ML, false, T, pend, mixed_, inject_, R_mtp_);
+    attn_layer(ML, T, pos0, mkc_, mvc_);
+    pend = Pending{}; pend.y = y_; pend.inject = inject_;
+    hc_block(ML, true, T, pend, mixed_, inject2_, R_mtp_);
+    moe_layer(ML, T);
+    pend = Pending{}; pend.y = ymoe_; pend.inject = inject2_;
+    head(T, pend, R_mtp_, mlogits_);
+}
+
 void Qwen4Exp::accept(int m) {
-    if (m != last_T_) throw std::runtime_error("Flash-Next: partial accept not implemented yet");
-    cur_ ^= 1; last_T_ = 0;
+    if (m < 1 || m > last_T_) throw std::runtime_error("bad accept");
+    const int nxt = cur_ ^ 1;
+    if (m < last_T_) {   // replay the recurrent state for m tokens from the saved inputs (cur_ is intact)
+        for (int il = 0; il < D::n_layer; ++il) {
+            if (D::is_attn(il)) continue;
+            const auto& L = layers_[il]; const int gi = gdn_index(il);
+            const size_t cso = (size_t)gi * 3 * D::gdn_qkv, gso = (size_t)gi * D::gdn_v_heads * D::gdn_dim * D::gdn_dim;
+            const float* qkv_raw = sv_qkv_ + (size_t)gi * D::max_T * D::gdn_qkv;
+            gdn_conv(qkv_raw, m, conv_state_[cur_] + cso, conv_state_[nxt] + cso, L.conv_w, big2_, D::gdn_qkv, s_);
+            gdn_step_sig(big2_, nullptr, sv_beta_ + (size_t)gi * D::max_T * 64, sv_alpha_ + (size_t)gi * D::max_T * 64, m, L.dt_bias, L.a_neg,
+                         gdn_state_[cur_] + gso, gdn_state_[nxt] + gso, L.ssm_norm, nullptr, xq_, D::rms_eps, s_);
+        }
+        const auto& P = layers_[D::ple_layer];
+        CK(hipMemcpyAsync(ple_state_[nxt], ple_state_[cur_], (size_t)D::ple_hist * D::wide * 4, hipMemcpyDeviceToDevice, s_));
+        CK(hipMemcpyAsync(ple_scratch_, sv_pleR_, (size_t)m * D::wide * 4, hipMemcpyDeviceToDevice, s_));   // R_ (= h_nextn) must stay intact
+        fn::ple_apply(ple_scratch_, sv_plekey_, sv_pleval_, P.ple_nk, P.ple_nq, P.ple_nc, P.ple_conv, ple_state_[nxt], m, D::rms_eps, s_);
+    }
+    for (int i = 0; i < m; ++i) hist_.push_back(pend_tokens_[i]);
+    if (hist_.size() > 2) hist_.erase(hist_.begin(), hist_.end() - 2);
+    cur_ = nxt; last_T_ = 0;
 }
 
 void Qwen4Exp::topk(const float* logits, int T, int k, int* ids, float* vals) {

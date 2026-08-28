@@ -40,13 +40,25 @@ struct FnLayer {
     FnLin ple_key, ple_value; float *ple_nk, *ple_nq, *ple_nc, *ple_conv;
 };
 
+struct FnMtp { FnLayer L; FnLin eh_proj; float *enorm, *hnorm; };   // blk.48: nextn.* + one attention layer (dense here) + MoE + hc
+
 class Qwen4Exp {
 public:
     explicit Qwen4Exp(const std::string& gguf_path, int max_ctx = 8192);
     // T tokens (<= max_T) at positions pos0..; tokens must continue the sequence (PLE history).
-    // Logits [T][n_vocab] on device. State committed with accept(m) (m == T only for now).
+    // Logits [T][n_vocab] on device. Commit with accept(m): m == T swaps the state buffers, m < T
+    // replays the recurrent state (GDN, conv, PLE conv history) for the first m tokens from saved inputs.
     float forward(const int* tokens, int T, int pos0);
     void accept(int m);
+    // MTP draft block over T (token, h) pairs at positions pos0..: h [T][10240] = the wide residual the
+    // trunk (h_nextn) or the previous draft (mtp_h) hands over. Logits in mtp_logits(), h_out in mtp_h().
+    void mtp_forward(const int* tokens, const float* h, int T, int pos0);
+    bool has_mtp() const { return has_mtp_; }
+    double ple_host_ms() const { return ple_host_ms_; }   // host time spent hashing + gathering n-gram rows from the mmap (SSD)
+    double gpu_ms() const { return gpu_ms_; }             // accumulated forward() GPU time
+    const float* h_nextn() const { return R_; }        // [T][4][2560] after the last combine
+    const float* mtp_h() const { return R_mtp_; }
+    const float* mtp_logits() const { return mlogits_; }
     const float* logits() const { return logits_; }
     void topk(const float* logits, int T, int k, int* ids, float* vals);
     void reset();
@@ -58,10 +70,14 @@ private:
     FnLin upload_lin(const GGUF& g, const std::string& name);
     float* upload_f32(const GGUF& g, const std::string& name, size_t expect, bool from_any = false);
     void upload_experts(const GGUF& g, const std::string& name, uint8_t** dst, WFmt* fmt, size_t* eb);
-    void gemv(const FnLin& l, float* y, int ncol);
     // the write half of a block (R += y * w(inject)) is deferred and folded into the next read's norm
     struct Pending { const float* y = nullptr; const float* inject = nullptr; };
-    void hc_block(const FnLayer& L, bool ffn, int T, const Pending& p, float* mixed, float* inject_out);
+    void load_layer(const GGUF& g, int il, FnLayer& L, bool attn);
+    void gemv(const FnLin& l, float* y, int ncol);
+    void attn_layer(const FnLayer& L, int T, int pos0, uint16_t* kc, uint16_t* vc);
+    void moe_layer(const FnLayer& L, int T);
+    void head(int T, const Pending& p, float* R, float* logits_out);
+    void hc_block(const FnLayer& L, bool ffn, int T, const Pending& p, float* mixed, float* inject_out, float* R);
     void ple(const int* tokens, int T);
 
     GGUF* gguf_ = nullptr;             // kept open: the n-gram table is read from the mmap on demand
@@ -71,14 +87,17 @@ private:
     int max_ctx_;
     std::vector<FnLayer> layers_;
     uint8_t* tok_embd_ = nullptr; float* head_norm_ = nullptr; FnLin head_down_, head_up_, output_;
-    float *gdn_state_[2], *conv_state_[2], *ple_state_; int cur_ = 0;
-    uint16_t *kc_, *vc_;
+    float *gdn_state_[2], *conv_state_[2], *ple_state_[2]; int cur_ = 0;
+    uint16_t *kc_, *vc_, *mkc_ = nullptr, *mvc_ = nullptr;
+    FnMtp mtp_; bool has_mtp_ = false;
+    // saved per-layer inputs of the last pass for replay on partial accept
+    float *sv_qkv_, *sv_beta_, *sv_alpha_, *sv_plekey_, *sv_pleval_, *sv_pleR_, *ple_scratch_; std::vector<int> pend_tokens_;
     // work
-    float *R_, *xn_, *lo_, *up_, *mixed_, *inject_, *inject2_, *y_, *big0_, *big1_, *big2_, *logits_, *emb_;
+    float *R_, *R_mtp_, *xn_, *lo_, *up_, *mixed_, *inject_, *inject2_, *y_, *big0_, *big1_, *big2_, *logits_, *mlogits_, *emb_;
     float *rlogits_, *rw_, *eg_, *eu_, *ymoe_, *shx_, *sg_; int* eid_;
     int* d_tok_; XQ8 xq_; int* d_ids_; float* d_vals_;
     hipStream_t s_; hipEvent_t ev0_, ev1_;
-    size_t weight_bytes_ = 0; std::string report_; int last_T_ = 0;
+    size_t weight_bytes_ = 0; std::string report_; int last_T_ = 0; double ple_host_ms_ = 0, gpu_ms_ = 0;
 };
 
 }  // namespace hip

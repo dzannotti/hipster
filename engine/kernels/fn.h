@@ -17,21 +17,23 @@ void init_wide(const float* x, float* R, int T, hipStream_t s);
 // Hyper-connection read, part 1, per stream s of R [T][4][2560]: first the pending write half of the previous
 // block, R[s] += y * w_s (w_s = 2*sigmoid(inject_s/4), inject given as the [T][20][4] partials hc_mix writes),
 // then xn[s] = rmsnorm(R[s]) * w_norm[s*2560..] written f32 [T][10240] and quantised into xq (input of the
-// 10240->320 GEMV). Also zeroes zero_lo [T][320] / zero_y [T][2560] (accumulated by the chain that follows).
+// 10240->320 GEMV).
 struct HcNormArgs {
     float* R; const float* y = nullptr; const float* inject = nullptr;
-    const float* w_norm; float* xn; float* zero_lo = nullptr; float* zero_y = nullptr;
+    const float* w_norm; float* xn;
     int8_t* q = nullptr; float* qd = nullptr; float* qs = nullptr;
 };
 void hc_norm(const HcNormArgs& a, XQ8 xq, int T, float eps, hipStream_t s);
-// part 2: lo = silu(lo_raw/4) (T x 320) -> quantised into xq (input of the 320->10240 GEMV)
-void hc_silu_quant(const float* lo_raw, XQ8 xq, int T, hipStream_t s);
+// part 2: lo = sum of the ksplit split-K partials [T][ksplit][320] (fixed order), silu(lo/4) -> quantised into xq
+void hc_silu_quant(const float* part, int ksplit, XQ8 xq, int T, hipStream_t s);
 // part 3: gate = sigmoid(up) [T][10240]; mixed[t] = mean_s(xn[s]*gate[s]) [2560] -> f32 out + xq;
 // inject = W_inject^T xn (W_inject f32 [10240][4], i.e. GGUF [4 x 10240] ne0=4) as per-block partials [T][20][4]
 void hc_mix(const float* xn, const float* up, const float* w_inject, float* mixed, float* inject, XQ8 xq, int T, hipStream_t s);
 
 // exact f32 GEMV (router 512x2560, shared-expert gate 1x2560): y [T][N] = W [N][K] . x [T][K]
 void f32_gemv(const float* W, const float* x, float* y, int N, int K, int T, hipStream_t s);
+// MTP input rows: xq [T*4][5120] = [rmsnorm(e)*enorm | rmsnorm(h, over the whole 10240 row)*hnorm, stream s] (eh_proj input)
+void mtp_prep(const float* e, const float* enorm, const float* h, const float* hnorm, XQ8 xq, int T, float eps, hipStream_t s);
 // MoE routing: logits [T][512] f32 -> softmax -> top-10 ids [T][10] and renormalised weights [T][10]
 void moe_route(const float* logits, int* ids, float* w, int T, hipStream_t s);
 // Expert GEMV for decode (T <= 8): for slot e < 10: y[t][e][N] = W[ids[t][e]] . x[t]  (x quantised in xq,

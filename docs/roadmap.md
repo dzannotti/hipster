@@ -8,7 +8,16 @@ the next measurement, not by feature.
 Per-token bytes: 27B 16.48 GB (floor 14.6 t/s) · Flash-Next 6.43 GB (floor 37 t/s; 4.1 GB of it
 is Q8_0 dense tensors — a requant lever llama.cpp doesn't have).
 
-## Status 2026-08-28: Phase 1 done (12.5 t/s, 87% of floor), Phase 2 MTP done (35.6 t/s code, exact), Phase 3 prefill v1 done (647 t/s @2K, 475 @32K). Depth gate green at 16K/32K (needle + logprobs vs llama.cpp). Phase 4 Flash-Next: decode engine exact vs llama.cpp (12/12), 17.5 t/s vs 37 floor — profiling. Next: int8 KV, 128K/262K gate, Flash-Next prefill + QSA + MTP.
+## Decision 2026-08-28: Flash-Next first
+Both engines exist and are exact. Priority goes to the model with the higher ceiling, single-stream and under
+concurrency: Flash-Next streams 6.1 GB/token (floor 39 t/s) vs 16.5 GB for the 27B (14.6 t/s); at 4 concurrent
+sequences the dense part of Flash-Next (4.3 GB) is shared and only the 1.8 GB of experts scales (mostly disjoint
+expert sets) → ~11.5 GB per 4-token pass ≈ 83 t/s aggregate ceiling vs 58 for the 27B, and the gap widens with
+MTP because expert reads for the T verify rows overlap. 27B work continues only where it is shared (GEMV,
+attention, GDN kernels) or asked for. Order: Flash-Next MTP → multi-slot verify/decode → prefill GEMM path →
+QSA beyond 2K → serving.
+
+## Status 2026-08-28: Phase 1 done (12.5 t/s, 87% of floor), Phase 2 MTP done (35.6 t/s code, exact), Phase 3 prefill v1 done (647 t/s @2K, 475 @32K). Depth gate green at 16K/32K (needle + logprobs vs llama.cpp). Phase 4 Flash-Next: decode exact vs llama.cpp (12/12), 28.2 t/s bare (floor 39), MTP 37.2 t/s exact (n=2), deterministic + T-invariant numerics. Next: multi-slot batching, prefill GEMM path, QSA beyond 2K, requant of the Q8_0 dense tensors.
 
 ## Phase 1 — 27B single-token decode at the wall
 Goal: a full forward pass of Qwen3.8-27B at ≥ 13 t/s bare (≥ 90% of floor), bit-comparable to

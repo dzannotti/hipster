@@ -50,6 +50,7 @@ public:
     const GTensor* find(std::string_view name) const;
     const GTensor& get(std::string_view name) const;  // throws if missing
     const std::vector<GTensor>& tensors() const { return tensors_; }
+    bool has(const std::string& name) const { return index_.count(name) != 0; }
     const GValue* kv(std::string_view key) const;
     uint32_t kv_u32(std::string_view key) const;
     float kv_f32(std::string_view key) const;

@@ -510,13 +510,33 @@ __global__ void __launch_bounds__(256) k_gemv_moe(MoeSegs a, int nseg, const int
     float v;
     if (id >= 0) v = gemv_row_1<F, TPR>((const uint8_t*)a.w[seg] + (size_t)id * a.ebytes, xqr, xdr, xsr, K, row, lane);
     else v = gemv_row_1<FS, TPR>((const uint8_t*)a.shared[seg], xqr, xdr, xsr, K, row, lane);
-    if (lane == 0) {
-        if (a.slotw) atomicAdd(a.y[seg] + (size_t)t * N + row, a.slotw[te] * v);
-        else a.y[seg][(size_t)te * N + row] = v;
+    if (lane == 0) a.y[seg][(size_t)te * N + row] = v;
+}
+// Down-projection with the combine: y[t][row] = sum_e slotw[t*nexp+e] * W[ids[t*nexp+e]] . x[t*nexp+e], accumulated in
+// slot order by the same thread (no atomics: deterministic and T-invariant). Grid = T x row-blocks.
+template <WFmt F, WFmt FS, int TPR>
+__global__ void __launch_bounds__(256) k_gemv_moe_down(MoeSegs a, const int* __restrict__ ids, int nexp,
+                                                       const int8_t* __restrict__ xq, const float* __restrict__ xd, const float* __restrict__ xs, int N, int K) {
+    constexpr int ROWS = 256 / TPR;
+    const int nrb = (N + ROWS - 1) / ROWS;
+    const int rb = blockIdx.x % nrb, t = blockIdx.x / nrb;
+    const int lane = threadIdx.x % TPR, row = rb * ROWS + threadIdx.x / TPR;
+    if (row >= N) return;
+    const int nsb = K / 32;
+    float acc = 0.f;
+    for (int e = 0; e < nexp; ++e) {
+        const int te = t * nexp + e, id = ids[te];
+        const int8_t* xqr = xq + (size_t)te * K; const float* xdr = xd + (size_t)te * nsb; const float* xsr = xs + (size_t)te * nsb;
+        float v;
+        if (id >= 0) v = gemv_row_1<F, TPR>((const uint8_t*)a.w[0] + (size_t)id * a.ebytes, xqr, xdr, xsr, K, row, lane);
+        else v = gemv_row_1<FS, TPR>((const uint8_t*)a.shared[0], xqr, xdr, xsr, K, row, lane);
+        acc += a.slotw[te] * v;
     }
+    if (lane == 0) a.y[0][(size_t)t * N + row] = acc;
 }
 template <WFmt F, WFmt FS, int TPR, bool XT> static void launch_moe2(const MoeSegs& a, int nseg, const int* ids, int nexp, XQ8 x, int N, int K, int T, hipStream_t s) {
     constexpr int ROWS = 256 / TPR;
+    if (a.slotw) { k_gemv_moe_down<F, FS, TPR><<<((N + ROWS - 1) / ROWS) * T, 256, 0, s>>>(a, ids, nexp, x.q, x.d, x.s, N, K); return; }
     const int grid = nseg * ((N + ROWS - 1) / ROWS) * T * nexp;
     k_gemv_moe<F, FS, TPR, XT><<<grid, 256, 0, s>>>(a, nseg, ids, nexp, x.q, x.d, x.s, N, K);
 }
@@ -701,38 +721,49 @@ void gemv_moe(WFmt f, WFmt fs, const MoeSegs& a, int nseg, const int* ids, int n
         default: if (s8) launch_moe<WFmt::Q5_K, WFmt::Q8_0_SOA>(a, nseg, ids, nexp, x, N, K, T, xrow_te, s); else launch_moe<WFmt::Q5_K, WFmt::Q5_K>(a, nseg, ids, nexp, x, N, K, T, xrow_te, s); break;
     }
 }
-// split-K GEMV for skinny weights (few rows, long K): grid = row-blocks x KSPLIT, partial sums atomically added to y (y must be zeroed)
+// split-K GEMV for skinny weights (few rows, long K): grid = row-blocks x ksplit x ncol; partial sums written to
+// part[(c*ksplit + ks)][N] (summed in a fixed order by the consumer: deterministic, T-invariant)
 template <WFmt F, int TPR>
 __global__ void __launch_bounds__(256) k_gemv_splitk(const uint8_t* __restrict__ W, const int8_t* __restrict__ xq, const float* __restrict__ xd, const float* __restrict__ xs,
-                                                     float* __restrict__ y, int N, int K, int ksplit) {
+                                                     float* __restrict__ part, int N, int K, int ksplit) {
     constexpr int ROWS = 256 / TPR;
-    const int nrb = (N + ROWS - 1) / ROWS, rb = blockIdx.x % nrb, ks = blockIdx.x / nrb;
+    const int nrb = (N + ROWS - 1) / ROWS, rb = blockIdx.x % nrb, ks = (blockIdx.x / nrb) % ksplit, c = blockIdx.x / (nrb * ksplit);
     const int lane = threadIdx.x % TPR, row = rb * ROWS + threadIdx.x / TPR;
     if (row >= N) return;
-    const int nb = (K + 255) / 256, b0 = ks * nb / ksplit, b1 = (ks + 1) * nb / ksplit;
+    const int nb = (K + 255) / 256, nsb = K / 32, b0 = ks * nb / ksplit, b1 = (ks + 1) * nb / ksplit;
     const uint8_t* rp = row_ptr<F>(W, row, K);
     float acc[1] = {0.f};
     for (int b = b0 + lane; b < b1; b += TPR) {
-        const uint32_t* xw[1] = {(const uint32_t*)(xq + b * 256)}; const float* cxd[1] = {xd + b * 8}; const float* cxs[1] = {xs + b * 8};
+        const uint32_t* xw[1] = {(const uint32_t*)(xq + (size_t)c * K + b * 256)}; const float* cxd[1] = {xd + (size_t)c * nsb + b * 8}; const float* cxs[1] = {xs + (size_t)c * nsb + b * 8};
         dispatch_block<F, 1>(rp, b, K, xw, cxd, cxs, acc);
     }
 #pragma unroll
     for (int off = TPR / 2; off > 0; off >>= 1) acc[0] += __shfl_xor(acc[0], off, TPR);
-    if (lane == 0) atomicAdd(y + row, acc[0]);
+    if (lane == 0) part[((size_t)c * ksplit + ks) * N + row] = acc[0];
 }
-void gemv_splitk(WFmt f, const void* W, XQ8 x, float* y, int N, int K, int ksplit, bool zero, hipStream_t s) {
-    if (zero) hipMemsetAsync(y, 0, (size_t)N * 4, s);
-    const int grid = ((N + 7) / 8) * ksplit;   // 8 rows per block
+void gemv_splitk(WFmt f, const void* W, XQ8 x, float* part, int N, int K, int ksplit, int ncol, hipStream_t s) {
+    const int grid = ((N + 7) / 8) * ksplit * ncol;   // 8 rows per block
     switch (f) {
-        case WFmt::Q8_0_SOA: k_gemv_splitk<WFmt::Q8_0_SOA, 32><<<grid, 256, 0, s>>>((const uint8_t*)W, x.q, x.d, x.s, y, N, K, ksplit); break;
-        case WFmt::Q4_K: k_gemv_splitk<WFmt::Q4_K, 32><<<grid, 256, 0, s>>>((const uint8_t*)W, x.q, x.d, x.s, y, N, K, ksplit); break;
-        default: k_gemv_splitk<WFmt::Q6_K_SOA, 32><<<grid, 256, 0, s>>>((const uint8_t*)W, x.q, x.d, x.s, y, N, K, ksplit); break;
+        case WFmt::Q8_0_SOA: k_gemv_splitk<WFmt::Q8_0_SOA, 32><<<grid, 256, 0, s>>>((const uint8_t*)W, x.q, x.d, x.s, part, N, K, ksplit); break;
+        case WFmt::Q4_K: k_gemv_splitk<WFmt::Q4_K, 32><<<grid, 256, 0, s>>>((const uint8_t*)W, x.q, x.d, x.s, part, N, K, ksplit); break;
+        default: k_gemv_splitk<WFmt::Q6_K_SOA, 32><<<grid, 256, 0, s>>>((const uint8_t*)W, x.q, x.d, x.s, part, N, K, ksplit); break;
     }
 }
 void repack_interleave8(WFmt f, const uint8_t* src, uint8_t* dst, int N, int K) {
     const int bb = f == WFmt::Q4_K ? 144 : f == WFmt::Q5_K ? 176 : 136, nb = K / 256;
     for (int r = 0; r < N; ++r) for (int b = 0; b < nb; ++b)
         memcpy(dst + (((size_t)(r / 8) * 8 * nb) + (size_t)b * 8 + r % 8) * bb, src + ((size_t)r * nb + b) * bb, bb);
+}
+// Q5_0 (d, qh, qs; x = d*(q-16)) is exactly a Q5_1 block with m = -16*d (a power-of-two scale of an f16 is exact).
+void repack_row_q5_0(const uint8_t* src, uint8_t* dst, int K) {
+    const int nb = K / 32;
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t* blk = src + (size_t)b * 22;   // d(2) qh(4) qs(16)
+        uint16_t dbits; memcpy(&dbits, blk, 2); _Float16 d; memcpy(&d, &dbits, 2);
+        const _Float16 m = (_Float16)(-16.0f * (float)d); uint16_t mbits; memcpy(&mbits, &m, 2);
+        memcpy(dst + (size_t)K / 2 + K / 8 + b * 2, &dbits, 2); memcpy(dst + (size_t)K / 2 + K / 8 + K / 16 + b * 2, &mbits, 2);
+        memcpy(dst + (size_t)K / 2 + b * 4, blk + 2, 4); memcpy(dst + (size_t)b * 16, blk + 6, 16);
+    }
 }
 void repack_row_q5_1(const uint8_t* src, uint8_t* dst, int K) {
     const int nb = K / 32;

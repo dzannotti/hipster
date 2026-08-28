@@ -14,7 +14,8 @@ enum class WFmt { Q4_K, Q5_K, IQ4_XS, Q6_K_SOA, Q8_0_SOA, Q5_1_SOA };
 // Repack one GGUF row into the SoA layout (same byte count). K multiple of 256.
 void repack_row_q6_K(const uint8_t* src, uint8_t* dst, int K);   // [ql K/2][qh K/4][scales K/16][d K/256*2]
 void repack_row_q8_0(const uint8_t* src, uint8_t* dst, int K);   // [q K][d K/32*2]
-void repack_row_q5_1(const uint8_t* src, uint8_t* dst, int K);   // [qs K/2][qh K/8][d K/32*2][m K/32*2]
+void repack_row_q5_1(const uint8_t* src, uint8_t* dst, int K);
+void repack_row_q5_0(const uint8_t* src, uint8_t* dst, int K);   // -> the Q5_1 SoA layout (exact), row bytes = K*24/32   // [qs K/2][qh K/8][d K/32*2][m K/32*2]
 size_t wfmt_row_bytes(WFmt f, int K);
 // experiment: block-interleaved layout in groups of 8 rows (Q4_K/Q5_K/IQ4_XS). N must be a multiple of 8.
 void repack_interleave8(WFmt f, const uint8_t* src, uint8_t* dst, int N, int K);
@@ -27,12 +28,13 @@ struct GemvSeg { WFmt fmt; const void* w; float* y; int N, K; };
 void gemv_multi(const GemvSeg* segs, int nseg, XQ8 x, hipStream_t s);
 // MoE: for token t < T and slot e < nexp, y[g][(t*nexp+e)][N] = W[g][expert ids[t*nexp+e]] . x[row] for segment g < nseg
 // (gate|up share one launch). ids < 0 selects the shared-expert matrices `shared[g]`. xrow_te: x row = t*nexp+e (down) else t.
-// slotw: per-slot combine weights [T*nexp]; when set, y[0][t][N] += slotw[te] * W_e . x (atomic; caller zeroes y)
+// slotw: per-slot combine weights [T*nexp]; when set (down-projection), y[0][t][N] = sum_e slotw[te] * W_e . x[te], one
+// thread group per (t, row) looping over the slots in order (deterministic, no atomics)
 struct MoeSegs { const void* w[2]; const void* shared[2]; float* y[2]; size_t ebytes; const float* slotw = nullptr; };
 void gemv_moe(WFmt f, WFmt shared_fmt, const MoeSegs& a, int nseg, const int* ids, int nexp, XQ8 x, int N, int K, int T, bool xrow_te, hipStream_t s);
-// split-K GEMV for skinny weights (N small, K long): y zeroed then accumulated atomically over ksplit K-ranges (T == 1).
+// split-K GEMV for skinny weights (N small, K long): partial sums part[ncol][ksplit][N], summed by the consumer in a fixed order
 extern int g_moe_tpr;   // bench knob: force lanes/row in gemv_moe (0 = policy)
-void gemv_splitk(WFmt f, const void* W, XQ8 x, float* y, int N, int K, int ksplit, bool zero, hipStream_t s);
+void gemv_splitk(WFmt f, const void* W, XQ8 x, float* part, int N, int K, int ksplit, int ncol, hipStream_t s);
 // f32-x baseline, Q4_K only (kept for the record).
 void gemv_q4_K_f32(const void* W, const float* x, float* y, int N, int K, int ncol, int tpr, hipStream_t s);
 }
