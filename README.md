@@ -19,6 +19,9 @@ Design principles, roofs and per-kernel accounting live in `CLAUDE.md` and `docs
 - Measured roofs (`bench/roofline/`): 240 GB/s DRAM read, 1.8–2.4 µs per kernel launch, 51.8 TFLOPS hipBLASLt bf16.
 
 ## Models (paths are what `build.sh` mounts as `/models`)
+> **Flash-Next speed needs the `-MTP` shards.** The plain `UD-Q4_K_XL` (4 shards) has no `blk.48` draft block: the server
+> prints `no MTP block in this GGUF` and decodes plainly at ~27 t/s. The 37–43 t/s numbers use the 5-shard
+> `UD-Q4_K_XL-MTP` upload (`…-00001-of-00005.gguf`), with the default `--mtp 2` (3–4 drafts are slower).
 | | host path | HF source |
 |---|---|---|
 | 27B | `/srv/models/qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_XL.gguf` (+ `mmproj-F16.gguf`) | unsloth/Qwen3.8-27B-GGUF, UD-Q4_K_XL |

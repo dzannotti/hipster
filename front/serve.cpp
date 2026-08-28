@@ -43,7 +43,7 @@ struct FnBackend : Backend {   // Flash-Next + MTP drafts, up to 8 slots (batche
     std::vector<int> ids = std::vector<int>(256); std::vector<float> vals = std::vector<float>(256); int r0s[8] = {};
     static constexpr int W = hip::FnDims::wide;
     FnBackend(const std::string& path, int ctx, int chunk, int mtp_, int slots) : m(path, ctx, slots, chunk), mtp(mtp_), ns(slots) {
-        if (mtp > 0 && !m.has_mtp()) { fprintf(stderr, "no MTP block in this GGUF: decoding without drafts\n"); mtp = 0; }
+        if (mtp > 0 && !m.has_mtp()) { fprintf(stderr, "no MTP block in this GGUF: decoding without drafts (plain ~27 t/s). The MTP drafts (37-43 t/s) need unsloth's 5-shard UD-Q4_K_XL-MTP upload: .../UD-Q4_K_XL-MTP/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00005.gguf\n"); mtp = 0; }
         hipMalloc(&hp_, (size_t)8 * W * 4); hipMalloc(&hb_, (size_t)8 * W * 4);
     }
     int n_slots() override { return ns; }
