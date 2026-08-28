@@ -83,7 +83,7 @@ int main(int argc, char** argv) {
                 if (!q8) memcpy(xr[c].data(), hx.data() + (size_t)c * K, K * 4);
                 else { std::vector<int8_t> q; std::vector<float> d, s; quantize_ref(hx.data() + (size_t)c * K, K, q, d, s); for (int k = 0; k < K; ++k) xr[c][k] = q[k] * d[k / 32]; }
             }
-            for (int cfg : {32, 16, 8, 4, 2, 1, 208, 204, 301, 404}) { if (ncol > 1 && (cfg == 16 || cfg == 8 || cfg == 2 || cfg == 1 || cfg == 208)) continue; if (cfg == 301 && t.type != hip::GType::Q4_K) continue; if (cfg == 404 && dWil.empty()) continue; const int tpr = cfg % 100, rpt = cfg / 100 + 1;
+            for (int cfg : {32, 16, 8, 4, 2, 1, 208, 204, 301, 302, 404}) { if (ncol > 1 && (cfg == 16 || cfg == 8 || cfg == 2 || cfg == 1 || cfg == 208)) continue; if ((cfg == 301 || cfg == 302) && (K % 256 != 0)) continue; if (cfg == 404 && dWil.empty()) continue; const int tpr = cfg % 100, rpt = cfg / 100 + 1;
                 int it = 0; auto run = [&] { uint8_t* w = (rpt == 5 ? dWil : dWs)[it++ % ncopy]; if (q8) { hip::quantize_x_q8(dx, xq, ncol, K, 0); if (rpt == 4 && ncol > 16) return; hip::gemv_q8(fmt, w, xq, dy, N, K, ncol, tpr, rpt, 0); } else hip::gemv_q4_K_f32(w, dx, dy, N, K, ncol, tpr, 0); };
                 it = 0; run(); CK(hipDeviceSynchronize());
                 std::vector<float> hy((size_t)ncol * N); CK(hipMemcpy(hy.data(), dy, hy.size() * 4, hipMemcpyDeviceToHost));

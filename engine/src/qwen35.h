@@ -5,6 +5,7 @@
 #include "../kernels/gemv.h"
 #include "../kernels/gemm.h"
 #include "../kernels/ops.h"
+#include "../kernels/dflash.h"
 #include <hip/hip_runtime.h>
 #include <string>
 #include <vector>
@@ -41,6 +42,11 @@ struct MtpLayer {
     AttnBlock attn; Lin ffn_gate, ffn_up, ffn_down;
 };
 
+struct DflashLayer { float *attn_norm, *ffn_norm, *q_norm, *k_norm, *attn_conv_base, *ffn_conv_base; Lin wq, wk, wv, wo, attn_conv_proj, ffn_conv_proj, ffn_gate, ffn_up, ffn_down; };
+struct DflashDraft {   // incoai DFlash2 draft (target layers 6/20/34/48/62, block 8, selector top-16 rank 256)
+    Lin fc, selector_hidden; float *enc_norm, *out_norm; const void *sel_pred, *sel_succ; std::vector<DflashLayer> layers; int target_layers[5]; int mask_id;
+};
+
 class Qwen35 {
 public:
     explicit Qwen35(const std::string& gguf_path, int max_ctx = 8192);
@@ -58,6 +64,12 @@ public:
     // h_out [T][n_embd]. h [T][n_embd] on device (target h_nextn of the previous position).
     void mtp_forward(const int* tokens, const float* h, int T, int pos0);
 
+    // DFlash2: load the draft GGUF; then forward() captures the residual at its target layers, encode() injects the
+    // captured rows (positions pos0..) into the draft KV, draft() returns <= nd draft tokens after id_last at position n.
+    void load_dflash(const std::string& gguf_path);
+    bool has_dflash() const { return dfl_ != nullptr; }
+    void dflash_encode(int T, int pos0);                       // rows 0..T-1 of the last forward
+    int dflash_draft(int id_last, int n, int nd, int* out);    // returns the number of drafts (greedy selector walk)
     const float* logits() const { return logits_; }
     const float* h_nextn() const { return h_; }
     const float* mtp_logits() const { return mlogits_; }
@@ -105,6 +117,9 @@ private:
     uint16_t* wscratch2_[2]; hipStream_t s2_; hipEvent_t scratch_free_[2], pf_ready_;
     bool pf_pending_ = false; int pf_buf_ = 0; const void* pf_w_ = nullptr; int pf_n_ = 0;
     GemvSeg next_pf_[4], next2_pf_[4]; int next_pfn_ = 0, next2_pfn_ = 0;
+    DflashDraft* dfl_ = nullptr; GGUF* dfl_gguf_ = nullptr;
+    float *dfl_feat_ = nullptr, *dfl_g_, *dfl_x_, *dfl_y_, *dfl_q_, *dfl_k_, *dfl_v_, *dfl_o_, *dfl_delta_, *dfl_logits_, *dfl_gate_, *dfl_lattice_, *dfl_vals_; int *dfl_ids_, *dfl_pos_, *dfl_tok_;
+    uint16_t *dfl_kc_, *dfl_vc_; size_t dfl_layer_stride_;
     void prefetch(const GemvSeg* segs, int n);
     BlasLt blas_;
     int* d_tok_;

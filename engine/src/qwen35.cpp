@@ -2,6 +2,7 @@
 #include "quant.h"
 #include "../kernels/ops.h"
 #include <cstdio>
+#include <string>
 #include <cstring>
 #include <stdexcept>
 #include <cstdlib>
@@ -20,7 +21,10 @@ static void* arena_alloc(size_t bytes) {
     if (!g_arena) { g_arena_cap = (size_t)18 << 30; if (hipMalloc(&g_arena, g_arena_cap) != hipSuccess) throw std::runtime_error("arena alloc failed"); }
     const size_t align = bytes >= (1u << 20) ? (2u << 20) : 256;
     g_arena_off = (g_arena_off + align - 1) / align * align;
-    if (g_arena_off + bytes > g_arena_cap) throw std::runtime_error("arena exhausted");
+    if (g_arena_off + bytes > g_arena_cap) {   // overflow (e.g. the DFlash2 draft after the 27B): a second 4 GiB arena
+        g_arena_cap = (size_t)4 << 30; if (hipMalloc(&g_arena, g_arena_cap) != hipSuccess) throw std::runtime_error("arena alloc failed"); g_arena_off = 0;
+        if (bytes > g_arena_cap) throw std::runtime_error("arena exhausted");
+    }
     void* p = g_arena + g_arena_off; g_arena_off += bytes; return p;
 }
 
@@ -185,7 +189,14 @@ void Qwen35::lin(const Lin& l, float* y, int M) {
 // one [sum N][K] bf16 matrix, one GEMM, then split the bf16 output rows into the f32 targets.
 void Qwen35::lin_multi(const GemvSeg* segs, int n, int M) {
     if (M <= D::max_T) {
-        if (M == 1) { gemv_multi(segs, n, xq_, 1, s_); tmark(T_GEMV); return; }
+        // one kernel shape for every T: each column is reduced in the same order as the T=1 pass (T-invariant numerics,
+        // the verify pass is bit-identical to T single passes). HIPSTER_GEMV_FAST=1 restores the old ncol-tuned kernel.
+        // HIPSTER_GEMV=wmma (default): int8-WMMA kernel for every T (T-invariant, ~the T=1 cost at T=8); multi: the
+        // 32-lane multi-column kernel (T-invariant, slow at T=8); fast: the old ncol-tuned kernels (not T-invariant).
+        static const std::string mode = getenv("HIPSTER_GEMV") ? getenv("HIPSTER_GEMV") : "wmma";
+        static const bool fast = mode == "fast";
+        if (mode == "wmma" && gemv_wmma_ok(segs, n)) { gemv_wmma(segs, n, xq_, M, 1, s_); tmark(T_GEMV); return; }
+        if (M == 1 || !fast) { gemv_multi(segs, n, xq_, M, s_); tmark(T_GEMV); return; }
         for (int i = 0; i < n; ++i) gemv_q8(segs[i].fmt, segs[i].w, xq_, segs[i].y, segs[i].N, segs[i].K, M, 4, 3, s_);
         tmark(T_GEMV); return;
     }
@@ -280,6 +291,8 @@ float Qwen35::forward(const int* tokens, int T, int pos0) {
         GemvSeg pfs[4]; int pfn;
         if (gm && il == 0) { pfn = seg_first(0, pfs); prefetch(pfs, pfn); }
         norm_in(pending, L.attn_norm);
+        if (dfl_) for (int k = 0; k < 5; ++k) if (dfl_->target_layers[k] == il)   // DFlash2: residual entering this layer -> feature slot k
+            CK(hipMemcpy2DAsync(dfl_feat_ + (size_t)k * D::n_embd, (size_t)5 * D::n_embd * 4, x_, (size_t)D::n_embd * 4, (size_t)D::n_embd * 4, T, hipMemcpyDeviceToDevice, s_));
         if (gm) { next_pf_[0] = {proj_out.fmt, proj_out.w, nullptr, proj_out.N, proj_out.K}; next_pfn_ = 1; }
         if (!D::is_attn(il)) {
             const int gi = gdn_index(il);
