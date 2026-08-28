@@ -104,6 +104,7 @@ int main(int argc, char** argv) {
     http::serve(host, port, [&](const http::Request& req, http::Response& res) {
         if (req.method == "OPTIONS") { res.send(200, "text/plain", ""); return; }
         if (req.path == "/health") { res.send(200, "application/json", "{\"status\":\"ok\"}"); return; }
+        if (req.path == "/" || req.path == "") { res.send(200, "text/plain", "hipster-serve: " + S.model_name + "\nendpoints: GET /health, GET /v1/models, POST /v1/chat/completions, POST /v1/completions\nsee docs/serving.md\n"); return; }
         if (req.path == "/v1/models") { js::Value v = js::Value::object(); v["object"] = "list"; js::Value md = js::Value::object(); md["id"] = S.model_name; md["object"] = "model"; md["owned_by"] = "hipster"; v["data"] = js::Value::array(); v["data"].push(md); res.send(200, "application/json", js::dump(v)); return; }
         const bool chat_ep = req.path == "/v1/chat/completions", comp_ep = req.path == "/v1/completions";
         if (!chat_ep && !comp_ep) { res.send(404, "application/json", "{\"error\":{\"message\":\"not found\"}}"); return; }
