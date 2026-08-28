@@ -111,3 +111,9 @@ the DRAM roof) — the distinct rows are the honest ones. Batched-pass fixes fro
 now go through the multi-segment kernel for any row count (183 → 48 launches per pass), split-K and the f32 router
 read their weights once for up to 8 rows. Per-row cost at S=8 ≈ 9 ms (experts 1.8 GB ≈ 7.5 ms at roof).
 Prefill is still token-by-token (27 t/s): **the Flash-Next prefill GEMM path is next** — a 2K prompt costs 74 s today.
+
+## 2026-08-28 (cont.) — dense Q8_0 → Q5_1 at load (HIPSTER_DENSE_Q51=1): a negative result
+Bytes/token 6.1 → 5.5 GB, quality fine (12/12 greedy, Δlogprob 0.58, 4K needle 7/7) — and decode **slower**:
+39.7 vs 36.3 ms/token. The Q5_1 decoder (bit-shuffling the 5th bits per word) costs more per byte on these shapes
+than the Q8_0 path saves in bytes. Lesson: the floor only moves if the decoder keeps the lane efficiency; a lower-bit
+dense format needs a decoder measured at ≥ 200 GB/s on the K=2560/6144 shapes first (bench_gemv), not a byte count.

@@ -622,6 +622,40 @@ static void moe_gemm_fmt(WFmt f, const void* W, size_t ebytes, const MoeTile* ti
 }
 
 
+
+// ======================= hyper-connection up-projection with the silu(lo/4) + q8 prologue =======================
+// lo = sum over ksplit partials part[(t*ksplit + k)][320] (fixed order); x = silu(lo/4) quantised per 32 into LDS;
+// then y[t][N] = W[N][320] . x (Q8_0 SoA rows, TPR lanes per row). Grid = row-blocks x T. Replaces silu kernel + xq round trip.
+template <int TPR>
+__global__ void __launch_bounds__(256) k_hc_up_fused(const uint8_t* __restrict__ W, const float* __restrict__ part, int ksplit, float* __restrict__ y, int N, int T) {
+    constexpr int K = 320, NSB = K / 32, ROWS = 256 / TPR;
+    __shared__ __align__(16) int8_t xq[K]; __shared__ float xd[NSB], xs[NSB]; __shared__ float xf[K];
+    const int nrb = (N + ROWS - 1) / ROWS, t = blockIdx.x / nrb, rb = blockIdx.x % nrb, tid = threadIdx.x;
+    for (int i = tid; i < K; i += 256) { float v = 0.f; for (int k = 0; k < ksplit; ++k) v += part[((size_t)t * ksplit + k) * K + i]; v *= 0.25f; xf[i] = v / (1.f + __expf(-v)); }
+    __syncthreads();
+    { const int wave = tid / 32, lane = tid % 32;
+      for (int sb = wave; sb < NSB; sb += 8) {
+          const float v = xf[sb * 32 + lane]; float amax = fabsf(v);
+#pragma unroll
+          for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor(amax, o, 32));
+          const float d = amax / 127.f, id = amax > 0 ? 127.f / amax : 0.f; const int qi = __float2int_rn(v * id); int sum = qi;
+#pragma unroll
+          for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor(sum, o, 32);
+          xq[sb * 32 + lane] = (int8_t)qi; if (lane == 0) { xd[sb] = d; xs[sb] = d * sum; }
+      } }
+    __syncthreads();
+    const int lane = tid % TPR, row = rb * ROWS + tid / TPR;
+    if (row >= N) return;
+    const uint8_t* rp = row_ptr<WFmt::Q8_0_SOA>(W, row, K);
+    float acc[1] = {0.f};
+    for (int b = lane; b < (K + 255) / 256; b += TPR) {
+        const uint32_t* xw[1] = {(const uint32_t*)(xq + b * 256)}; const float* cxd[1] = {xd + b * 8}; const float* cxs[1] = {xs + b * 8};
+        dispatch_block<WFmt::Q8_0_SOA, 1>(rp, b, K, xw, cxd, cxs, acc);
+    }
+#pragma unroll
+    for (int off = TPR / 2; off > 0; off >>= 1) acc[0] += __shfl_xor(acc[0], off, TPR);
+    if (lane == 0) y[(size_t)t * N + row] = acc[0];
+}
 // ======================= multi-segment GEMV (ncol = 1) =======================
 struct SegDev { const uint8_t* w; float* y; int N, K, fmt, block0; };
 struct SegArgs { SegDev s[4]; int n; };
@@ -922,6 +956,9 @@ void moe_gemm(WFmt f, WFmt fs, const void* W, const void* Wsh, size_t ebytes, co
     moe_gemm_fmt(f, W, ebytes, tiles, ntiles, ct, rowtab, x, y, N, K, s);          // routed experts
     moe_gemm_fmt(fs, Wsh, 0, stiles, nstiles, ct, rowtab, x, y, N, K, s);          // the shared expert (its tiles carry expert = -1)
 }
+void hc_up_fused(const void* W, const float* part, int ksplit, float* y, int N, int T, hipStream_t s) {
+    constexpr int TPR = 8; k_hc_up_fused<TPR><<<((N + 256 / TPR - 1) / (256 / TPR)) * T, 256, 0, s>>>((const uint8_t*)W, part, ksplit, y, N, T);
+}
 void gemv_moe(WFmt f, WFmt fs, const MoeSegs& a, int nseg, const int* ids, int nexp, XQ8 x, int N, int K, int T, bool xrow_te, hipStream_t s) {
     if (fs != WFmt::Q8_0_SOA && fs != f) { fprintf(stderr, "gemv_moe: unsupported shared-expert format\n"); abort(); }
     const bool s8 = fs == WFmt::Q8_0_SOA;
@@ -974,7 +1011,9 @@ void gemv_splitk(WFmt f, const void* W, XQ8 x, float* part, int N, int K, int ks
     switch (f) {
         case WFmt::Q8_0_SOA: launch_splitk<WFmt::Q8_0_SOA>(W, x, part, N, K, ksplit, ncol, s); break;
         case WFmt::Q4_K: launch_splitk<WFmt::Q4_K>(W, x, part, N, K, ksplit, ncol, s); break;
-        default: launch_splitk<WFmt::Q6_K_SOA>(W, x, part, N, K, ksplit, ncol, s); break;
+        case WFmt::Q5_1_SOA: launch_splitk<WFmt::Q5_1_SOA>(W, x, part, N, K, ksplit, ncol, s); break;
+        case WFmt::Q6_K_SOA: launch_splitk<WFmt::Q6_K_SOA>(W, x, part, N, K, ksplit, ncol, s); break;
+        default: fprintf(stderr, "gemv_splitk: unsupported format\n"); abort();
     }
 }
 void repack_interleave8(WFmt f, const uint8_t* src, uint8_t* dst, int N, int K) {

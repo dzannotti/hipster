@@ -2,3 +2,4 @@ build/
 *.o
 gpucore.*
 .rocprofv3/
+models/

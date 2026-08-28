@@ -41,7 +41,13 @@ static FnLin to_lin(const GTensor& t, int K, int N, const uint8_t* src_rows, siz
         case GType::IQ4_XS: l.fmt = WFmt::IQ4_XS; l.bytes = rb_src * N; break;
         case GType::Q6_K: l.fmt = WFmt::Q6_K_SOA; l.bytes = rb_src * N; tmp.resize(l.bytes);
             parallel_rows(N, [&](int r) { repack_row_q6_K(src_rows + (size_t)r * rb_src, tmp.data() + (size_t)r * rb_src, K); }); src = tmp.data(); break;
-        case GType::Q8_0: l.fmt = WFmt::Q8_0_SOA; l.bytes = rb_src * N; tmp.resize(l.bytes);
+        case GType::Q8_0:
+            if (getenv("HIPSTER_DENSE_Q51") && t.name != "output.weight" && t.name.find("_exps") == std::string::npos && t.name.find("shexp") == std::string::npos) {   // experiment: dense Q8_0 -> Q5_1 at load (6.1 -> ~5.5 GB/token)
+                l.fmt = WFmt::Q5_1_SOA; const size_t rb = wfmt_row_bytes(WFmt::Q5_1_SOA, K); l.bytes = rb * N; tmp.resize(l.bytes);
+                parallel_rows(N, [&](int r) { std::vector<float> row(K); dequant_row((int)t.type, src_rows + (size_t)r * rb_src, row.data(), K); quantize_row_q5_1_soa(row.data(), tmp.data() + (size_t)r * rb, K); });
+                src = tmp.data(); report += "  " + t.name + ": Q8_0 -> Q5_1\n"; break;
+            }
+            l.fmt = WFmt::Q8_0_SOA; l.bytes = rb_src * N; tmp.resize(l.bytes);
             parallel_rows(N, [&](int r) { repack_row_q8_0(src_rows + (size_t)r * rb_src, tmp.data() + (size_t)r * rb_src, K); }); src = tmp.data(); break;
         case GType::Q5_0: l.fmt = WFmt::Q5_1_SOA; l.bytes = wfmt_row_bytes(WFmt::Q5_1_SOA, K) * N; tmp.resize(l.bytes);   // exact: m = -16 d
             parallel_rows(N, [&](int r) { repack_row_q5_0(src_rows + (size_t)r * rb_src, tmp.data() + (size_t)r * (l.bytes / N), K); }); src = tmp.data(); break;
@@ -234,8 +240,8 @@ void Qwen4Exp::hc_block(const FnLayer& L, bool ffn, int T, const Pending& p, flo
     fn::hc_norm(na, xq_, T, D::rms_eps, s_);
     const FnLin& dn = ffn ? L.hc_ffn_down : L.hc_attn_down; const FnLin& up = ffn ? L.hc_ffn_up : L.hc_attn_up;
     gemv_splitk(dn.fmt, dn.w, xq_, lo_, dn.N, dn.K, KSPLIT, T, s_);   // 320 rows x 10240: 8 K-splits fill the GPU
-    fn::hc_silu_quant(lo_, KSPLIT, xq_, T, s_);
-    gemv(up, up_, T);
+    if (up.fmt == WFmt::Q8_0_SOA) hc_up_fused(up.w, lo_, KSPLIT, up_, up.N, T, s_);   // silu + q8 in the GEMV prologue (one launch)
+    else { fn::hc_silu_quant(lo_, KSPLIT, xq_, T, s_); gemv(up, up_, T); }
     fn::hc_mix(xn_, up_, ffn ? L.hc_ffn_inject : L.hc_attn_inject, mixed, inject_out, xq_, T, s_);
 }
 

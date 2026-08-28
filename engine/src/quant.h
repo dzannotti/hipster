@@ -154,6 +154,23 @@ inline uint16_t f32_to_f16(float f) {
     uint32_t r = s | (e << 10) | (m >> 13); if (m & 0x1000) r++; return (uint16_t)r;
 }
 // Quantise a float row to Q8_0 row-SoA ([q K int8][d K/32 f16]) — load-time conversion of rare formats.
+// f32 row -> Q5_1 in the engine's row-SoA layout [qs K/2][qh K/8][d K/32 f16][m K/32 f16]: per 32 values, m = min,
+// d = (max - min) / 31, q = round((x - m) / d) in [0, 31] (llama.cpp's quantize_row_q5_1_ref)
+inline void quantize_row_q5_1_soa(const float* x, uint8_t* dst, uint64_t K) {
+    const uint64_t nb = K / 32; uint8_t* qs = dst; uint8_t* qh = dst + K / 2; uint16_t* dp = (uint16_t*)(dst + K / 2 + K / 8); uint16_t* mp = dp + nb;
+    for (uint64_t b = 0; b < nb; ++b) {
+        const float* v = x + b * 32; float mn = v[0], mx = v[0]; for (int i = 1; i < 32; ++i) { mn = std::min(mn, v[i]); mx = std::max(mx, v[i]); }
+        const float d = (mx - mn) / 31.f, id = d ? 1.f / d : 0.f;
+        _Float16 dh = (_Float16)d, mh = (_Float16)mn; memcpy(&dp[b], &dh, 2); memcpy(&mp[b], &mh, 2);
+        const float df = (float)dh, mf = (float)mh;   // quantise against the stored (rounded) scales
+        uint32_t h = 0;
+        for (int i = 0; i < 16; ++i) {
+            const int q0 = std::min(31, std::max(0, (int)lrintf((v[i] - mf) * (df ? 1.f / df : id)))), q1 = std::min(31, std::max(0, (int)lrintf((v[i + 16] - mf) * (df ? 1.f / df : id))));
+            qs[b * 16 + i] = (uint8_t)((q0 & 0xF) | ((q1 & 0xF) << 4)); h |= (uint32_t)(q0 >> 4) << i; h |= (uint32_t)(q1 >> 4) << (i + 16);
+        }
+        memcpy(qh + b * 4, &h, 4);
+    }
+}
 inline void quantize_row_q8_0_soa(const float* x, uint8_t* dst, uint64_t K) {
     int8_t* q = (int8_t*)dst; uint16_t* dd = (uint16_t*)(dst + K);
     for (uint64_t b = 0; b < K / 32; ++b) {

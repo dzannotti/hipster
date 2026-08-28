@@ -38,6 +38,8 @@ void gemv_moe(WFmt f, WFmt shared_fmt, const MoeSegs& a, int nseg, const int* id
 struct MoeTile { int expert, k0, ncols; };
 void moe_gemm(WFmt f, WFmt fs, const void* W, const void* Wsh, size_t ebytes, const MoeTile* tiles, int ntiles, const MoeTile* stiles, int nstiles, int ct,
               const int* rowtab, XQ8 x, float* y, int N, int K, hipStream_t s);   // routed tiles + shared-expert tiles (separate launches, one format each); ct = 16-column tiles per block
+// hyper-connection up-projection (Q8_0 [N][320]) with the silu(sum of split-K partials / 4) + q8 prologue in LDS: y[T][N]
+void hc_up_fused(const void* W, const float* part, int ksplit, float* y, int N, int T, hipStream_t s);
 extern int g_moe_tpr;
 extern int g_moe_fake;   // bench knob: bf16 MoE GEMM with constant weight fragments (WMMA + LDS floor)   // bench knob: force lanes/row in gemv_moe (0 = policy)
 void gemv_splitk(WFmt f, const void* W, XQ8 x, float* part, int N, int K, int ksplit, int ncol, hipStream_t s);

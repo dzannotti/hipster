@@ -48,36 +48,24 @@ __global__ void k_embed_q8_0(const uint8_t* __restrict__ tbl, const int* __restr
 // previous block (R[s] += y * 2*sigmoid(inject[s]/4), y either given or = sum_e dw[e]*down[e] (MoE combine)),
 // then rmsnorm -> xn (f32) + xq. Stream-0 block also zeroes the buffers the following read chain accumulates
 // into (split-K lo, inject atomics) so no memsets are needed.
-__global__ void __launch_bounds__(256) k_hc_norm(HcNormArgs a, float eps) {
-    __shared__ float sh[8];
-    const int t = blockIdx.x / HC, s = blockIdx.x % HC;
+__global__ void __launch_bounds__(1024) k_hc_norm(HcNormArgs a, float eps) {
+    __shared__ float sh[32];
+    const int t = blockIdx.x / HC, s = blockIdx.x % HC, tid = threadIdx.x, wave = tid / 32, lane = tid % 32;
     float* r = a.R + ((size_t)t * HC + s) * E;
     const bool comb = a.y != nullptr;
     const float ws = comb ? inject_w(a.inject, t, s) : 0.f;
-    float ss = 0.f;
-    for (int i = threadIdx.x; i < E; i += 256) {
-        float v = r[i];
-        if (comb) {
-            v += a.y[(size_t)t * E + i] * ws; r[i] = v;
-        }
-        ss += v * v;
-    }
-    ss = wave_sum(ss);
-    if (threadIdx.x % 32 == 0) sh[threadIdx.x / 32] = ss;
+    // 2560 = 1024 * 2.5: thread handles i = tid and tid + 1024, plus i = tid + 2048 for tid < 512
+    float v0 = r[tid], v1 = r[tid + 1024], v2 = tid < 512 ? r[tid + 2048] : 0.f;
+    if (comb) { const float* y = a.y + (size_t)t * E; v0 += y[tid] * ws; v1 += y[tid + 1024] * ws; if (tid < 512) v2 += y[tid + 2048] * ws; r[tid] = v0; r[tid + 1024] = v1; if (tid < 512) r[tid + 2048] = v2; }
+    float ss = wave_sum(v0 * v0 + v1 * v1 + v2 * v2);
+    if (lane == 0) sh[wave] = ss;
     __syncthreads();
-    ss = 0.f; for (int i = 0; i < 8; ++i) ss += sh[i];
+    ss = 0.f; for (int i = 0; i < 32; ++i) ss += sh[i];
     const float sc = rsqrtf(ss / E + eps);
-    const int wave = threadIdx.x / 32, lane = threadIdx.x % 32;
-    for (int sb = wave; sb < E / 32; sb += 8) {
-        const int i = sb * 32 + lane;
-        const float v = r[i] * sc * a.w_norm[s * E + i];
-        const size_t oi = ((size_t)t * HC + s) * E + i;
-        a.xn[oi] = v;
-        if (a.xb) a.xb[oi] = f2bf(v);
-        if (a.q) wave_quant32(v, a.q, a.qd, a.qs, (int)(oi / 32), lane);
-    }
+    const float* w = a.w_norm + s * E; const size_t ob = ((size_t)t * HC + s) * E;
+    auto emit = [&](int i, float v) { const float o = v * sc * w[i]; a.xn[ob + i] = o; if (a.xb) a.xb[ob + i] = f2bf(o); if (a.q) wave_quant32(o, a.q, a.qd, a.qs, (int)((ob + i) / 32), lane); };
+    emit(tid, v0); emit(tid + 1024, v1); if (tid < 512) emit(tid + 2048, v2);
 }
-// lo = sum over the ksplit partials (fixed order) -> silu(lo/4) -> quantised 320-wide rows
 __global__ void k_hc_silu_quant(const float* __restrict__ part, int ksplit, int8_t* __restrict__ q, float* __restrict__ qd, float* __restrict__ qs, int T) {
     const int sb = blockIdx.x * 8 + threadIdx.x / 32, lane = threadIdx.x % 32;   // 320 = 10 sub-blocks per token
     if (sb >= T * 10) return;
@@ -292,7 +280,7 @@ void hc_combine(float* R, const float* y, const float* inject, int T, hipStream_
 void init_wide(const float* x, float* R, int T, hipStream_t s) { k_init_wide<<<T * HC, 256, 0, s>>>(x, R); }
 void hc_norm(const HcNormArgs& a0, XQ8 xq, int T, float eps, hipStream_t s) {
     HcNormArgs a = a0; a.q = xq.q; a.qd = xq.d; a.qs = xq.s;   // xq.q may be null (prefill: bf16 only)
-    k_hc_norm<<<T * HC, 256, 0, s>>>(a, eps);
+    k_hc_norm<<<T * HC, 1024, 0, s>>>(a, eps);
 }
 void hc_silu_quant(const float* part, int ksplit, XQ8 xq, int T, hipStream_t s) { k_hc_silu_quant<<<(T * 10 + 7) / 8, 256, 0, s>>>(part, ksplit, xq.q, xq.d, xq.s, T); }
 void hc_mix(const float* xn, const float* up, const float* w_inject, float* mixed, float* inject, XQ8 xq, int T, hipStream_t s) {
