@@ -1,0 +1,18 @@
+# Reproduces the `mimiron/rocm:10.0.0` image used by build.sh: Ubuntu 24.04 + stock ROCm 10.0.0 from AMD's official
+# apt repository (the same `amdrocm-*10.0` packages TheRock's install scripts pull; nothing patched) + build tools.
+# The original was built by AMD's rocm-ai-docker-stack Dockerfile (labels: "Multi-arch ROCm user-space runtime;
+# installed from pinned TheRock scripts", VERSION=10.0.0, RELEASE_TYPE=stable, INSTALL_METHOD=packages).
+#   docker build -t mimiron/rocm:10.0.0 -f tools/Dockerfile.rocm .
+# Any ROCm 10.0.0 install with hipcc (AMD clang), hipBLASLt and rocprofv3 for gfx1151 works the same; pass it as IMG=… to build.sh.
+FROM ubuntu:24.04
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg && \
+    install -m 0755 -d /etc/apt/keyrings && \
+    curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor -o /etc/apt/keyrings/amdrocm.gpg && \
+    echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.gpg] https://stable.repo.amd.com/rocm/core/packages/ubuntu2404 stable main" > /etc/apt/sources.list.d/amdrocm.list && \
+    apt-get update && apt-get install -y --no-install-recommends amdrocm10.0 amdrocm-core-sdk10.0 amdrocm-developer-tools10.0 amdrocm-profiler10.0 amdrocm-blas-dev10.0 amdrocm-llvm-dev10.0 && \
+    apt-get install -y --no-install-recommends build-essential cmake git ninja-build pkg-config libssl-dev libcurl4-openssl-dev python3 && \
+    rm -rf /var/lib/apt/lists/*
+ENV ROCM_PATH=/opt/rocm HIP_PATH=/opt/rocm LD_LIBRARY_PATH=/opt/rocm/lib PATH=/opt/rocm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    GPU_TARGETS=gfx1151 AMDGPU_TARGETS=gfx1151 ROCBLAS_USE_HIPBLASLT=1 AMD_LOG_LEVEL=0
+CMD ["/bin/bash"]

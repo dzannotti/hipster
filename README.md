@@ -7,10 +7,15 @@ Design principles, roofs and per-kernel accounting live in `CLAUDE.md` and `docs
 
 ## Hardware and software this was measured on
 - AMD Ryzen AI MAX+ 395 (Radeon 8060S, gfx1151, 40 CU wave32), 128 GB unified memory, NVMe (Kingston OM8TAP42048K1).
-- Fedora 44 host **without ROCm**; everything GPU-side runs in the docker image `mimiron/rocm:10.0.0` (ROCm 10.0.0
-  developer image: AMD clang 23.0.0git, hipBLASLt, rocprofv3). `build.sh` is the only entry point: it runs cmake +
-  ninja inside that image and then your command. If your image differs, the flags to match are in `build.sh` and
-  `engine/CMakeLists.txt` (HIP via `/opt/rocm/lib/llvm/bin/clang++`, `--offload-arch=gfx1151`, link `libhipblaslt`).
+- Fedora 44 host **without ROCm**; everything GPU-side runs in a docker image, `mimiron/rocm:10.0.0`. **That tag is a
+  local build, not on a registry, and nothing in it is custom**: Ubuntu 24.04 + stock ROCm 10.0.0 installed from AMD's
+  official apt repository (`stable.repo.amd.com/rocm/core/packages/ubuntu2404`, the `amdrocm-*10.0` packages —
+  i.e. exactly what TheRock's install scripts pull; AMD clang 23.0.0git, hipBLASLt, rocprofv3) plus `cmake ninja git`
+  and env `GPU_TARGETS=gfx1151 ROCBLAS_USE_HIPBLASLT=1`. `tools/Dockerfile.rocm` rebuilds it
+  (`docker build -t mimiron/rocm:10.0.0 -f tools/Dockerfile.rocm .`); any ROCm 10.0.0 image with hipcc, hipBLASLt and
+  rocprofv3 for gfx1151 works the same — pass it as `IMG=<image> ./build.sh …`. `build.sh` is the only entry point: it
+  runs cmake + ninja inside the image and then your command. The flags to match if your toolchain differs are in
+  `build.sh` and `engine/CMakeLists.txt` (HIP via `/opt/rocm/lib/llvm/bin/clang++`, `--offload-arch=gfx1151`, link `libhipblaslt`).
 - Measured roofs (`bench/roofline/`): 240 GB/s DRAM read, 1.8–2.4 µs per kernel launch, 51.8 TFLOPS hipBLASLt bf16.
 
 ## Models (paths are what `build.sh` mounts as `/models`)
