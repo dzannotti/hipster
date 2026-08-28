@@ -132,7 +132,7 @@ int main(int argc, char** argv) {
             v["endpoint_slots"] = false; v["endpoint_props"] = true; v["endpoint_metrics"] = false; v["ui"] = true; v["ui_settings"] = js::Value::object();
             v["chat_template"] = ""; v["chat_template_caps"] = js::Value::object(); v["bos_token"] = ""; v["eos_token"] = "<|im_end|>"; v["build_info"] = "hipster"; v["is_sleeping"] = false; v["cors_proxy_enabled"] = false;
             res.send(200, "application/json", js::dump(v)); return; }
-        static const char* api_paths[] = {"/slots", "/metrics", "/tokenize", "/detokenize", "/apply-template", "/completion", "/infill", "/embedding", "/embeddings", "/rerank", "/models/", "/api/"};
+        static const char* api_paths[] = {"/slots", "/metrics", "/tokenize", "/detokenize", "/apply-template", "/completion", "/infill", "/embedding", "/embeddings", "/rerank", "/models", "/api/", "/props", "/health"};
         bool api = req.path.rfind("/v1", 0) == 0; for (const char* a : api_paths) if (req.path.rfind(a, 0) == 0) api = true;
         if (req.method == "GET" && !api && serve_static(ui_dir, req.path, res)) return;
         if (req.path == "/v1/models" || req.path == "/models") { js::Value v = js::Value::object(); v["object"] = "list"; js::Value md = js::Value::object(); md["id"] = S.model_name; md["object"] = "model"; md["owned_by"] = "hipster"; v["data"] = js::Value::array(); v["data"].push(md); res.send(200, "application/json", js::dump(v)); return; }
