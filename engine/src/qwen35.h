@@ -86,6 +86,7 @@ public:
     // top-k per row of the given logits buffer -> host arrays [T][k]
     void topk(const float* logits, int T, int k, int* ids, float* vals);
     void reset();
+    void reset_slot(int slot);   // zero one slot's recurrent state (its KV is overwritten as positions are re-filled)
     void clear_kv(bool k, bool v);   // debug: zero the attention K and/or V caches
     size_t weight_bytes() const { return weight_bytes_; }
     std::string load_report() const { return report_; }

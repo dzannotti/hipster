@@ -16,71 +16,82 @@
 #include <hip/hip_runtime.h>
 #include <fstream>
 #include <sstream>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
 
 namespace {
 constexpr int N_VOCAB = 248320;
-// token-level view of an engine for the serving loop: prompt in chunks, then either plain steps or spec rounds
+// token-level view of an engine for the serving loop: slots, prompt in chunks, then rounds of (draft, verify, accept)
 struct Backend {
     virtual ~Backend() {}
-    virtual void reset() = 0;
-    virtual void prefill(const int* toks, int n, int pos0, bool spec) = 0;     // one chunk (+ draft catch-up when spec)
-    virtual const float* logits() = 0;                                          // rows of the last pass
+    virtual int n_slots() = 0;
+    virtual void reset_slot(int s) = 0;
+    virtual void prefill(int s, const int* toks, int n, int pos0, bool spec) = 0;   // one chunk of slot s (+ draft catch-up when spec)
+    virtual const float* logits() = 0;                                              // rows of the last pass, in request order
     virtual void topk(const float* l, int T, int k, int* ids, float* vals) = 0;
-    virtual int max_draft() = 0;                                                // 0: no drafts
-    virtual int draft(int id_last, int pos, int* out) = 0;                      // drafts after id_last at pos, returns their count
-    virtual void verify(const int* batch, int T, int pos) = 0;                  // target pass over [id_last, drafts...]
-    virtual void accept(int mm, const int* drafts, int pos) = 0;                // commit mm drafts + bonus, draft catch-up
-    virtual void step(int id, int pos) = 0;                                     // plain: one token
+    virtual int max_draft() = 0;                                                    // 0: no drafts
+    virtual int draft(const int* slots, const int* id_last, const int* pos, int S, int* out) = 0;   // out[s*max_draft + i]; returns the count per slot
+    virtual void verify(const hip::SlotReq* reqs, int S) = 0;                       // one pass over the active slots
+    virtual void accept(int s, int mm, const int* drafts, int pos) = 0;             // commit mm drafts + bonus on slot s, draft catch-up
     virtual size_t weight_bytes() = 0;
 };
-struct FnBackend : Backend {   // Flash-Next + MTP
+struct FnBackend : Backend {   // Flash-Next + MTP, one slot
     hip::Qwen4Exp m; int mtp; float* h_pending = nullptr; std::vector<int> ids = std::vector<int>(16); std::vector<float> vals = std::vector<float>(16);
     FnBackend(const std::string& path, int ctx, int chunk, int mtp_) : m(path, ctx, 1, chunk), mtp(mtp_) {
         if (mtp > 0 && !m.has_mtp()) { fprintf(stderr, "no MTP block in this GGUF: decoding without drafts\n"); mtp = 0; }
         hipMalloc(&h_pending, (size_t)hip::FnDims::wide * 4);
     }
-    void reset() override { m.reset(); }
-    void prefill(const int* t, int n, int p, bool spec) override { m.prefill(t, n, p); if (spec && mtp > 0) m.mtp_catchup(t, n, p); hipMemcpy(h_pending, m.h_nextn(), (size_t)hip::FnDims::wide * 4, hipMemcpyDeviceToDevice); }
+    int n_slots() override { return 1; }
+    void reset_slot(int) override { m.reset(); }
+    void prefill(int, const int* t, int n, int p, bool spec) override { m.prefill(t, n, p); if (spec && mtp > 0) m.mtp_catchup(t, n, p); hipMemcpy(h_pending, m.h_nextn(), (size_t)hip::FnDims::wide * 4, hipMemcpyDeviceToDevice); }
     const float* logits() override { return m.logits(); }
     void topk(const float* l, int T, int k, int* i, float* v) override { m.topk(l, T, k, i, v); }
     int max_draft() override { return mtp; }
-    int draft(int id_last, int pos, int* out) override {
-        int tok = id_last; const float* h = h_pending;
-        for (int i = 0; i < mtp; ++i) { m.mtp_forward(&tok, h, 1, pos + i); m.topk(m.mtp_logits(), 1, 1, ids.data(), vals.data()); tok = ids[0]; out[i] = tok; h = m.mtp_h(); }
+    int draft(const int*, const int* id_last, const int* pos, int, int* out) override {
+        int tok = id_last[0]; const float* h = h_pending;
+        for (int i = 0; i < mtp; ++i) { m.mtp_forward(&tok, h, 1, pos[0] + i); m.topk(m.mtp_logits(), 1, 1, ids.data(), vals.data()); tok = ids[0]; out[i] = tok; h = m.mtp_h(); }
         return mtp;
     }
-    void verify(const int* b, int T, int pos) override { m.forward(b, T, pos); }
-    void accept(int mm, const int* drafts, int pos) override {
+    void verify(const hip::SlotReq* r, int) override { m.forward(r[0].tokens, r[0].T, r[0].pos); }
+    void accept(int, int mm, const int* drafts, int pos) override {
         m.accept(mm + 1); if (mm > 0) m.mtp_forward(drafts, m.h_nextn(), mm, pos + 1);
         hipMemcpy(h_pending, m.h_nextn() + (size_t)mm * hip::FnDims::wide, (size_t)hip::FnDims::wide * 4, hipMemcpyDeviceToDevice);
     }
-    void step(int id, int pos) override { m.forward(&id, 1, pos); m.accept(1); }
     size_t weight_bytes() override { return m.weight_bytes(); }
 };
-struct B27Backend : Backend {   // 27B + DFlash2
-    hip::Qwen35 m; int nd;
-    B27Backend(const std::string& path, const std::string& draft_path, int ctx, int nd_) : m(path, ctx, 1), nd(nd_) {
+struct B27Backend : Backend {   // 27B + DFlash2, n slots (rows per pass <= 16)
+    hip::Qwen35 m; int nd, ns;
+    B27Backend(const std::string& path, const std::string& draft_path, int ctx, int nd_, int slots) : m(path, ctx, slots), nd(nd_), ns(slots) {
         if (!draft_path.empty()) m.load_dflash(draft_path); else { fprintf(stderr, "no --draft: 27B decodes without drafts\n"); nd = 0; }
     }
-    void reset() override { m.reset(); }
-    void prefill(const int* t, int n, int p, bool spec) override { m.forward(t, n, p); m.accept(n); if (spec && nd > 0) m.dflash_encode(n, p); }
+    int n_slots() override { return ns; }
+    void reset_slot(int s) override { m.reset_slot(s); }
+    void prefill(int s, const int* t, int n, int p, bool spec) override { hip::SlotReq r{s, t, n, p}; m.forward(&r, 1); m.accept(s, n); if (spec && nd > 0) m.dflash_encode(s, n, p); }
     const float* logits() override { return m.logits(); }
     void topk(const float* l, int T, int k, int* i, float* v) override { m.topk(l, T, k, i, v); }
     int max_draft() override { return nd; }
-    int draft(int id_last, int pos, int* out) override { return m.dflash_draft(id_last, pos, nd, out); }
-    void verify(const int* b, int T, int pos) override { m.forward(b, T, pos); }
-    void accept(int mm, const int*, int pos) override { m.accept(mm + 1); if (nd > 0) m.dflash_encode(mm + 1, pos); }
-    void step(int id, int pos) override { m.forward(&id, 1, pos); m.accept(1); if (nd > 0) m.dflash_encode(1, pos); }
+    int draft(const int* slots, const int* id_last, const int* pos, int S, int* out) override { return m.dflash_draft_b(slots, id_last, pos, S, nd, out); }
+    void verify(const hip::SlotReq* r, int S) override { m.forward(r, S); }
+    void accept(int s, int mm, const int*, int pos) override { m.accept(s, mm + 1); if (nd > 0) m.dflash_encode(s, mm + 1, pos); }
     size_t weight_bytes() override { return m.weight_bytes(); }
 };
 struct Params { int max_tokens = 4096; float temperature = 0.f, top_p = 1.f; int top_k = 0; bool stream = false; };
+struct Result { std::vector<int> ids; std::string finish; int prompt_tokens = 0; double prefill_s = 0, gen_s = 0; int rounds = 0, accepted = 0, drafted = 0; };
+struct Job {   // one request in the scheduler
+    std::vector<int> prompt; Params p; bool reasoning; std::function<void(const std::string&, bool)> emit;
+    Result r; std::string pending; int pos = 0, id_last = 0, slot = -1; bool spec = false; double t_gen0 = 0;
+    std::mutex mu; std::condition_variable cv; bool done = false;
+};
 struct Server {
     Backend* m; tok::Tokenizer* T; int ctx, chunk, mtp; std::string model_name;
     int eos, im_end, think_open, think_close;
     std::mt19937 rng{42};
+    std::mutex qmu; std::condition_variable qcv; std::deque<Job*> queue; std::vector<Job*> active;
     static double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
-    // greedy top-1 / sampled next token from the logits on device
+    // greedy top-1 / sampled next token from a logits row on device
     int pick(const float* dlogits, const Params& p, std::vector<float>& host) {
         if (p.temperature <= 0.f) { int id; float v; m->topk(dlogits, 1, 1, &id, &v); return id; }
         host.resize(N_VOCAB); hipMemcpy(host.data(), dlogits, (size_t)N_VOCAB * 4, hipMemcpyDeviceToHost);
@@ -91,52 +102,80 @@ struct Server {
         double cum = 0; int n = k; for (int i = 0; i < k; ++i) { cum += pr[i] / s; if (cum >= p.top_p) { n = i + 1; break; } }
         std::discrete_distribution<int> dist(pr.begin(), pr.begin() + n); return idx[dist(rng)];
     }
-    // run the prompt, then generate; emit(text, is_reasoning) per decoded piece; returns {generated ids, finish reason}
-    struct Result { std::vector<int> ids; std::string finish; int prompt_tokens = 0; double prefill_s = 0, gen_s = 0; int rounds = 0, accepted = 0, drafted = 0; };
+    bool stop(int id) const { return id == eos || id == im_end; }
+    void out(Job& j, int id) {   // emit one token: thinking tags, UTF-8 boundary handling
+        j.r.ids.push_back(id);
+        if (id == think_close && j.reasoning) { j.reasoning = false; return; }
+        if (id == think_open) { j.reasoning = true; return; }
+        j.pending += T->piece(id);
+        size_t ok = j.pending.size();
+        { size_t p = j.pending.size(); int back = 0; while (p > 0 && back < 4 && ((unsigned char)j.pending[p - 1] & 0xC0) == 0x80) { --p; ++back; }
+          if (p > 0) { unsigned char c = j.pending[p - 1]; int need = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1; if (j.pending.size() - (p - 1) < (size_t)need) ok = p - 1; } }
+        if (ok > 0) { j.emit(j.pending.substr(0, ok), j.reasoning); j.pending.erase(0, ok); }
+    }
+    void finish(Job& j) {
+        if (!j.pending.empty()) { j.emit(j.pending, j.reasoning); j.pending.clear(); }
+        if (j.r.finish.empty()) j.r.finish = "length";
+        j.r.gen_s = now() - j.t_gen0;
+        m->reset_slot(j.slot);
+        { std::lock_guard<std::mutex> lk(j.mu); j.done = true; } j.cv.notify_all();
+    }
+    // request entry: queue the job and wait for the scheduler thread to finish it
     Result generate(std::vector<int> prompt, const Params& p, bool thinking_open, const std::function<void(const std::string&, bool)>& emit) {
-        Result r; r.prompt_tokens = (int)prompt.size();
         if ((int)prompt.size() + 8 > ctx) throw std::runtime_error("prompt longer than the context (" + std::to_string(prompt.size()) + " > " + std::to_string(ctx - 8) + ")");
-        m->reset();
-        const double t0 = now();
-        for (int c0 = 0; c0 < (int)prompt.size(); c0 += chunk) { const int n = std::min(chunk, (int)prompt.size() - c0); m->prefill(&prompt[c0], n, c0, mtp > 0 && p.temperature <= 0.f); }
-        r.prefill_s = now() - t0;
-        int pos = (int)prompt.size(); bool reasoning = thinking_open;
-        std::string pending;   // incomplete UTF-8 tail
-        auto out = [&](int id) {
-            r.ids.push_back(id);
-            if (id == think_close && reasoning) { reasoning = false; return; }
-            if (id == think_open) { reasoning = true; return; }
-            pending += T->piece(id);
-            // flush complete UTF-8 sequences: keep an incomplete trailing multi-byte character for the next piece
-            size_t ok = pending.size();
-            { size_t p = pending.size(); int back = 0; while (p > 0 && back < 4 && ((unsigned char)pending[p - 1] & 0xC0) == 0x80) { --p; ++back; }   // p: last lead byte (or ascii)
-              if (p > 0) { unsigned char c = pending[p - 1]; int need = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1; if (pending.size() - (p - 1) < (size_t)need) ok = p - 1; } }
-            if (ok > 0) { emit(pending.substr(0, ok), reasoning); pending.erase(0, ok); }
-        };
-        std::vector<float> host; int id_last; { id_last = pick(m->logits(), p, host); }
-        const double t1 = now();
-        std::vector<int> ids(16 * 16); std::vector<float> vals(16 * 16); int drafts[16];
-        auto stop = [&](int id) { return id == eos || id == im_end; };
-        bool done = false;
-        while (!done && (int)r.ids.size() < p.max_tokens) {
-            if (stop(id_last)) { r.finish = "stop"; done = true; break; }
-            out(id_last);
-            if (mtp > 0 && p.temperature <= 0.f) {   // spec round: draft n, verify n+1, accept the matching prefix + bonus
-                const int nd = m->draft(id_last, pos, drafts);
-                std::vector<int> batch; batch.push_back(id_last); for (int i = 0; i < nd; ++i) batch.push_back(drafts[i]);
-                const int Tn = (int)batch.size(); m->verify(batch.data(), Tn, pos); m->topk(m->logits(), Tn, 1, ids.data(), vals.data());
-                int mm = 0; while (mm < nd && ids[mm] == drafts[mm] && !stop(drafts[mm])) ++mm;
-                m->accept(mm, drafts, pos);
-                for (int i = 0; i < mm; ++i) { if ((int)r.ids.size() >= p.max_tokens) { done = true; break; } out(drafts[i]); }
-                id_last = ids[mm]; pos += mm + 1; ++r.rounds; r.drafted += nd; r.accepted += mm;
-            } else {
-                m->step(id_last, pos); ++pos; id_last = pick(m->logits(), p, host);
+        Job j; j.prompt = std::move(prompt); j.p = p; j.reasoning = thinking_open; j.emit = emit; j.r.prompt_tokens = (int)j.prompt.size();
+        j.spec = mtp > 0 && p.temperature <= 0.f;
+        { std::lock_guard<std::mutex> lk(qmu); queue.push_back(&j); } qcv.notify_one();
+        std::unique_lock<std::mutex> lk(j.mu); j.cv.wait(lk, [&] { return j.done; });
+        return j.r;
+    }
+    // the scheduler: admit queued jobs into free slots (prefill), then lockstep rounds over the active ones
+    void run() {
+        std::vector<float> host; std::vector<int> ids(16 * 16); std::vector<float> vals(16 * 16);
+        const int ns = m->n_slots(), nd = mtp;
+        std::vector<bool> used(ns, false);
+        while (true) {
+            {   std::unique_lock<std::mutex> lk(qmu);
+                qcv.wait(lk, [&] { return !queue.empty() || !active.empty(); });
+                while (!queue.empty() && (int)active.size() < ns) {
+                    Job* j = queue.front(); queue.pop_front(); int s = 0; while (used[s]) ++s; used[s] = true; j->slot = s; active.push_back(j);
+                    lk.unlock();
+                    const double t0 = now(); m->reset_slot(s);
+                    for (int c0 = 0; c0 < (int)j->prompt.size(); c0 += chunk) { const int n = std::min(chunk, (int)j->prompt.size() - c0); m->prefill(s, &j->prompt[c0], n, c0, j->spec); }
+                    j->r.prefill_s = now() - t0; j->pos = (int)j->prompt.size(); j->id_last = pick(m->logits(), j->p, host); j->t_gen0 = now();
+                    lk.lock();
+                }
             }
+            // one round over the active slots
+            std::vector<Job*> spec_jobs; for (Job* j : active) if (j->spec) spec_jobs.push_back(j);
+            std::vector<int> drafts((size_t)ns * 8, 0), ndr(ns, 0);
+            if (!spec_jobs.empty()) {
+                std::vector<int> sl, il, pl; for (Job* j : spec_jobs) { sl.push_back(j->slot); il.push_back(j->id_last); pl.push_back(j->pos); }
+                std::vector<int> dr((size_t)spec_jobs.size() * nd);
+                const int k = m->draft(sl.data(), il.data(), pl.data(), (int)spec_jobs.size(), dr.data());
+                for (size_t q = 0; q < spec_jobs.size(); ++q) { ndr[spec_jobs[q]->slot] = k; for (int i = 0; i < k; ++i) drafts[(size_t)spec_jobs[q]->slot * 8 + i] = dr[q * nd + i]; }
+            }
+            std::vector<std::vector<int>> batch(active.size()); std::vector<hip::SlotReq> reqs; int rows = 0;
+            for (size_t q = 0; q < active.size(); ++q) { Job* j = active[q]; batch[q].push_back(j->id_last); for (int i = 0; i < ndr[j->slot]; ++i) batch[q].push_back(drafts[(size_t)j->slot * 8 + i]);
+                reqs.push_back({j->slot, batch[q].data(), (int)batch[q].size(), j->pos}); rows += (int)batch[q].size(); }
+            m->verify(reqs.data(), (int)reqs.size());
+            bool any_greedy = false; for (Job* j : active) any_greedy |= j->p.temperature <= 0.f;
+            if (any_greedy) m->topk(m->logits(), rows, 1, ids.data(), vals.data());
+            int r0 = 0; std::vector<Job*> still;
+            for (size_t q = 0; q < active.size(); ++q) {
+                Job* j = active[q]; const int T = reqs[q].T; const int* dr = &drafts[(size_t)j->slot * 8];
+                if (stop(j->id_last)) { j->r.finish = "stop"; m->accept(j->slot, 0, dr, j->pos); finish(*j); r0 += T; continue; }
+                out(*j, j->id_last);
+                int mm = 0; while (mm < ndr[j->slot] && ids[r0 + mm] == dr[mm] && !stop(dr[mm])) ++mm;
+                m->accept(j->slot, mm, dr, j->pos);
+                bool full = false;
+                for (int i = 0; i < mm; ++i) { if ((int)j->r.ids.size() >= j->p.max_tokens) { full = true; break; } out(*j, dr[i]); }
+                j->id_last = j->p.temperature <= 0.f ? ids[r0 + mm] : pick(m->logits() + (size_t)(r0 + mm) * N_VOCAB, j->p, host);
+                j->pos += mm + 1; ++j->r.rounds; j->r.drafted += ndr[j->slot]; j->r.accepted += mm; r0 += T;
+                if (full || (int)j->r.ids.size() >= j->p.max_tokens) finish(*j); else still.push_back(j);
+            }
+            { std::lock_guard<std::mutex> lk(qmu); for (Job* j : active) if (std::find(still.begin(), still.end(), j) == still.end()) used[j->slot] = false; active = still; }
         }
-        if (!pending.empty()) emit(pending, reasoning);
-        if (r.finish.empty()) r.finish = "length";
-        r.gen_s = now() - t1;
-        return r;
     }
 };
 std::string sse(const js::Value& v) { return "data: " + js::dump(v) + "\n\n"; }
@@ -161,30 +200,32 @@ js::Value timings_json(int prompt_n, double prefill_s, int predicted_n, double g
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string model, draft, host = "127.0.0.1", ui_dir = "/models/.work/fn-tree/build/tools/ui/dist"; int port = 8090, ctx = 16384, chunk = 2048, mtp = 2, ndraft = 7;
+    std::string model, draft, host = "127.0.0.1", ui_dir = "/models/.work/fn-tree/build/tools/ui/dist"; int port = 8090, ctx = 16384, chunk = 2048, mtp = 2, ndraft = 7, slots = 1;
     for (int i = 1; i < argc; ++i) { std::string a = argv[i]; auto next = [&] { return std::string(argv[++i]); };
         if (a == "--model") model = next(); else if (a == "--draft") draft = next(); else if (a == "--port") port = atoi(next().c_str()); else if (a == "--host") host = next(); else if (a == "--ctx") ctx = atoi(next().c_str());
-        else if (a == "--chunk") chunk = atoi(next().c_str()); else if (a == "--mtp") mtp = atoi(next().c_str()); else if (a == "--ndraft") ndraft = atoi(next().c_str()); else if (a == "--ui-dir") ui_dir = next(); }
-    if (model.empty()) { fprintf(stderr, "usage: hipster-serve --model <gguf> [--draft <dflash2.gguf>] [--port 8090] [--host 127.0.0.1] [--ctx 16384] [--chunk 2048] [--mtp 2] [--ndraft 7]\n"); return 2; }
+        else if (a == "--chunk") chunk = atoi(next().c_str()); else if (a == "--mtp") mtp = atoi(next().c_str()); else if (a == "--ndraft") ndraft = atoi(next().c_str()); else if (a == "--slots") slots = atoi(next().c_str()); else if (a == "--ui-dir") ui_dir = next(); }
+    if (model.empty()) { fprintf(stderr, "usage: hipster-serve --model <gguf> [--draft <dflash2.gguf>] [--port 8090] [--host 127.0.0.1] [--ctx 16384] [--chunk 2048] [--mtp 2] [--ndraft 7] [--slots 2]\n"); return 2; }
     std::string arch; { hip::GGUF g(model); arch = g.arch(); }
     const bool is27b = arch == "qwen35";
     if (is27b) chunk = std::min(chunk, hip::Qwen35Dims::max_prefill);
-    Backend* be = is27b ? (Backend*)new B27Backend(model, draft, ctx, std::min(ndraft, 7)) : (Backend*)new FnBackend(model, ctx, chunk, mtp);
+    if (!is27b && slots != 1) { fprintf(stderr, "Flash-Next serving is one slot for now\n"); slots = 1; }
+    Backend* be = is27b ? (Backend*)new B27Backend(model, draft, ctx, std::min(ndraft, 7), std::max(1, std::min(slots, 2))) : (Backend*)new FnBackend(model, ctx, chunk, mtp);
     mtp = be->max_draft();
     tok::Tokenizer* Tp; { hip::GGUF g(model); Tp = new tok::Tokenizer(g); } tok::Tokenizer& T = *Tp;
     Server S{be, &T, ctx, chunk, mtp, is27b ? "qwen3.8-27b" : "qwen3.8-flash-next", T.eos(), T.special("<|im_end|>"), T.special("<think>"), T.special("</think>")};
     {   // warm-up: the GEMM shapes of a short and a full chunk (hipBLASLt autotune), then reset
-        std::vector<int> w(chunk, 1); be->reset(); be->prefill(w.data(), 128, 0, false); be->reset(); be->prefill(w.data(), chunk, 0, false); be->reset();
-        be->step(1, 0); be->reset();
+        std::vector<int> w(chunk, 1); be->reset_slot(0); be->prefill(0, w.data(), 128, 0, false); be->reset_slot(0); be->prefill(0, w.data(), chunk, 0, false); be->reset_slot(0);
+        hip::SlotReq r{0, w.data(), 1, 0}; be->verify(&r, 1); be->accept(0, 0, nullptr, 0); be->reset_slot(0);
     }
-    fprintf(stderr, "ready: %s, ctx %d, chunk %d, drafts %d, weights %.1f GiB\n", S.model_name.c_str(), ctx, chunk, mtp, be->weight_bytes() / 1073741824.0);
+    std::thread([&S] { S.run(); }).detach();
+    fprintf(stderr, "ready: %s, ctx %d, chunk %d, drafts %d, slots %d, weights %.1f GiB\n", S.model_name.c_str(), ctx, chunk, mtp, be->n_slots(), be->weight_bytes() / 1073741824.0);
     http::serve(host, port, [&](const http::Request& req0, http::Response& res) {
         http::Request req = req0; { size_t q = req.path.find('?'); if (q != std::string::npos) req.path = req.path.substr(0, q); }   // route without the query string
         if (req.method == "OPTIONS") { res.send(200, "text/plain", ""); return; }
         if (req.path == "/health") { res.send(200, "application/json", "{\"status\":\"ok\"}"); return; }
         if (req.path == "/props") {   // what llama.cpp's web UI reads
             js::Value v = js::Value::object(); js::Value dgs = js::Value::object(); dgs["params"] = js::Value::object(); dgs["n_ctx"] = ctx; v["default_generation_settings"] = dgs;
-            v["total_slots"] = 1; v["model_alias"] = S.model_name; v["model_ftype"] = "UD-Q4_K_XL"; v["model_path"] = model;
+            v["total_slots"] = be->n_slots(); v["model_alias"] = S.model_name; v["model_ftype"] = "UD-Q4_K_XL"; v["model_path"] = model;
             js::Value mod = js::Value::object(); mod["vision"] = false; mod["video"] = false; mod["audio"] = false; v["modalities"] = mod;
             v["endpoint_slots"] = false; v["endpoint_props"] = true; v["endpoint_metrics"] = false; v["ui"] = true; v["ui_settings"] = js::Value::object();
             v["chat_template"] = ""; v["chat_template_caps"] = js::Value::object(); v["bos_token"] = ""; v["eos_token"] = "<|im_end|>"; v["build_info"] = "hipster"; v["is_sleeping"] = false; v["cors_proxy_enabled"] = false;

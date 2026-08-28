@@ -42,3 +42,19 @@ block draft (`--ndraft 7`), otherwise plain decode; prefill chunks are capped at
 First measurement (chat completion, 37-token prompt, 200 tokens of Python, greedy): `prompt_ms 1135`,
 `predicted_per_second 45.9` (DFlash2 n=7), UI/streaming/thinking/tools unchanged. Still one slot per server; the
 engine's 2-slot lockstep mode (79 t/s aggregate in `dflash27b`) is not scheduled from the HTTP layer yet.
+
+### 2-slot serving (27B)
+
+`--slots 2`: `http::serve` now runs one thread per connection; requests are queued to a scheduler thread that admits jobs
+into free slots (prefill, other slots pause), then runs lockstep rounds over the active slots — one batched DFlash2 draft
+pass, one verify pass over all rows, per-slot accept/encode/stream. Greedy output is identical alone or concurrent
+(`A alone == A concurrent: True`).
+
+| request mix (200–300 tokens each, greedy, 40-token prompts) | per request | aggregate (wall, incl. prefills) |
+|---|---|---|
+| 1 code | 45.8 t/s | 45.8 |
+| 2 concurrent code | 32.7 / 38.5 | **61.4** |
+| code + prose | 30.6 / 19.1 | 32.9 (prose accepts ~30% of the drafts) |
+
+The 40-token prompts cost 1.1 s each through the GEMM path (every weight dequantised to bf16 per chunk); next: short
+prompts through 16-row GEMV passes.

@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <stdexcept>
 #include <signal.h>
+#include <thread>
 
 namespace http {
 void Response::write_all(const std::string& s) { size_t off = 0; while (off < s.size()) { ssize_t n = ::send(fd_, s.data() + off, s.size() - off, MSG_NOSIGNAL); if (n <= 0) throw std::runtime_error("client gone"); off += n; } }
@@ -30,10 +31,11 @@ void serve(const std::string& host, int port, const Handler& handler) {
     fprintf(stderr, "listening on http://%s:%d\n", host.c_str(), port);
     while (true) {
         int fd = accept(s, nullptr, nullptr); if (fd < 0) continue;
-        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+        std::thread([fd, &handler]() {   // one thread per connection: parse, handle (the handler serialises engine work itself), close
+        int one = 1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
         std::string buf; char tmp[65536]; size_t hdr_end = std::string::npos;
         while (hdr_end == std::string::npos) { ssize_t n = recv(fd, tmp, sizeof tmp, 0); if (n <= 0) break; buf.append(tmp, n); hdr_end = buf.find("\r\n\r\n"); if (buf.size() > (64u << 20)) break; }
-        if (hdr_end == std::string::npos) { close(fd); continue; }
+        if (hdr_end == std::string::npos) { close(fd); return; }
         Request r; { size_t p = buf.find(' '); r.method = buf.substr(0, p); size_t q = buf.find(' ', p + 1); r.path = buf.substr(p + 1, q - p - 1); }
         size_t line = buf.find("\r\n") + 2;
         while (line < hdr_end) { size_t e = buf.find("\r\n", line); size_t c = buf.find(':', line); if (c != std::string::npos && c < e) { std::string k = buf.substr(line, c - line), v = buf.substr(c + 1, e - c - 1); for (auto& ch : k) ch = tolower(ch); while (!v.empty() && v[0] == ' ') v.erase(0, 1); r.headers[k] = v; } line = e + 2; }
@@ -44,6 +46,7 @@ void serve(const std::string& host, int port, const Handler& handler) {
         try { handler(r, resp); } catch (const std::exception& e) { try { if (!resp.streaming()) resp.send(500, "application/json", std::string("{\"error\":{\"message\":\"") + e.what() + "\"}}"); else { resp.chunk("data: {\"error\":\"" + std::string(e.what()) + "\"}\n\n"); resp.end(); } } catch (...) {} }
         try { resp.end(); } catch (...) {}
         close(fd);
+        }).detach();
     }
 }
 }  // namespace http

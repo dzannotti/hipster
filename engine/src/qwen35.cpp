@@ -158,6 +158,10 @@ void Qwen35::clear_kv(bool k, bool v) {
     if (k) CK(hipMemset(kc_, 0, kv_slot_ * 2 * n_slots_));
     if (v) CK(hipMemset(vc_, 0, kvt_slot_ * 2 * n_slots_));
 }
+void Qwen35::reset_slot(int s) {
+    CK(hipMemset(gdn_state_ + (size_t)s * 2 * st_stride_, 0, st_stride_ * 2 * 4)); CK(hipMemset(conv_state_ + (size_t)s * 2 * cs_stride_, 0, cs_stride_ * 2 * 4));
+    cur_[s] = 0; lT_[s] = 0;
+}
 void Qwen35::reset() {
     CK(hipMemset(gdn_state_, 0, st_stride_ * 2 * n_slots_ * 4)); CK(hipMemset(conv_state_, 0, cs_stride_ * 2 * n_slots_ * 4));
     for (int s = 0; s < n_slots_; ++s) { cur_[s] = 0; lT_[s] = 0; }
