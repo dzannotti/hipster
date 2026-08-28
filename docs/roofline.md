@@ -69,3 +69,20 @@ GEMMs were everything (llama.cpp best: 440 t/s on Vulkan, ~310 on ROCm). Flash-N
 
 Vulkan's only measured advantage was per-dispatch cost on an unfused graph, which a
 from-scratch engine removes by construction. HIP wins prefill outright.
+
+## Addenda 2026-08-28 (`bench/roofline/coldstream.hip`, `wmma_rate.hip`)
+
+Cold streams (rotating copies so nothing is cached), 16-byte loads:
+
+| bytes | flat grid-stride kernel | one row (5.7 KB) per wave | launch+ramp+tail |
+|---:|---:|---:|---:|
+| 4 MiB | 161 GB/s | 201 | 21 µs |
+| 34 MiB | 234 | 221 | 161 µs |
+| 45 MiB | 236 | 221 | |
+| 682 MiB | 239 | 231 | |
+
+The memory system does not penalise small cold tensors; a row-per-wave access pattern costs 3–5%,
+and every launch carries ~15–20 µs of ramp/tail. (GEMV on the same 34 MB: 173 µs.)
+
+WMMA instruction throughput (register-only): **f16 54.8, bf16 55.2, iu8 54.8, iu4 109.7 TFLOPS/TOPS.**
+Int8 matrix math is the same rate as bf16 here; only int4×int4 is faster (2×).

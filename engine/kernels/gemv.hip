@@ -1,0 +1,770 @@
+#include <cstdio>
+#include <cstdlib>
+#include "gemv.h"
+#include <hip/hip_fp16.h>
+#include <cstring>
+
+namespace hip {
+int g_moe_tpr = 0;
+int g_persist_blocks = 0;   // 0 = one block per row-block; else cap the grid (persistent loop)
+namespace {
+
+__device__ __forceinline__ float h2f(uint16_t h) { return __half2float(__ushort_as_half(h)); }
+typedef unsigned int u32x4_t __attribute__((ext_vector_type(4)));
+#ifndef HIPSTER_NT_WEIGHTS
+#define HIPSTER_NT_WEIGHTS 0
+#endif
+// weight-stream load: non-temporal so the 17 GB/token stream does not churn MALL/L2 (Nathan's finding)
+__device__ __forceinline__ uint4 ldw(const uint4* p) {
+#if HIPSTER_NT_WEIGHTS
+    u32x4_t v = __builtin_nontemporal_load((const u32x4_t*)p); uint4 r; r.x = v[0]; r.y = v[1]; r.z = v[2]; r.w = v[3]; return r;
+#else
+    return *p;
+#endif
+}
+// v_dot4_i32_iu8 / v_dot4_i32_i8
+__device__ __forceinline__ int dot4_u8s8(uint32_t a, uint32_t b, int c) { return __builtin_amdgcn_sudot4(false, a, true, b, c, false); }
+__device__ __forceinline__ int dot4_s8s8(uint32_t a, uint32_t b, int c) { return __builtin_amdgcn_sudot4(true, a, true, b, c, false); }
+
+__device__ __forceinline__ void q4k_scales(const uint8_t* scales, int is, uint8_t& sc0, uint8_t& mn0, uint8_t& sc1, uint8_t& mn1) {
+    if (is < 4) { sc0 = scales[is] & 63; mn0 = scales[is + 4] & 63; sc1 = scales[is + 1] & 63; mn1 = scales[is + 5] & 63; }
+    else { sc0 = (scales[is + 4] & 0xF) | ((scales[is - 4] >> 6) << 4); mn0 = (scales[is + 4] >> 4) | ((scales[is] >> 6) << 4);
+           sc1 = (scales[is + 5] & 0xF) | ((scales[is - 3] >> 6) << 4); mn1 = (scales[is + 5] >> 4) | ((scales[is + 1] >> 6) << 4); }
+}
+
+// ---------------- x -> q8 ----------------
+__global__ void k_quantize_x_q8(const float* __restrict__ x, int8_t* __restrict__ q, float* __restrict__ d, float* __restrict__ s, int K) {
+    const int col = blockIdx.y;
+    const int sb = blockIdx.x * 8 + threadIdx.x / 32, lane = threadIdx.x % 32;
+    if (sb * 32 >= K) return;
+    const float v = x[(size_t)col * K + sb * 32 + lane];
+    float amax = fabsf(v);
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor(amax, off, 32));
+    const float dd = amax / 127.f, id = amax > 0 ? 127.f / amax : 0.f;
+    const int qi = __float2int_rn(v * id);
+    int sum = qi;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor(sum, off, 32);
+    q[(size_t)col * K + sb * 32 + lane] = (int8_t)qi;
+    if (lane == 0) { d[(size_t)col * (K / 32) + sb] = dd; s[(size_t)col * (K / 32) + sb] = dd * sum; }
+}
+
+// ======================= per-format block decoders =======================
+// Each format: ROW_BYTES(K), and `block(row, b, xw, xd, xs)` returning the f32 contribution of
+// 256-element block b of one row against one column of x: xw = 64 words of int8 x for that block,
+// xd/xs = the 8 per-32 x scales / x sums (d*sum q) for that block. Everything is compile-time.
+
+struct FmtQ4K {
+    static __device__ __forceinline__ const uint8_t* row(const uint8_t* W, int r, int K) { return W + (size_t)r * (K / 256) * 144; }
+    template <int NCOL>
+    static __device__ __forceinline__ void block(const uint8_t* rp, int b, const uint32_t* const* xw, const float* const* xd, const float* const* xs, float* acc) {
+        const uint8_t* blk = rp + (size_t)b * 144;
+        uint4 v[9];
+#pragma unroll
+        for (int i = 0; i < 9; ++i) v[i] = ldw((const uint4*)blk + i);
+        const uint16_t* hdr = (const uint16_t*)&v[0];
+        const float d = h2f(hdr[0]), dmin = h2f(hdr[1]);
+        const uint8_t* scales = (const uint8_t*)&v[0] + 4;
+        const uint32_t* qw = (const uint32_t*)&v[1];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            uint8_t sc0, mn0, sc1, mn1; q4k_scales(scales, 2 * j, sc0, mn0, sc1, mn1);
+            int i0[NCOL], i1[NCOL];
+#pragma unroll
+            for (int c = 0; c < NCOL; ++c) { i0[c] = 0; i1[c] = 0; }
+#pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                const uint32_t qq = qw[8 * j + w];
+                const uint32_t lo = qq & 0x0F0F0F0Fu, hi = (qq >> 4) & 0x0F0F0F0Fu;
+#pragma unroll
+                for (int c = 0; c < NCOL; ++c) { i0[c] = dot4_u8s8(lo, xw[c][16 * j + w], i0[c]); i1[c] = dot4_u8s8(hi, xw[c][16 * j + 8 + w], i1[c]); }
+            }
+            const float d0 = d * sc0, m0 = dmin * mn0, d1 = d * sc1, m1 = dmin * mn1;
+#pragma unroll
+            for (int c = 0; c < NCOL; ++c) acc[c] += d0 * xd[c][2 * j] * i0[c] - m0 * xs[c][2 * j] + d1 * xd[c][2 * j + 1] * i1[c] - m1 * xs[c][2 * j + 1];
+        }
+    }
+};
+
+struct FmtQ5K {
+    static __device__ __forceinline__ const uint8_t* row(const uint8_t* W, int r, int K) { return W + (size_t)r * (K / 256) * 176; }
+    template <int NCOL>
+    static __device__ __forceinline__ void block(const uint8_t* rp, int b, const uint32_t* const* xw, const float* const* xd, const float* const* xs, float* acc) {
+        const uint8_t* blk = rp + (size_t)b * 176;
+        uint4 v[11];
+#pragma unroll
+        for (int i = 0; i < 11; ++i) v[i] = ldw((const uint4*)blk + i);
+        const uint16_t* hdr = (const uint16_t*)&v[0];
+        const float d = h2f(hdr[0]), dmin = h2f(hdr[1]);
+        const uint8_t* scales = (const uint8_t*)&v[0] + 4;
+        const uint32_t* qh = (const uint32_t*)&v[1];
+        const uint32_t* qw = (const uint32_t*)&v[3];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            uint8_t sc0, mn0, sc1, mn1; q4k_scales(scales, 2 * j, sc0, mn0, sc1, mn1);
+            int i0[NCOL], i1[NCOL];
+#pragma unroll
+            for (int c = 0; c < NCOL; ++c) { i0[c] = 0; i1[c] = 0; }
+#pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                const uint32_t qq = qw[8 * j + w], hh = qh[w];
+                const uint32_t lo = (qq & 0x0F0F0F0Fu) | (((hh >> (2 * j)) & 0x01010101u) << 4);
+                const uint32_t hi = ((qq >> 4) & 0x0F0F0F0Fu) | (((hh >> (2 * j + 1)) & 0x01010101u) << 4);
+#pragma unroll
+                for (int c = 0; c < NCOL; ++c) { i0[c] = dot4_u8s8(lo, xw[c][16 * j + w], i0[c]); i1[c] = dot4_u8s8(hi, xw[c][16 * j + 8 + w], i1[c]); }
+            }
+            const float d0 = d * sc0, m0 = dmin * mn0, d1 = d * sc1, m1 = dmin * mn1;
+#pragma unroll
+            for (int c = 0; c < NCOL; ++c) acc[c] += d0 * xd[c][2 * j] * i0[c] - m0 * xs[c][2 * j] + d1 * xd[c][2 * j + 1] * i1[c] - m1 * xs[c][2 * j + 1];
+        }
+    }
+};
+
+// IQ4_XS: nibble -> kvalues_iq4nl via two v_perm_b32 lookups. Per-32 scale (ls-32)*d, no min.
+__device__ __forceinline__ uint32_t iq4nl_lut4(uint32_t nib) {
+    // kvalues_iq4nl = {-127,-104,-83,-65,-49,-35,-22,-10, 1,13,25,38,53,69,89,113} as bytes
+    const uint32_t l0 = 0xBFAD9881u, l1 = 0xF6EADDCFu, h0 = 0x26190D01u, h1 = 0x71594535u;
+    const uint32_t sel = nib & 0x07070707u;
+    const uint32_t lo = __builtin_amdgcn_perm(l1, l0, sel), hi = __builtin_amdgcn_perm(h1, h0, sel);
+    const uint32_t m = ((nib >> 3) & 0x01010101u) * 0xFFu;
+    return (hi & m) | (lo & ~m);
+}
+struct FmtIQ4XS {
+    static __device__ __forceinline__ const uint8_t* row(const uint8_t* W, int r, int K) { return W + (size_t)r * (K / 256) * 136; }
+    template <int NCOL>
+    static __device__ __forceinline__ void block(const uint8_t* rp, int b, const uint32_t* const* xw, const float* const* xd, const float* const* xs, float* acc) {
+        const uint8_t* blk = rp + (size_t)b * 136;
+        uint2 h = *(const uint2*)blk;
+        uint4 v[8];
+#pragma unroll
+        for (int i = 0; i < 8; ++i) v[i] = ldw((const uint4*)(blk + 8) + i);
+        const float d = h2f((uint16_t)(h.x & 0xFFFF));
+        const uint32_t scales_h = h.x >> 16, scales_l = h.y;
+        const uint32_t* qw = (const uint32_t*)v;
+#pragma unroll
+        for (int ib = 0; ib < 8; ++ib) {
+            const int ls = ((scales_l >> (4 * ib)) & 0xF) | (((scales_h >> (2 * ib)) & 3) << 4);
+            int i0[NCOL];
+#pragma unroll
+            for (int c = 0; c < NCOL; ++c) i0[c] = 0;
+#pragma unroll
+            for (int w = 0; w < 4; ++w) {
+                const uint32_t qq = qw[4 * ib + w];
+                const uint32_t lo = iq4nl_lut4(qq & 0x0F0F0F0Fu), hi = iq4nl_lut4((qq >> 4) & 0x0F0F0F0Fu);
+#pragma unroll
+                for (int c = 0; c < NCOL; ++c) { i0[c] = dot4_s8s8(lo, xw[c][8 * ib + w], i0[c]); i0[c] = dot4_s8s8(hi, xw[c][8 * ib + 4 + w], i0[c]); }
+            }
+            const float dl = d * (ls - 32);
+#pragma unroll
+            for (int c = 0; c < NCOL; ++c) acc[c] += dl * xd[c][ib] * i0[c];
+        }
+    }
+};
+
+template <int NCOL>
+__device__ __forceinline__ void q6k_soa_block(const uint8_t* rp, int b, int K, const uint32_t* const* xw, const float* const* xd, float* acc) {
+    const int nb = K / 256;
+    const uint8_t* ql = rp + (size_t)b * 128;
+    const uint8_t* qh = rp + (size_t)nb * 128 + (size_t)b * 64;
+    const uint8_t* sc = rp + (size_t)nb * 192 + (size_t)b * 16;
+    const uint16_t* dp = (const uint16_t*)(rp + (size_t)nb * 208) + b;
+    uint4 vl[8], vh[4], vs;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) vl[i] = ldw((const uint4*)ql + i);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) vh[i] = ldw((const uint4*)qh + i);
+    vs = *(const uint4*)sc;
+    const float d = h2f(*dp);
+    const uint32_t* lw = (const uint32_t*)vl;
+    const uint32_t* hw = (const uint32_t*)vh;
+    const int8_t* s8 = (const int8_t*)&vs;
+#pragma unroll
+    for (int n = 0; n < 2; ++n) {
+        int i[8][NCOL];
+#pragma unroll
+        for (int g = 0; g < 8; ++g)
+#pragma unroll
+            for (int c = 0; c < NCOL; ++c) i[g][c] = 0;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            const uint32_t a = lw[16 * n + w], cc = lw[16 * n + 8 + w], h = hw[8 * n + w];
+            const uint32_t q1 = (((a & 0x0F0F0F0Fu) | (((h >> 0) & 0x03030303u) << 4)) + 0x60606060u) ^ 0x80808080u;
+            const uint32_t q2 = (((cc & 0x0F0F0F0Fu) | (((h >> 2) & 0x03030303u) << 4)) + 0x60606060u) ^ 0x80808080u;
+            const uint32_t q3 = ((((a >> 4) & 0x0F0F0F0Fu) | (((h >> 4) & 0x03030303u) << 4)) + 0x60606060u) ^ 0x80808080u;
+            const uint32_t q4 = ((((cc >> 4) & 0x0F0F0F0Fu) | (((h >> 6) & 0x03030303u) << 4)) + 0x60606060u) ^ 0x80808080u;
+            const int g = w / 4, xb = 32 * n;
+#pragma unroll
+            for (int c = 0; c < NCOL; ++c) {
+                i[0 + g][c] = dot4_s8s8(q1, xw[c][xb + w], i[0 + g][c]);
+                i[2 + g][c] = dot4_s8s8(q2, xw[c][xb + 8 + w], i[2 + g][c]);
+                i[4 + g][c] = dot4_s8s8(q3, xw[c][xb + 16 + w], i[4 + g][c]);
+                i[6 + g][c] = dot4_s8s8(q4, xw[c][xb + 24 + w], i[6 + g][c]);
+            }
+        }
+#pragma unroll
+        for (int g = 0; g < 8; ++g) {
+            const float ds = d * s8[8 * n + g];
+#pragma unroll
+            for (int c = 0; c < NCOL; ++c) acc[c] += ds * xd[c][4 * n + g / 2] * i[g][c];
+        }
+    }
+}
+
+// Q8_0 row-SoA: [q K int8][d (K/32)*2]. K multiple of 32: the last 256-block may be partial (guarded per sub-block).
+template <int NCOL>
+__device__ __forceinline__ void q8_0_soa_block(const uint8_t* rp, int b, int K, const uint32_t* const* xw, const float* const* xd, float* acc) {
+    const uint8_t* q = rp + (size_t)b * 256;
+    const uint16_t* dp = (const uint16_t*)(rp + K) + b * 8;
+    const int nsb_left = K / 32 - b * 8;
+#pragma unroll
+    for (int ib = 0; ib < 8; ++ib) {
+        if (ib >= nsb_left) break;
+        const uint4 v0 = ldw((const uint4*)q + 2 * ib), v1 = ldw((const uint4*)q + 2 * ib + 1);
+        const uint32_t qw[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+        int i0[NCOL];
+#pragma unroll
+        for (int c = 0; c < NCOL; ++c) i0[c] = 0;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+#pragma unroll
+            for (int c = 0; c < NCOL; ++c) i0[c] = dot4_s8s8(qw[w], xw[c][8 * ib + w], i0[c]);
+        }
+        const float dd = h2f(dp[ib]);
+#pragma unroll
+        for (int c = 0; c < NCOL; ++c) acc[c] += dd * xd[c][ib] * i0[c];
+    }
+}
+
+// Q5_1 row-SoA: [qs K/2][qh K/8][d K/32 f16][m K/32 f16]; w = d*q + m with q = nibble | (hbit<<4).
+// ggml block: qh bit j -> element j (0..15: low nibbles), bits 16..31 -> elements 16..31 (high nibbles).
+template <int NCOL>
+__device__ __forceinline__ void q5_1_soa_block(const uint8_t* rp, int b, int K, const uint32_t* const* xw, const float* const* xd, const float* const* xs, float* acc) {
+    const uint8_t* qs = rp + (size_t)b * 128; const uint32_t* qh = (const uint32_t*)(rp + K / 2) + b * 8;
+    const uint16_t* dp = (const uint16_t*)(rp + K / 2 + K / 8) + b * 8; const uint16_t* mp = dp + K / 32;
+    const int nsb_left = K / 32 - b * 8;
+#pragma unroll
+    for (int ib = 0; ib < 8; ++ib) {
+        if (ib >= nsb_left) break;
+        const uint4 v = ldw((const uint4*)qs + ib);
+        const uint32_t qw[4] = {v.x, v.y, v.z, v.w};
+        const uint32_t hb = qh[ib];
+        int i0[NCOL];
+#pragma unroll
+        for (int c = 0; c < NCOL; ++c) i0[c] = 0;
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            const uint32_t qq = qw[w];
+            const uint32_t hl = ((hb >> (4 * w)) & 1u) | (((hb >> (4 * w + 1)) & 1u) << 8) | (((hb >> (4 * w + 2)) & 1u) << 16) | (((hb >> (4 * w + 3)) & 1u) << 24);
+            const uint32_t hh = ((hb >> (16 + 4 * w)) & 1u) | (((hb >> (17 + 4 * w)) & 1u) << 8) | (((hb >> (18 + 4 * w)) & 1u) << 16) | (((hb >> (19 + 4 * w)) & 1u) << 24);
+            const uint32_t lo = (qq & 0x0F0F0F0Fu) | (hl << 4), hi = ((qq >> 4) & 0x0F0F0F0Fu) | (hh << 4);
+#pragma unroll
+            for (int c = 0; c < NCOL; ++c) { i0[c] = dot4_u8s8(lo, xw[c][8 * ib + w], i0[c]); i0[c] = dot4_u8s8(hi, xw[c][8 * ib + 4 + w], i0[c]); }
+        }
+        const float d = h2f(dp[ib]), m = h2f(mp[ib]);
+#pragma unroll
+        for (int c = 0; c < NCOL; ++c) acc[c] += d * xd[c][ib] * i0[c] + m * xs[c][ib];
+    }
+}
+
+// ======================= the kernels =======================
+template <WFmt F, int NCOL>
+__device__ __forceinline__ void dispatch_block(const uint8_t* rp, int b, int K, const uint32_t* const* xw, const float* const* xd, const float* const* xs, float* acc) {
+    if constexpr (F == WFmt::Q4_K) FmtQ4K::block<NCOL>(rp, b, xw, xd, xs, acc);
+    else if constexpr (F == WFmt::Q5_K) FmtQ5K::block<NCOL>(rp, b, xw, xd, xs, acc);
+    else if constexpr (F == WFmt::IQ4_XS) FmtIQ4XS::block<NCOL>(rp, b, xw, xd, xs, acc);
+    else if constexpr (F == WFmt::Q6_K_SOA) q6k_soa_block<NCOL>(rp, b, K, xw, xd, acc);
+    else if constexpr (F == WFmt::Q5_1_SOA) q5_1_soa_block<NCOL>(rp, b, K, xw, xd, xs, acc);
+    else q8_0_soa_block<NCOL>(rp, b, K, xw, xd, acc);
+}
+template <WFmt F>
+__device__ __forceinline__ const uint8_t* row_ptr(const uint8_t* W, int row, int K) {
+    if constexpr (F == WFmt::Q4_K) return FmtQ4K::row(W, row, K);
+    else if constexpr (F == WFmt::Q5_K) return FmtQ5K::row(W, row, K);
+    else if constexpr (F == WFmt::IQ4_XS) return FmtIQ4XS::row(W, row, K);
+    else if constexpr (F == WFmt::Q6_K_SOA) return W + (size_t)row * ((size_t)K * 210 / 256);
+    else if constexpr (F == WFmt::Q5_1_SOA) return W + (size_t)row * ((size_t)K * 24 / 32);
+    else return W + (size_t)row * ((size_t)K + K / 16);
+}
+
+// Direct: x words read from global (L1/L2). Rows in a wave share x addresses.
+template <WFmt F, int TPR, int NCOL>
+__global__ void __launch_bounds__(256) k_gemv_q8(const uint8_t* __restrict__ W, const int8_t* __restrict__ xq,
+                                                 const float* __restrict__ xd, const float* __restrict__ xs,
+                                                 float* __restrict__ y, int N, int K) {
+    constexpr int ROWS = 256 / TPR;
+    const int tid = threadIdx.x, lane = tid % TPR, r = tid / TPR;
+    const int nb = (K + 255) / 256, nsb = K / 32, nblk = (N + ROWS - 1) / ROWS;
+    for (int vb = blockIdx.x; vb < nblk; vb += gridDim.x) {   // persistent: loop over row-blocks
+        const int row = vb * ROWS + r;
+        if (row >= N) break;
+        const uint8_t* rp = row_ptr<F>(W, row, K);
+        float acc[NCOL];
+#pragma unroll
+        for (int c = 0; c < NCOL; ++c) acc[c] = 0.f;
+        for (int b = lane; b < nb; b += TPR) {
+            const uint32_t* xw[NCOL]; const float* cxd[NCOL]; const float* cxs[NCOL];
+#pragma unroll
+            for (int c = 0; c < NCOL; ++c) { xw[c] = (const uint32_t*)(xq + (size_t)c * K + b * 256); cxd[c] = xd + (size_t)c * nsb + b * 8; cxs[c] = xs + (size_t)c * nsb + b * 8; }
+            dispatch_block<F, NCOL>(rp, b, K, xw, cxd, cxs, acc);
+        }
+#pragma unroll
+        for (int c = 0; c < NCOL; ++c) {
+#pragma unroll
+            for (int off = TPR / 2; off > 0; off >>= 1) acc[c] += __shfl_xor(acc[c], off, TPR);
+        }
+        if (lane == 0) {
+#pragma unroll
+            for (int c = 0; c < NCOL; ++c) y[(size_t)c * N + row] = acc[c];
+        }
+    }
+}
+
+// LDS-staged: per iteration the 256 threads cover TPR consecutive blocks (same for every row);
+// stage those TPR*NCOL*256 int8 (+ scales) in LDS once, then read x words from LDS.
+template <WFmt F, int TPR, int NCOL>
+__global__ void __launch_bounds__(256) k_gemv_q8_lds(const uint8_t* __restrict__ W, const int8_t* __restrict__ xq,
+                                                     const float* __restrict__ xd, const float* __restrict__ xs,
+                                                     float* __restrict__ y, int N, int K) {
+    constexpr int ROWS = 256 / TPR;
+    __shared__ __align__(16) int8_t sx[NCOL][TPR * 256];
+    __shared__ float sd[NCOL][TPR * 8], ss[NCOL][TPR * 8];
+    const int tid = threadIdx.x, lane = tid % TPR, r = tid / TPR;
+    const int row = min(blockIdx.x * ROWS + r, N - 1);
+    const int nb = (K + 255) / 256, nsb = K / 32;
+    const uint8_t* rp = row_ptr<F>(W, row, K);
+    float acc[NCOL];
+#pragma unroll
+    for (int c = 0; c < NCOL; ++c) acc[c] = 0.f;
+    for (int b0 = 0; b0 < nb; b0 += TPR) {
+        __syncthreads();
+        for (int i = tid; i < NCOL * TPR * 16; i += 256) {
+            const int c = i / (TPR * 16), o = i % (TPR * 16);
+            if (b0 * 256 + o * 16 < K) ((uint4*)sx[c])[o] = *(const uint4*)(xq + (size_t)c * K + b0 * 256 + o * 16);
+        }
+        for (int i = tid; i < NCOL * TPR * 8; i += 256) {
+            const int c = i / (TPR * 8), o = i % (TPR * 8);
+            if (b0 * 8 + o < nsb) { sd[c][o] = xd[(size_t)c * nsb + b0 * 8 + o]; ss[c][o] = xs[(size_t)c * nsb + b0 * 8 + o]; }
+        }
+        __syncthreads();
+        const int b = b0 + lane;
+        if (b < nb) {
+            const uint32_t* xw[NCOL]; const float* cxd[NCOL]; const float* cxs[NCOL];
+#pragma unroll
+            for (int c = 0; c < NCOL; ++c) { xw[c] = (const uint32_t*)(sx[c] + lane * 256); cxd[c] = sd[c] + lane * 8; cxs[c] = ss[c] + lane * 8; }
+            dispatch_block<F, NCOL>(rp, b, K, xw, cxd, cxs, acc);
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < NCOL; ++c) {
+#pragma unroll
+        for (int off = TPR / 2; off > 0; off >>= 1) acc[c] += __shfl_xor(acc[c], off, TPR);
+    }
+    if (lane == 0 && blockIdx.x * ROWS + r < N) {
+#pragma unroll
+        for (int c = 0; c < NCOL; ++c) y[(size_t)c * N + row] = acc[c];
+    }
+}
+
+// ======================= WMMA (tensor core) variant for 8..16 columns =======================
+// One wave = 16 weight rows; block = 8 waves = 128 rows. x is [16][K] int8 (columns >= ncol zero).
+// RDNA3 wave32 iu8 WMMA: each operand fragment = 16 int8 of row (lane%16), lanes 16-31 mirror lanes 0-15;
+// D = 8 int32 per lane: index into the 2nd operand = lane%16, index into the 1st operand = 2*l + lane/16 (probed).
+typedef int int32x4_t __attribute__((ext_vector_type(4)));
+typedef int int32x8_t __attribute__((ext_vector_type(8)));
+
+template <int TILES>   // row tiles (of 16) per wave
+__global__ void __launch_bounds__(256) k_gemv_q4_K_wmma(const uint8_t* __restrict__ W, const int8_t* __restrict__ xq,
+                                                        const float* __restrict__ xd, const float* __restrict__ xs,
+                                                        float* __restrict__ y, int N, int K, int ncol) {
+    const int lane = threadIdx.x % 32, wave = threadIdx.x / 32;
+    const int r16 = lane % 16, half = lane / 16;
+    const int nb = K / 256, nsb = K / 32;
+    const int row_base = (blockIdx.x * 8 + wave) * (16 * TILES);
+    float acc[TILES][8];
+#pragma unroll
+    for (int t = 0; t < TILES; ++t)
+#pragma unroll
+        for (int l = 0; l < 8; ++l) acc[t][l] = 0.f;
+
+    for (int b = 0; b < nb; ++b) {
+        // B fragments for the 8 sub-blocks: column (lane%16), 16 bytes per k-step. Shared by all row tiles.
+        int32x4_t B[8][2];
+        const int8_t* xcol = xq + (size_t)r16 * K + b * 256;
+#pragma unroll
+        for (int sb = 0; sb < 8; ++sb) { B[sb][0] = *(const int32x4_t*)(xcol + sb * 32); B[sb][1] = *(const int32x4_t*)(xcol + sb * 32 + 16); }
+        // column scales for this lane's 8 output columns (2l + half)
+        float cxd[8], cxs[8];
+#pragma unroll
+        for (int t = 0; t < TILES; ++t) {
+            const int row = min(row_base + 16 * t + r16, N - 1);
+            const uint8_t* blk = W + ((size_t)row * nb + b) * 144;
+            uint4 v[9];
+#pragma unroll
+            for (int i = 0; i < 9; ++i) v[i] = ldw((const uint4*)blk + i);
+            const uint16_t* hdr = (const uint16_t*)&v[0];
+            const float d = h2f(hdr[0]), dmin = h2f(hdr[1]);
+            const uint8_t* scales = (const uint8_t*)&v[0] + 4;
+            const uint32_t* qw = (const uint32_t*)&v[1];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                uint8_t sc0, mn0, sc1, mn1; q4k_scales(scales, 2 * j, sc0, mn0, sc1, mn1);
+                int32x4_t A0lo, A1lo, A0hi, A1hi;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const uint32_t w0 = qw[8 * j + i], w1 = qw[8 * j + 4 + i];
+                    A0lo[i] = (int)(w0 & 0x0F0F0F0Fu); A1lo[i] = (int)(w1 & 0x0F0F0F0Fu);
+                    A0hi[i] = (int)((w0 >> 4) & 0x0F0F0F0Fu); A1hi[i] = (int)((w1 >> 4) & 0x0F0F0F0Fu);
+                }
+                int32x8_t C0 = {0, 0, 0, 0, 0, 0, 0, 0}, C1 = {0, 0, 0, 0, 0, 0, 0, 0};
+                // Probed on gfx1151: D lane layout is j = lane%16 from the SECOND operand, i = 2l + lane/16 from
+                // the first. Weights go second so each lane's 8 outputs share its own row (and scales).
+                C0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, B[2 * j][0], false, A0lo, C0, false);
+                C0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, B[2 * j][1], false, A1lo, C0, false);
+                C1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, B[2 * j + 1][0], false, A0hi, C1, false);
+                C1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, B[2 * j + 1][1], false, A1hi, C1, false);
+                const float d0 = d * sc0, m0 = dmin * mn0, d1 = d * sc1, m1 = dmin * mn1;
+                const int sb0 = b * 8 + 2 * j;
+#pragma unroll
+                for (int l = 0; l < 8; ++l) {
+                    const int col = 2 * l + half;
+                    const float xd0 = xd[(size_t)col * nsb + sb0], xs0 = xs[(size_t)col * nsb + sb0];
+                    const float xd1 = xd[(size_t)col * nsb + sb0 + 1], xs1 = xs[(size_t)col * nsb + sb0 + 1];
+                    acc[t][l] += d0 * xd0 * (float)C0[l] - m0 * xs0 + d1 * xd1 * (float)C1[l] - m1 * xs1;
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < TILES; ++t) {
+        const int row = row_base + 16 * t + r16;
+        if (row < N) {
+#pragma unroll
+            for (int l = 0; l < 8; ++l) { const int col = 2 * l + half; if (col < ncol) y[(size_t)col * N + row] = acc[t][l]; }
+        }
+    }
+}
+
+// ======================= multi-segment GEMV (ncol = 1) =======================
+struct SegDev { const uint8_t* w; float* y; int N, K, fmt, block0; };
+struct SegArgs { SegDev s[4]; int n; };
+
+template <WFmt F, int TPR>
+__device__ __forceinline__ float gemv_row_1(const uint8_t* __restrict__ W, const int8_t* __restrict__ xq, const float* __restrict__ xd,
+                                            const float* __restrict__ xs, int K, int row, int lane) {
+    const int nb = (K + 255) / 256;
+    const uint8_t* rp = row_ptr<F>(W, row, K);
+    float acc[1] = {0.f};
+    for (int b = lane; b < nb; b += TPR) {
+        const uint32_t* xw[1] = {(const uint32_t*)(xq + b * 256)}; const float* cxd[1] = {xd + b * 8}; const float* cxs[1] = {xs + b * 8};
+        dispatch_block<F, 1>(rp, b, K, xw, cxd, cxs, acc);
+    }
+#pragma unroll
+    for (int off = TPR / 2; off > 0; off >>= 1) acc[0] += __shfl_xor(acc[0], off, TPR);
+    return acc[0];
+}
+
+template <int TPR>
+__global__ void __launch_bounds__(256) k_gemv_multi(SegArgs a, const int8_t* __restrict__ xq, const float* __restrict__ xd, const float* __restrict__ xs) {
+    constexpr int ROWS = 256 / TPR;
+    const int nblk = a.s[a.n - 1].block0 + (a.s[a.n - 1].N + ROWS - 1) / ROWS;
+    for (int vb = blockIdx.x; vb < nblk; vb += gridDim.x) {
+    int si = 0;
+#pragma unroll
+    for (int i = 1; i < 4; ++i) if (i < a.n && vb >= a.s[i].block0) si = i;
+    const SegDev sg = a.s[si];
+    const int lane = threadIdx.x % TPR, row = (vb - sg.block0) * ROWS + threadIdx.x / TPR;
+    if (row >= sg.N) continue;
+    float v;
+    switch (sg.fmt) {
+        case (int)WFmt::Q4_K:     v = gemv_row_1<WFmt::Q4_K, TPR>(sg.w, xq, xd, xs, sg.K, row, lane); break;
+        case (int)WFmt::Q5_K:     v = gemv_row_1<WFmt::Q5_K, TPR>(sg.w, xq, xd, xs, sg.K, row, lane); break;
+        case (int)WFmt::IQ4_XS:   v = gemv_row_1<WFmt::IQ4_XS, TPR>(sg.w, xq, xd, xs, sg.K, row, lane); break;
+        case (int)WFmt::Q6_K_SOA: v = gemv_row_1<WFmt::Q6_K_SOA, TPR>(sg.w, xq, xd, xs, sg.K, row, lane); break;
+        case (int)WFmt::Q5_1_SOA: v = gemv_row_1<WFmt::Q5_1_SOA, TPR>(sg.w, xq, xd, xs, sg.K, row, lane); break;
+        default:                  v = gemv_row_1<WFmt::Q8_0_SOA, TPR>(sg.w, xq, xd, xs, sg.K, row, lane); break;
+    }
+    if (lane == 0) sg.y[row] = v;
+    }
+}
+
+// ======================= MoE expert GEMV: y[(t,e)][N] = W[ids[t*nexp+e]] . x[xrow(t,e)] =======================
+// xrow: XROW_T -> x row t (gate/up: input is the token), XROW_TE -> x row t*nexp+e (down: input is per (t,e))
+// NSEG weight tensors (e.g. gate|up) of identical shape: segment g uses W[g], writes y[g]. ids[te] < 0 selects a
+// "shared" slot: the weights at shared[g] (a single expert-shaped matrix), x row t.
+// FS: format of the shared-expert matrices (Q8_0 in the UD-Q4_K_XL checkpoint while the routed experts are Q4_K / Q5_1).
+// a.slotw != null (down-projection): y[t][row] += slotw[te] * dot, atomically (the MoE combine; y zeroed by the caller).
+template <WFmt F, WFmt FS, int TPR, bool XROW_TE>
+__global__ void __launch_bounds__(256) k_gemv_moe(MoeSegs a, int nseg, const int* __restrict__ ids, int nexp,
+                                                  const int8_t* __restrict__ xq, const float* __restrict__ xd, const float* __restrict__ xs, int N, int K) {
+    constexpr int ROWS = 256 / TPR;
+    const int nrb = (N + ROWS - 1) / ROWS;
+    const int bx = blockIdx.x % (nrb * nseg), te = blockIdx.x / (nrb * nseg);   // 1D grid, te-major
+    const int seg = bx / nrb, rb = bx % nrb;
+    const int t = te / nexp;
+    const int lane = threadIdx.x % TPR, row = rb * ROWS + threadIdx.x / TPR;
+    if (row >= N) return;
+    const int id = ids[te];
+    const int xr = XROW_TE ? te : t, nsb = K / 32;
+    const int8_t* xqr = xq + (size_t)xr * K; const float* xdr = xd + (size_t)xr * nsb; const float* xsr = xs + (size_t)xr * nsb;
+    float v;
+    if (id >= 0) v = gemv_row_1<F, TPR>((const uint8_t*)a.w[seg] + (size_t)id * a.ebytes, xqr, xdr, xsr, K, row, lane);
+    else v = gemv_row_1<FS, TPR>((const uint8_t*)a.shared[seg], xqr, xdr, xsr, K, row, lane);
+    if (lane == 0) {
+        if (a.slotw) atomicAdd(a.y[seg] + (size_t)t * N + row, a.slotw[te] * v);
+        else a.y[seg][(size_t)te * N + row] = v;
+    }
+}
+template <WFmt F, WFmt FS, int TPR, bool XT> static void launch_moe2(const MoeSegs& a, int nseg, const int* ids, int nexp, XQ8 x, int N, int K, int T, hipStream_t s) {
+    constexpr int ROWS = 256 / TPR;
+    const int grid = nseg * ((N + ROWS - 1) / ROWS) * T * nexp;
+    k_gemv_moe<F, FS, TPR, XT><<<grid, 256, 0, s>>>(a, nseg, ids, nexp, x.q, x.d, x.s, N, K);
+}
+template <WFmt F, WFmt FS> static void launch_moe(const MoeSegs& a, int nseg, const int* ids, int nexp, XQ8 x, int N, int K, int T, bool xrow_te, hipStream_t s) {
+    // bench_gemv on the Flash-Next expert tensors (docs/decode-flash-next.md): K=640 Q5_1 -> 8 lanes/row (224 GB/s;
+    // 4 lanes 207, 32 lanes 107); K=2560 Q4_K -> 32 (233; all of 8..32 within 2%).
+    int tpr = K / 256 < 8 ? 16 : 32;   // gather bench: K=640 16 lanes 152 GB/s, 8 lanes 144, 4 lanes 97, 32 lanes 95
+    if (g_moe_tpr) tpr = g_moe_tpr;
+    #define LM(TP) if (xrow_te) launch_moe2<F, FS, TP, true>(a, nseg, ids, nexp, x, N, K, T, s); else launch_moe2<F, FS, TP, false>(a, nseg, ids, nexp, x, N, K, T, s)
+    switch (tpr) { case 1: LM(1); break; case 2: LM(2); break; case 4: LM(4); break; case 8: LM(8); break; case 16: LM(16); break; default: LM(32); break; }
+    #undef LM
+}
+
+// ======================= interleaved layout (experiment) =======================
+// Layout: rows grouped by 8; within a group blocks are stored [b][r%8] so that the 32 lanes of a wave
+// read 32 consecutive blocks (4 blocks x 8 rows). Lane l -> row l%8, blocks it*4 + l/8.
+template <WFmt F> struct IlFmt;   // block-pointer decoders (GGUF block layouts only)
+template <> struct IlFmt<WFmt::Q4_K> { static constexpr int BB = 144; };
+template <> struct IlFmt<WFmt::Q5_K> { static constexpr int BB = 176; };
+template <> struct IlFmt<WFmt::IQ4_XS> { static constexpr int BB = 136; };
+
+template <WFmt F, int NCOL>
+__device__ __forceinline__ void il_block(const uint8_t* blk, const uint32_t* const* xw, const float* const* xd, const float* const* xs, float* acc) {
+    // reuse the row decoders by pointing them at the block with b = 0
+    if constexpr (F == WFmt::Q4_K) FmtQ4K::block<NCOL>(blk, 0, xw, xd, xs, acc);
+    else if constexpr (F == WFmt::Q5_K) FmtQ5K::block<NCOL>(blk, 0, xw, xd, xs, acc);
+    else FmtIQ4XS::block<NCOL>(blk, 0, xw, xd, xs, acc);
+}
+
+template <WFmt F, int NCOL>
+__global__ void __launch_bounds__(256) k_gemv_il(const uint8_t* __restrict__ W, const int8_t* __restrict__ xq, const float* __restrict__ xd,
+                                                 const float* __restrict__ xs, float* __restrict__ y, int N, int K) {
+    constexpr int BB = IlFmt<F>::BB;
+    const int lane = threadIdx.x % 32, wave = threadIdx.x / 32;
+    const int group = blockIdx.x * 8 + wave;            // 8 groups (64 rows) per block
+    const int row = group * 8 + lane % 8;
+    const int nb = K / 256, nsb = K / 32;
+    if (group * 8 >= N) return;
+    const uint8_t* gb = W + (size_t)group * 8 * nb * BB;
+    float acc[NCOL];
+#pragma unroll
+    for (int c = 0; c < NCOL; ++c) acc[c] = 0.f;
+    for (int b = lane / 8; b < nb; b += 4) {
+        const uint8_t* blk = gb + ((size_t)b * 8 + lane % 8) * BB;
+        const uint32_t* xw[NCOL]; const float* cxd[NCOL]; const float* cxs[NCOL];
+#pragma unroll
+        for (int c = 0; c < NCOL; ++c) { xw[c] = (const uint32_t*)(xq + (size_t)c * K + b * 256); cxd[c] = xd + (size_t)c * nsb + b * 8; cxs[c] = xs + (size_t)c * nsb + b * 8; }
+        il_block<F, NCOL>(blk, xw, cxd, cxs, acc);
+    }
+    // reduce over the 4 lanes sharing a row: lanes l, l+8, l+16, l+24
+#pragma unroll
+    for (int c = 0; c < NCOL; ++c) { acc[c] += __shfl_xor(acc[c], 8, 32); acc[c] += __shfl_xor(acc[c], 16, 32); }
+    if (lane < 8 && row < N) {
+#pragma unroll
+        for (int c = 0; c < NCOL; ++c) y[(size_t)c * N + row] = acc[c];
+    }
+}
+
+// ---------------- Q4_K x f32 (baseline; kept for the record) ----------------
+template <int TPR, int NCOL>
+__global__ void __launch_bounds__(256) k_gemv_q4_K_f32(const uint8_t* __restrict__ W, const float* __restrict__ x, float* __restrict__ y, int N, int K) {
+    constexpr int ROWS = 256 / TPR;
+    const int tid = threadIdx.x, lane = tid % TPR, r = tid / TPR;
+    const int row = blockIdx.x * ROWS + r;
+    if (row >= N) return;
+    const int nb = K / 256;
+    const uint8_t* wrow = W + (size_t)row * nb * 144;
+    float acc[NCOL];
+#pragma unroll
+    for (int c = 0; c < NCOL; ++c) acc[c] = 0.f;
+    for (int b = lane; b < nb; b += TPR) {
+        const uint8_t* blk = wrow + (size_t)b * 144;
+        uint4 v[9];
+#pragma unroll
+        for (int i = 0; i < 9; ++i) v[i] = ldw((const uint4*)blk + i);
+        const uint16_t* hdr = (const uint16_t*)&v[0];
+        const float d = h2f(hdr[0]), dmin = h2f(hdr[1]);
+        const uint8_t* scales = (const uint8_t*)&v[0] + 4;
+        const uint8_t* qs = (const uint8_t*)&v[1];
+        const float* xb = x + b * 256;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            uint8_t sc0, mn0, sc1, mn1; q4k_scales(scales, 2 * j, sc0, mn0, sc1, mn1);
+            const float d0 = d * sc0, m0 = dmin * mn0, d1 = d * sc1, m1 = dmin * mn1;
+            const uint8_t* q = qs + 32 * j;
+#pragma unroll
+            for (int c = 0; c < NCOL; ++c) {
+                const float* xc = xb + (size_t)c * K + 64 * j;
+                float s0 = 0.f, s1 = 0.f, sx0 = 0.f, sx1 = 0.f;
+#pragma unroll
+                for (int l = 0; l < 32; ++l) { const float x0 = xc[l], x1 = xc[32 + l]; s0 += x0 * (q[l] & 0xF); s1 += x1 * (q[l] >> 4); sx0 += x0; sx1 += x1; }
+                acc[c] += d0 * s0 - m0 * sx0 + d1 * s1 - m1 * sx1;
+            }
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < NCOL; ++c) { for (int off = TPR / 2; off > 0; off >>= 1) acc[c] += __shfl_xor(acc[c], off, TPR); }
+    if (lane == 0) { for (int c = 0; c < NCOL; ++c) y[(size_t)c * N + row] = acc[c]; }
+}
+
+#define NCOL_SWITCH(KERNEL, ...) \
+    switch (ncol) { \
+        case 1: KERNEL<1><<<grid, 256, 0, s>>>(__VA_ARGS__); break; case 2: KERNEL<2><<<grid, 256, 0, s>>>(__VA_ARGS__); break; \
+        case 3: KERNEL<3><<<grid, 256, 0, s>>>(__VA_ARGS__); break; case 4: KERNEL<4><<<grid, 256, 0, s>>>(__VA_ARGS__); break; \
+        case 5: KERNEL<5><<<grid, 256, 0, s>>>(__VA_ARGS__); break; case 6: KERNEL<6><<<grid, 256, 0, s>>>(__VA_ARGS__); break; \
+        case 7: KERNEL<7><<<grid, 256, 0, s>>>(__VA_ARGS__); break; case 8: KERNEL<8><<<grid, 256, 0, s>>>(__VA_ARGS__); break; }
+
+template <WFmt F, int TPR> void launch_fmt(const void* W, XQ8 x, float* y, int N, int K, int ncol, bool lds, hipStream_t s) {
+    constexpr int ROWS = 256 / TPR;
+    int grid = (N + ROWS - 1) / ROWS;
+    if (!lds && g_persist_blocks > 0 && grid > g_persist_blocks) grid = g_persist_blocks;
+    #define KD(NC) k_gemv_q8<F, TPR, NC><<<grid, 256, 0, s>>>((const uint8_t*)W, x.q, x.d, x.s, y, N, K)
+    #define KL(NC) k_gemv_q8_lds<F, TPR, NC><<<grid, 256, 0, s>>>((const uint8_t*)W, x.q, x.d, x.s, y, N, K)
+    if constexpr (TPR <= 8) { if (lds) { switch (ncol) { case 1: KL(1); break; case 2: KL(2); break; case 3: KL(3); break; case 4: KL(4); break; case 5: KL(5); break; case 6: KL(6); break; case 7: KL(7); break; case 8: KL(8); break; } return; } }
+    { switch (ncol) { case 1: KD(1); break; case 2: KD(2); break; case 3: KD(3); break; case 4: KD(4); break; case 5: KD(5); break; case 6: KD(6); break; case 7: KD(7); break; case 8: KD(8); break; } }
+    #undef KD
+    #undef KL
+}
+template <WFmt F> void launch_tpr(const void* W, XQ8 x, float* y, int N, int K, int ncol, int tpr, int rpt, hipStream_t s) {
+    const bool lds = rpt == 3;
+    if (lds && tpr > 8) tpr = 8;
+    switch (tpr) { case 1: launch_fmt<F, 1>(W, x, y, N, K, ncol, lds, s); break; case 2: launch_fmt<F, 2>(W, x, y, N, K, ncol, lds, s); break;
+                   case 4: launch_fmt<F, 4>(W, x, y, N, K, ncol, lds, s); break; case 8: launch_fmt<F, 8>(W, x, y, N, K, ncol, lds, s); break;
+                   case 16: launch_fmt<F, 16>(W, x, y, N, K, ncol, lds, s); break; default: launch_fmt<F, 32>(W, x, y, N, K, ncol, lds, s); break; }
+}
+template <int TPR> void launch_f32(const void* W, const float* x, float* y, int N, int K, int ncol, hipStream_t s) {
+    const int grid = (N + 256 / TPR - 1) / (256 / TPR);
+    #define KF(NC) k_gemv_q4_K_f32<TPR, NC>
+    switch (ncol) {
+        case 1: KF(1)<<<grid, 256, 0, s>>>((const uint8_t*)W, x, y, N, K); break; case 2: KF(2)<<<grid, 256, 0, s>>>((const uint8_t*)W, x, y, N, K); break;
+        case 3: KF(3)<<<grid, 256, 0, s>>>((const uint8_t*)W, x, y, N, K); break; case 4: KF(4)<<<grid, 256, 0, s>>>((const uint8_t*)W, x, y, N, K); break;
+        default: KF(8)<<<grid, 256, 0, s>>>((const uint8_t*)W, x, y, N, K); break;
+    }
+    #undef KF
+}
+}  // namespace
+
+void quantize_x_q8(const float* x, XQ8 out, int ncol, int K, hipStream_t s) {
+    dim3 grid((K / 32 + 7) / 8, ncol);
+    k_quantize_x_q8<<<grid, 256, 0, s>>>(x, out.q, out.d, out.s, K);
+}
+size_t wfmt_row_bytes(WFmt f, int K) {
+    switch (f) { case WFmt::Q4_K: return (size_t)K / 256 * 144; case WFmt::Q5_K: return (size_t)K / 256 * 176; case WFmt::IQ4_XS: return (size_t)K / 256 * 136;
+                 case WFmt::Q6_K_SOA: return (size_t)K * 210 / 256; case WFmt::Q5_1_SOA: return (size_t)K * 24 / 32; default: return (size_t)K + K / 16; }
+}
+void repack_row_q6_K(const uint8_t* src, uint8_t* dst, int K) {
+    const int nb = K / 256;
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t* blk = src + (size_t)b * 210;
+        memcpy(dst + (size_t)b * 128, blk, 128);
+        memcpy(dst + (size_t)nb * 128 + (size_t)b * 64, blk + 128, 64);
+        memcpy(dst + (size_t)nb * 192 + (size_t)b * 16, blk + 192, 16);
+        memcpy(dst + (size_t)nb * 208 + (size_t)b * 2, blk + 208, 2);
+    }
+}
+void repack_row_q8_0(const uint8_t* src, uint8_t* dst, int K) {
+    const int nb = K / 32;
+    for (int b = 0; b < nb; ++b) { memcpy(dst + (size_t)K + b * 2, src + (size_t)b * 34, 2); memcpy(dst + (size_t)b * 32, src + (size_t)b * 34 + 2, 32); }
+}
+void gemv_multi(const GemvSeg* segs, int nseg, XQ8 x, hipStream_t s) {
+    constexpr int TPR = 32, ROWS = 256 / TPR;
+    SegArgs a; a.n = nseg; int blocks = 0;
+    for (int i = 0; i < nseg; ++i) { a.s[i] = {(const uint8_t*)segs[i].w, segs[i].y, segs[i].N, segs[i].K, (int)segs[i].fmt, blocks}; blocks += (segs[i].N + ROWS - 1) / ROWS; }
+    for (int i = nseg; i < 4; ++i) a.s[i] = a.s[nseg - 1];
+    if (g_persist_blocks > 0 && blocks > g_persist_blocks) blocks = g_persist_blocks;
+    k_gemv_multi<TPR><<<blocks, 256, 0, s>>>(a, x.q, x.d, x.s);
+}
+// experiment: interleaved layout (rpt == 5). Weights must have been repacked with repack_interleave8.
+template <WFmt F> static void launch_il(const void* W, XQ8 x, float* y, int N, int K, int ncol, hipStream_t s) {
+    const int grid = (N + 63) / 64;
+    #define KI(NC) k_gemv_il<F, NC><<<grid, 256, 0, s>>>((const uint8_t*)W, x.q, x.d, x.s, y, N, K)
+    switch (ncol) { case 1: KI(1); break; case 2: KI(2); break; case 3: KI(3); break; case 4: KI(4); break; default: KI(8); break; }
+    #undef KI
+}
+void gemv_moe(WFmt f, WFmt fs, const MoeSegs& a, int nseg, const int* ids, int nexp, XQ8 x, int N, int K, int T, bool xrow_te, hipStream_t s) {
+    if (fs != WFmt::Q8_0_SOA && fs != f) { fprintf(stderr, "gemv_moe: unsupported shared-expert format\n"); abort(); }
+    const bool s8 = fs == WFmt::Q8_0_SOA;
+    switch (f) {
+        case WFmt::Q4_K: if (s8) launch_moe<WFmt::Q4_K, WFmt::Q8_0_SOA>(a, nseg, ids, nexp, x, N, K, T, xrow_te, s); else launch_moe<WFmt::Q4_K, WFmt::Q4_K>(a, nseg, ids, nexp, x, N, K, T, xrow_te, s); break;
+        case WFmt::Q5_1_SOA: if (s8) launch_moe<WFmt::Q5_1_SOA, WFmt::Q8_0_SOA>(a, nseg, ids, nexp, x, N, K, T, xrow_te, s); else launch_moe<WFmt::Q5_1_SOA, WFmt::Q5_1_SOA>(a, nseg, ids, nexp, x, N, K, T, xrow_te, s); break;
+        case WFmt::Q8_0_SOA: launch_moe<WFmt::Q8_0_SOA, WFmt::Q8_0_SOA>(a, nseg, ids, nexp, x, N, K, T, xrow_te, s); break;
+        default: if (s8) launch_moe<WFmt::Q5_K, WFmt::Q8_0_SOA>(a, nseg, ids, nexp, x, N, K, T, xrow_te, s); else launch_moe<WFmt::Q5_K, WFmt::Q5_K>(a, nseg, ids, nexp, x, N, K, T, xrow_te, s); break;
+    }
+}
+// split-K GEMV for skinny weights (few rows, long K): grid = row-blocks x KSPLIT, partial sums atomically added to y (y must be zeroed)
+template <WFmt F, int TPR>
+__global__ void __launch_bounds__(256) k_gemv_splitk(const uint8_t* __restrict__ W, const int8_t* __restrict__ xq, const float* __restrict__ xd, const float* __restrict__ xs,
+                                                     float* __restrict__ y, int N, int K, int ksplit) {
+    constexpr int ROWS = 256 / TPR;
+    const int nrb = (N + ROWS - 1) / ROWS, rb = blockIdx.x % nrb, ks = blockIdx.x / nrb;
+    const int lane = threadIdx.x % TPR, row = rb * ROWS + threadIdx.x / TPR;
+    if (row >= N) return;
+    const int nb = (K + 255) / 256, b0 = ks * nb / ksplit, b1 = (ks + 1) * nb / ksplit;
+    const uint8_t* rp = row_ptr<F>(W, row, K);
+    float acc[1] = {0.f};
+    for (int b = b0 + lane; b < b1; b += TPR) {
+        const uint32_t* xw[1] = {(const uint32_t*)(xq + b * 256)}; const float* cxd[1] = {xd + b * 8}; const float* cxs[1] = {xs + b * 8};
+        dispatch_block<F, 1>(rp, b, K, xw, cxd, cxs, acc);
+    }
+#pragma unroll
+    for (int off = TPR / 2; off > 0; off >>= 1) acc[0] += __shfl_xor(acc[0], off, TPR);
+    if (lane == 0) atomicAdd(y + row, acc[0]);
+}
+void gemv_splitk(WFmt f, const void* W, XQ8 x, float* y, int N, int K, int ksplit, bool zero, hipStream_t s) {
+    if (zero) hipMemsetAsync(y, 0, (size_t)N * 4, s);
+    const int grid = ((N + 7) / 8) * ksplit;   // 8 rows per block
+    switch (f) {
+        case WFmt::Q8_0_SOA: k_gemv_splitk<WFmt::Q8_0_SOA, 32><<<grid, 256, 0, s>>>((const uint8_t*)W, x.q, x.d, x.s, y, N, K, ksplit); break;
+        case WFmt::Q4_K: k_gemv_splitk<WFmt::Q4_K, 32><<<grid, 256, 0, s>>>((const uint8_t*)W, x.q, x.d, x.s, y, N, K, ksplit); break;
+        default: k_gemv_splitk<WFmt::Q6_K_SOA, 32><<<grid, 256, 0, s>>>((const uint8_t*)W, x.q, x.d, x.s, y, N, K, ksplit); break;
+    }
+}
+void repack_interleave8(WFmt f, const uint8_t* src, uint8_t* dst, int N, int K) {
+    const int bb = f == WFmt::Q4_K ? 144 : f == WFmt::Q5_K ? 176 : 136, nb = K / 256;
+    for (int r = 0; r < N; ++r) for (int b = 0; b < nb; ++b)
+        memcpy(dst + (((size_t)(r / 8) * 8 * nb) + (size_t)b * 8 + r % 8) * bb, src + ((size_t)r * nb + b) * bb, bb);
+}
+void repack_row_q5_1(const uint8_t* src, uint8_t* dst, int K) {
+    const int nb = K / 32;
+    for (int b = 0; b < nb; ++b) {
+        const uint8_t* blk = src + (size_t)b * 24;   // d(2) m(2) qh(4) qs(16)
+        memcpy(dst + (size_t)K / 2 + K / 8 + b * 2, blk, 2); memcpy(dst + (size_t)K / 2 + K / 8 + K / 16 + b * 2, blk + 2, 2);
+        memcpy(dst + (size_t)K / 2 + b * 4, blk + 4, 4); memcpy(dst + (size_t)b * 16, blk + 8, 16);
+    }
+}
+void gemv_q8(WFmt f, const void* W, XQ8 x, float* y, int N, int K, int ncol, int tpr, int rpt, hipStream_t s) {
+    if (rpt == 5) {
+        if (f == WFmt::Q4_K) launch_il<WFmt::Q4_K>(W, x, y, N, K, ncol, s);
+        else if (f == WFmt::Q5_K) launch_il<WFmt::Q5_K>(W, x, y, N, K, ncol, s);
+        else launch_il<WFmt::IQ4_XS>(W, x, y, N, K, ncol, s);
+        return;
+    }
+    if (rpt == 4) {   // WMMA path, Q4_K only for now; tpr reused as TILES (1/2)
+        if (tpr == 2) k_gemv_q4_K_wmma<2><<<(N + 255) / 256, 256, 0, s>>>((const uint8_t*)W, x.q, x.d, x.s, y, N, K, ncol);
+        else          k_gemv_q4_K_wmma<1><<<(N + 127) / 128, 256, 0, s>>>((const uint8_t*)W, x.q, x.d, x.s, y, N, K, ncol);
+        return;
+    }
+    switch (f) {
+        case WFmt::Q4_K: launch_tpr<WFmt::Q4_K>(W, x, y, N, K, ncol, tpr, rpt, s); break;
+        case WFmt::Q5_K: launch_tpr<WFmt::Q5_K>(W, x, y, N, K, ncol, tpr, rpt, s); break;
+        case WFmt::IQ4_XS: launch_tpr<WFmt::IQ4_XS>(W, x, y, N, K, ncol, tpr, rpt, s); break;
+        case WFmt::Q6_K_SOA: launch_tpr<WFmt::Q6_K_SOA>(W, x, y, N, K, ncol, tpr, rpt, s); break;
+        case WFmt::Q8_0_SOA: launch_tpr<WFmt::Q8_0_SOA>(W, x, y, N, K, ncol, tpr, rpt, s); break;
+        case WFmt::Q5_1_SOA: launch_tpr<WFmt::Q5_1_SOA>(W, x, y, N, K, ncol, tpr, rpt, s); break;
+    }
+}
+void gemv_q4_K_f32(const void* W, const float* x, float* y, int N, int K, int ncol, int tpr, hipStream_t s) {
+    switch (tpr) { case 4: launch_f32<4>(W, x, y, N, K, ncol, s); break; case 8: launch_f32<8>(W, x, y, N, K, ncol, s); break;
+                   case 16: launch_f32<16>(W, x, y, N, K, ncol, s); break; default: launch_f32<32>(W, x, y, N, K, ncol, s); break; }
+}
+}  // namespace hip
