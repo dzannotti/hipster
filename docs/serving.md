@@ -80,3 +80,6 @@ with the measured policy n=2 / n=1 / 0 for 1 / 2 / ≥3 active slots (docs/decod
 1 request 43.7 t/s, 2 concurrent 48.1 aggregate (24.8 / 25.5), 4 concurrent 50.8 aggregate (13–17 each), every output
 identical to the plain-batched and solo runs. The fix behind it: Flash-Next decode attention used a different key-split
 count above 8 rows, which broke exactness for any multi-slot pass with more than 8 rows.
+
+Client disconnects: an `emit` that fails (socket gone) marks the job and the scheduler finishes it at the end of the
+round, freeing the slot (a 3000-token streaming request killed after 2 s: the next request was served 0.7 s later).

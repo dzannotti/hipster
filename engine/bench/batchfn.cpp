@@ -27,6 +27,23 @@ int main(int argc, char** argv) {
     const int n_gen = argc > 3 ? atoi(argv[3]) : 64, S = argc > 4 ? atoi(argv[4]) : 4;
     hip::Qwen4Exp m(argv[1], 8192, S);
     std::vector<int> ids(64 * 16); std::vector<float> vals(64 * 16);
+    if (getenv("LONG")) {   // LONG=<ref.json with a long prompt>: prefill (GEMM path) per slot, then lockstep decode vs each slot's single-slot run
+        std::ifstream lf(getenv("LONG")); std::stringstream lb; lb << lf.rdbuf(); auto lp = parse_ids(lb.str(), "prompt_ids");
+        const int P = (int)lp.size(); const int chunk = 2048;
+        hip::Qwen4Exp ml(argv[1], (P + 4096 + 1023) / 1024 * 1024, S, chunk);
+        std::vector<std::vector<int>> ref(S); std::vector<std::vector<int>> pr(S); for (int s = 0; s < S; ++s) pr[s].assign(lp.begin() + s, lp.end());
+        for (int s = 0; s < S; ++s) { ml.reset(); int pos = 0; for (int c0 = 0; c0 < (int)pr[s].size(); c0 += chunk) { const int n = std::min(chunk, (int)pr[s].size() - c0); ml.prefill(&pr[s][c0], n, c0, 0); pos += n; }
+            ml.topk(ml.logits(), 1, 1, ids.data(), vals.data()); int cur = ids[0];
+            for (int i = 0; i < n_gen; ++i) { ref[s].push_back(cur); ml.forward(&cur, 1, pos++); ml.accept(1); ml.topk(ml.logits(), 1, 1, ids.data(), vals.data()); cur = ids[0]; } }
+        ml.reset(); std::vector<int> cur(S), pos(S); std::vector<std::vector<int>> st(S);
+        for (int s = 0; s < S; ++s) { for (int c0 = 0; c0 < (int)pr[s].size(); c0 += chunk) { const int n = std::min(chunk, (int)pr[s].size() - c0); ml.prefill(&pr[s][c0], n, c0, s); } ml.topk(ml.logits(), 1, 1, ids.data(), vals.data()); cur[s] = ids[0]; pos[s] = (int)pr[s].size(); }
+        std::vector<hip::SlotReq> rq(S); double t0 = now_ms();
+        for (int i = 0; i < n_gen; ++i) { for (int s = 0; s < S; ++s) { st[s].push_back(cur[s]); rq[s] = {s, &cur[s], 1, pos[s]}; } ml.forward(rq.data(), S); for (int s = 0; s < S; ++s) { ml.accept(s, 1); ++pos[s]; } ml.topk(ml.logits(), S, 1, ids.data(), vals.data()); for (int s = 0; s < S; ++s) cur[s] = ids[s]; }
+        const double dt = now_ms() - t0; int bad = 0;
+        for (int s = 0; s < S; ++s) { int mt = 0; for (int i = 0; i < n_gen; ++i) if (st[s][i] == ref[s][i]) ++mt; else break; if (mt != n_gen) { ++bad; printf("slot %d diverges at %d\n", s, mt); } }
+        printf("%d slots at %d-token prompts (GEMM prefill per slot): %.2f t/s aggregate; %s: %d/%d slots identical to their single-slot runs\n", S, P, S * n_gen * 1000.0 / dt, bad ? "MISMATCH" : "EXACT", S - bad, S);
+        return bad ? 1 : 0;
+    }
     if (getenv("ROWS_DIAG")) {   // which rows of a >8-row batched pass differ from the same rows in a single-slot pass?
         const int V = hip::FnDims::n_vocab; std::vector<int> toks(prompt.begin(), prompt.begin() + 9);
         for (auto Ts : std::vector<std::vector<int>>{{8, 1}, {1, 8}, {5, 4}, {4, 5}, {8, 2}, {2, 2, 2, 2, 1}, {7, 1}, {3, 3, 2}}) {
