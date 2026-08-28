@@ -6,13 +6,15 @@
 # Any ROCm 10.0.0 install with hipcc (AMD clang), hipBLASLt and rocprofv3 for gfx1151 works the same; pass it as IMG=… to build.sh.
 FROM ubuntu:24.04
 ARG DEBIAN_FRONTEND=noninteractive
+# apt keyring of stable.repo.amd.com (AMD MLSE DevOps, D0F004A0025A1145C7807FCD0701EAC4D5E02107; signing subkey FA296B056C5BB456),
+# exported from the original image — the key is not published at a stable URL.
+COPY tools/amdrocm.gpg.asc /tmp/amdrocm.gpg.asc
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg && \
-    install -m 0755 -d /etc/apt/keyrings && \
-    curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor -o /etc/apt/keyrings/amdrocm.gpg && \
+    install -m 0755 -d /etc/apt/keyrings && gpg --dearmor -o /etc/apt/keyrings/amdrocm.gpg /tmp/amdrocm.gpg.asc && \
     echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdrocm.gpg] https://stable.repo.amd.com/rocm/core/packages/ubuntu2404 stable main" > /etc/apt/sources.list.d/amdrocm.list && \
     apt-get update && apt-get install -y --no-install-recommends amdrocm10.0 amdrocm-core-sdk10.0 amdrocm-developer-tools10.0 amdrocm-profiler10.0 amdrocm-blas-dev10.0 amdrocm-llvm-dev10.0 && \
     apt-get install -y --no-install-recommends build-essential cmake git ninja-build pkg-config libssl-dev libcurl4-openssl-dev python3 && \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/* /tmp/amdrocm.gpg.asc
 ENV ROCM_PATH=/opt/rocm HIP_PATH=/opt/rocm LD_LIBRARY_PATH=/opt/rocm/lib PATH=/opt/rocm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     GPU_TARGETS=gfx1151 AMDGPU_TARGETS=gfx1151 ROCBLAS_USE_HIPBLASLT=1 AMD_LOG_LEVEL=0
 CMD ["/bin/bash"]
