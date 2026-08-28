@@ -56,5 +56,5 @@ Language: engine C++/HIP. Front-end: recommend Rust (`tokenizers`, `minijinja`, 
 - 27B verify GEMV at 8 columns: ~165 GB/s (K-quant epilogue); Q8_K activations prototype +8% on Q5_K (bench only); interleaved layout +3–15% on three formats. Both measured, neither adopted.
 - 27B with 3 slots: a 24-row verify needs two GEMV launches (≈2.3× a single pass for 3× the tokens) — does not pay; 2 slots is the sweet spot.
 - Prefix caching (multi-turn chat re-prefills the whole conversation); `stop` strings; `logprobs`.
-- Flash-Next: multi-slot exactness at long context (QSA beyond 2051 tokens) is tested for a 4K prompt (`batchfn LONG=…`); 262K not validated.
+- Flash-Next: multi-slot exactness at long context: `LONG=docs/ref/fn-long4k.json batchfn … 32 2` → EXACT, 42 t/s aggregate (QSA path, per-slot GEMM prefill); 262K not validated.
 - DFlash2 acceptance on prose is 15–30%: the draft is the limit there (adaptive n gains little because a 16-row verify costs ~the same as 8).

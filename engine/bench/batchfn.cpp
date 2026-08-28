@@ -25,12 +25,11 @@ int main(int argc, char** argv) {
     std::ifstream f(argv[2]); std::stringstream buf; buf << f.rdbuf();
     auto prompt = parse_ids(buf.str(), "prompt_ids");
     const int n_gen = argc > 3 ? atoi(argv[3]) : 64, S = argc > 4 ? atoi(argv[4]) : 4;
-    hip::Qwen4Exp m(argv[1], 8192, S);
+    std::vector<int> lp; if (getenv("LONG")) { std::ifstream lf(getenv("LONG")); std::stringstream lb; lb << lf.rdbuf(); lp = parse_ids(lb.str(), "prompt_ids"); }
+    hip::Qwen4Exp m(argv[1], lp.empty() ? 8192 : ((int)lp.size() + 4096 + 1023) / 1024 * 1024, S, lp.empty() ? 0 : 2048);   // one engine: two Flash-Next instances do not fit
     std::vector<int> ids(64 * 16); std::vector<float> vals(64 * 16);
     if (getenv("LONG")) {   // LONG=<ref.json with a long prompt>: prefill (GEMM path) per slot, then lockstep decode vs each slot's single-slot run
-        std::ifstream lf(getenv("LONG")); std::stringstream lb; lb << lf.rdbuf(); auto lp = parse_ids(lb.str(), "prompt_ids");
-        const int P = (int)lp.size(); const int chunk = 2048;
-        hip::Qwen4Exp ml(argv[1], (P + 4096 + 1023) / 1024 * 1024, S, chunk);
+        const int P = (int)lp.size(); const int chunk = 2048; hip::Qwen4Exp& ml = m;
         std::vector<std::vector<int>> ref(S); std::vector<std::vector<int>> pr(S); for (int s = 0; s < S; ++s) pr[s].assign(lp.begin() + s, lp.end());
         for (int s = 0; s < S; ++s) { ml.reset(); int pos = 0; for (int c0 = 0; c0 < (int)pr[s].size(); c0 += chunk) { const int n = std::min(chunk, (int)pr[s].size() - c0); ml.prefill(&pr[s][c0], n, c0, 0); pos += n; }
             ml.topk(ml.logits(), 1, 1, ids.data(), vals.data()); int cur = ids[0];
