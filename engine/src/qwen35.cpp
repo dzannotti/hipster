@@ -145,11 +145,19 @@ Qwen35::Qwen35(const std::string& path, int max_ctx, int n_slots) : max_ctx_(max
     CK(hipMalloc(&xq_.q, xk)); CK(hipMalloc(&xq_.d, xk / 32 * 4)); CK(hipMalloc(&xq_.s, xk / 32 * 4));
     CK(hipMemset(xq_.q, 0, xk)); CK(hipMemset(xq_.d, 0, xk / 32 * 4)); CK(hipMemset(xq_.s, 0, xk / 32 * 4));
     CK(hipMalloc(&d_tok_, T * 4)); CK(hipMalloc(&d_ids_, MAXR * 16 * 4)); CK(hipMalloc(&d_vals_, MAXR * 16 * 4));
+    attn_mq_ = !(getenv("HIPSTER_ATTN") && std::string(getenv("HIPSTER_ATTN")) == "old");
+    { apart_.spl = std::max(512, (max_ctx_ / 32 + 511) / 512 * 512); apart_.nsplit_max = (max_ctx_ + apart_.spl - 1) / apart_.spl;
+      const size_t np = (size_t)4 * n_slots_ * apart_.nsplit_max * 64;
+      CK(hipMalloc(&apart_.O, np * 256 * 4)); CK(hipMalloc(&apart_.m, np * 4)); CK(hipMalloc(&apart_.l, np * 4)); }
     reset();
 }
 
 Qwen35::~Qwen35() {}
 
+void Qwen35::clear_kv(bool k, bool v) {
+    if (k) CK(hipMemset(kc_, 0, kv_slot_ * 2 * n_slots_));
+    if (v) CK(hipMemset(vc_, 0, kvt_slot_ * 2 * n_slots_));
+}
 void Qwen35::reset() {
     CK(hipMemset(gdn_state_, 0, st_stride_ * 2 * n_slots_ * 4)); CK(hipMemset(conv_state_, 0, cs_stride_ * 2 * n_slots_ * 4));
     for (int s = 0; s < n_slots_; ++s) { cur_[s] = 0; lT_[s] = 0; }
@@ -244,6 +252,11 @@ void Qwen35::attn_block(const AttnBlock& a, int T, int pos0, uint16_t* kc, uint1
         else { attn_stage1_i8(qf, k, v, T, a.q_norm, a.k_norm, D::rope_base, pos0, *c8, max_ctx_, D::rms_eps, s_); attn_prefill_i8(qf, *c8, T, pos0, max_ctx_, xb_, s_); }
     } else if (!gm_ && getenv("HIPSTER_GQA_ATTN")) {   // experimental: slower at 32K and not yet exact (docs/decode-27b.md)
         attn_decode_gqa(qf, k, v, T, a.q_norm, a.k_norm, D::rope_base, pos0, kc, vc, max_ctx_, ao, xq_, pO_, pm_, pl_, D::rms_eps, s_);
+    } else if (!gm_ && attn_mq_) {   // multi-query: K/V read once per kv head for all heads x rows; rows grouped by slot
+        const RowBatch* rbp = rb;
+        if (!rbp) { arb_.n = T; for (int t = 0; t < T; ++t) { arb_.pos[t] = pos0 + t; arb_.kv[t] = 0; } rbp = &arb_; }
+        agroups_.n = 0; for (int t = 0; t < T; ++t) { if (t == 0 || rbp->kv[t] != rbp->kv[t - 1]) { agroups_.r0[agroups_.n] = t; agroups_.T[agroups_.n] = 0; ++agroups_.n; } ++agroups_.T[agroups_.n - 1]; }
+        attn_decode_mq(qf, k, v, T, a.q_norm, a.k_norm, D::rope_base, *rbp, agroups_, kc, vc, kv_slot_, kvt_slot_, max_ctx_, ao, xq_, apart_, D::rms_eps, s_);
     } else if (rb) {   // batched rows (several slots): per-row positions and KV slots
         attn_decode_b(qf, k, v, T, a.q_norm, a.k_norm, D::rope_base, *rb, kc, vc, kv_slot_, kvt_slot_, max_ctx_, ao, xq_, D::rms_eps, s_);
     } else if (!gm_ || getenv("HIPSTER_SCALAR_ATTN")) {

@@ -35,11 +35,42 @@ int main(int argc, char** argv) {
     hip::Qwen35 m(argv[1], std::max(8192, max_ctx), n_slots); m.load_dflash(argv[2]);
     int ids[16 * 8]; float vals[16 * 8];
 
-    if (getenv("DIAG") && n_slots >= 2) {   // identical tokens/state in two slots of one batched pass: rows must match bit for bit
+    if (getenv("DIAG")) {   // identical tokens/state in two slots of one batched pass: rows must match bit for bit
         m.reset(); const int V = hip::Qwen35Dims::n_vocab;
-        for (int s = 0; s < 2; ++s) for (size_t i = 0; i < prompt.size(); ++i) { hip::SlotReq r{s, &prompt[i], 1, (int)i}; m.forward(&r, 1); m.accept(s, 1); }
+        for (int s = 0; s < n_slots; ++s) for (size_t i = 0; i < prompt.size(); ++i) { hip::SlotReq r{s, &prompt[i], 1, (int)i}; m.forward(&r, 1); m.accept(s, 1); }
         int toks[8] = {1393, 471, 220, 16, 8, 478, 73111, 1393}; const int P = (int)prompt.size();
-        for (auto [Ta, Tb] : std::vector<std::pair<int,int>>{{1, 1}, {8, 8}, {8, 1}, {1, 8}}) {
+        if (!getenv("ROWSONLY")) {   // same state: row 0 of a T=1 pass vs row 0 of a T=8 pass (no accept in between)
+            hip::SlotReq r1{0, toks, 1, P}; m.forward(&r1, 1); std::vector<float> a(V); hipMemcpy(a.data(), m.logits(), V * 4, hipMemcpyDeviceToHost);
+            for (int T : {2, 4, 8}) { hip::SlotReq r8{0, toks, T, P}; m.forward(&r8, 1); std::vector<float> c(V); hipMemcpy(c.data(), m.logits(), V * 4, hipMemcpyDeviceToHost);
+                double md = 0; for (int v = 0; v < V; ++v) md = fmax(md, fabs(a[v] - c[v])); printf("row 0: T=1 vs T=%d pass = %.4f\n", T, md); }
+        }
+        {   // rows r of one T=8 pass vs the sequential T=1 results at the same positions (slot 1, whose state is untouched)
+            for (int sl = n_slots - 1; sl >= 0; --sl) { printf("=== T=8 pass\n"); fflush(stdout);
+            hip::SlotReq r8{sl, toks, 8, P}; m.forward(&r8, 1); std::vector<float> l8((size_t)8 * V); hipMemcpy(l8.data(), m.logits(), l8.size() * 4, hipMemcpyDeviceToHost);
+            for (int r = 0; r < 8; ++r) { printf("=== T=1 pass at %d\n", P + r); fflush(stdout); hip::SlotReq r1{sl, toks + r, 1, P + r}; m.forward(&r1, 1); m.accept(sl, 1); std::vector<float> c(V); hipMemcpy(c.data(), m.logits(), V * 4, hipMemcpyDeviceToHost);
+                double md = 0; for (int v = 0; v < V; ++v) md = fmax(md, fabs(l8[(size_t)r * V + v] - c[v]));
+                int a8 = 0, a1 = 0; for (int v = 1; v < V; ++v) { if (l8[(size_t)r * V + v] > l8[(size_t)r * V + a8]) a8 = v; if (c[v] > c[a1]) a1 = v; }
+                printf("slot %d row %d: T=8 pass vs sequential T=1 = %.4f | T=8: top %d %.4f, logit[1393] %.4f | T=1: top %d %.4f, logit[1393] %.4f\n", sl, r, md, a8, l8[(size_t)r * V + a8], l8[(size_t)r * V + 1393], a1, c[a1], c[1393]); }
+            }
+            return 0;
+        }
+        {   // stale-cache dependence: sequential T=1 to P+8 (slot 0), reset, re-feed the prompt, then a T=8 pass at P
+            std::vector<std::vector<float>> seq(8, std::vector<float>(V));
+            for (int r = 0; r < 8; ++r) { hip::SlotReq r1{0, toks + r, 1, P + r}; m.forward(&r1, 1); m.accept(0, 1); hipMemcpy(seq[r].data(), m.logits(), V * 4, hipMemcpyDeviceToHost); }
+            m.reset(); for (size_t i = 0; i < prompt.size(); ++i) { hip::SlotReq r{0, &prompt[i], 1, (int)i}; m.forward(&r, 1); m.accept(0, 1); }
+            hip::SlotReq r8{0, toks, 8, P}; m.forward(&r8, 1); std::vector<float> l8((size_t)8 * V); hipMemcpy(l8.data(), m.logits(), l8.size() * 4, hipMemcpyDeviceToHost);
+            for (int r = 0; r < 8; ++r) { double md = 0; for (int v = 0; v < V; ++v) md = fmax(md, fabs(l8[(size_t)r * V + v] - seq[r][v])); printf("after reset, row %d: T=8 pass vs earlier sequential T=1 = %.4f\n", r, md); }
+            for (int r = 0; r < 8; ++r) { double md = 0; for (int v = 0; v < V; ++v) md = fmax(md, fabs(l8[(size_t)r * V + v] - seq[r][v])); }
+            { m.reset(); for (size_t i = 0; i < prompt.size(); ++i) { hip::SlotReq r{0, &prompt[i], 1, (int)i}; m.forward(&r, 1); m.accept(0, 1); }
+              for (int r = 0; r < 8; ++r) { hip::SlotReq r1{0, toks + r, 1, P + r}; m.forward(&r1, 1); m.accept(0, 1); std::vector<float> c(V); hipMemcpy(c.data(), m.logits(), V * 4, hipMemcpyDeviceToHost);
+                  double md = 0; for (int v = 0; v < V; ++v) md = fmax(md, fabs(c[v] - seq[r][v])); printf("after reset, sequential T=1 row %d vs earlier sequential = %.4f\n", r, md); } }
+            for (int mode = 0; mode < 4; ++mode) {   // 0: nothing cleared, 1: K cleared, 2: V cleared, 3: both (then the prompt is re-fed)
+                m.reset(); m.clear_kv(mode & 1, mode & 2); for (size_t i = 0; i < prompt.size(); ++i) { hip::SlotReq r{0, &prompt[i], 1, (int)i}; m.forward(&r, 1); m.accept(0, 1); }
+                hip::SlotReq r1{0, toks, 1, P}; m.forward(&r1, 1); std::vector<float> c(V); hipMemcpy(c.data(), m.logits(), V * 4, hipMemcpyDeviceToHost);
+                double md = 0; for (int v = 0; v < V; ++v) md = fmax(md, fabs(c[v] - seq[0][v])); printf("after reset (clear K=%d V=%d), T=1 pass at P vs earlier sequential T=1 = %.4f\n", mode & 1, (mode >> 1) & 1, md);
+            }
+        }
+        if (n_slots >= 2) for (auto [Ta, Tb] : std::vector<std::pair<int,int>>{{1, 1}, {8, 8}, {8, 1}, {1, 8}}) {
             hip::SlotReq reqs[2] = {{0, toks, Ta, P}, {1, toks, Tb, P}};
             m.forward(reqs, 2);
             std::vector<float> lg((size_t)(Ta + Tb) * V); hipMemcpy(lg.data(), m.logits(), lg.size() * 4, hipMemcpyDeviceToHost);
@@ -75,7 +106,8 @@ int main(int argc, char** argv) {
       double t0 = now_ms();
       for (int i = 0; i < n_gen; ++i) { plain.push_back(cur); m.forward(&cur, 1, pos++); m.accept(1); m.topk(m.logits(), 1, 1, ids, vals); cur = ids[0]; }
       double dt = now_ms() - t0;
-      printf("plain greedy: %d tokens in %.0f ms = %.2f t/s\n", n_gen, dt, n_gen * 1000.0 / dt); }
+      printf("plain greedy: %d tokens in %.0f ms = %.2f t/s\n", n_gen, dt, n_gen * 1000.0 / dt);
+      if (getenv("PRINT_PLAIN")) { printf("plain:"); for (int t : plain) printf(" %d", t); printf("\n"); } }
 
     std::vector<int> spec;
     { m.reset();

@@ -1,4 +1,5 @@
 #include "ops.h"
+#include <cstdlib>
 #include <hip/hip_fp16.h>
 #include <cmath>
 
@@ -818,6 +819,131 @@ void attn_stage1(float* q_full, float* k, const float* v, int T, const float* q_
 void attn_stage1_i8(float* q_full, float* k, const float* v, int T, const float* q_norm_w, const float* k_norm_w, float rope_base, int pos0,
                     const KV8& c, int max_ctx, float eps, hipStream_t s) {
     k_qk_norm_rope_kv<24, 4, true><<<28 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, pos0, nullptr, nullptr, max_ctx, eps, c.k, c.ks, c.v, c.vs, RowBatch{}, 0, 0, 0);
+}
+// ---- multi-query decode attention (27B) ----
+// Block = 8 waves (256 threads) = the <= 8 rows of one group (one slot) x one kv head x one 512-key split; wave w owns row t = w
+// and computes its 6 query heads as rows 0..5 of a 16-row WMMA tile (rows 6..15 zero). K/V of the split are read once per
+// wave from L1/L2 (shared by the 8 waves), instead of once per (row, head) block.
+// Exactness: the f16 WMMA's rounding depends on B-operand values even where the A operand is exactly 0 (bench/roofline/
+// wmma_pair.hip: 176/256 outputs change by an ulp when V of a zero-weight key changes), so a wave must never feed V of a
+// key beyond its own row's position into the product: every wave zeroes V per key by its own qpos. With that, and splits at
+// fixed absolute 512-key boundaries merged in order, a row's result is bit-identical in a T=1 and a T=8 pass.
+__global__ void __launch_bounds__(256) k_attn_mq(const float* __restrict__ qf, const uint16_t* __restrict__ kc, const uint16_t* __restrict__ vc, RowBatch rb, AttnGroups g,
+                                                 size_t kv_stride, size_t kvt_stride, int max_ctx, int nsplit, int spl, float* __restrict__ pO, float* __restrict__ pm, float* __restrict__ pl) {
+    constexpr int HD = 256, BQ = 64, BK = 32, NW = 8, HPK = 6;
+    __shared__ __align__(16) uint16_t sQ[NW][HPK][HD];   // 24 KB: the wave's 6 query heads
+    __shared__ __align__(16) uint16_t sP[NW][16][BK];    // 8 KB
+    const int sidx = blockIdx.x % nsplit, gi = (blockIdx.x / nsplit) % g.n, kh = blockIdx.x / (nsplit * g.n);
+    const int wave = threadIdx.x / 32, lane = threadIdx.x % 32, r16 = lane % 16, half = lane / 16;
+    const int r0 = g.r0[gi], Tg = g.T[gi], cp = max_ctx + 128, t = wave;
+    const int slot = rb.n ? rb.kv[r0] : 0;
+    const uint16_t* K = kc + (size_t)slot * kv_stride + (size_t)kh * max_ctx * HD; const uint16_t* Vt = vc + (size_t)slot * kvt_stride + (size_t)kh * HD * cp;
+    const size_t pbase = ((size_t)(kh * g.n + gi) * nsplit + sidx) * BQ + (size_t)t * 8;   // this row's 8 slots (6 used)
+    const int k_lo = sidx * spl;
+    if (t >= Tg) {   // no row: empty partials
+        if (lane < 8) { pm[pbase + lane] = -INFINITY; pl[pbase + lane] = 0.f; }
+        for (int i = lane; i < 8 * HD; i += 32) pO[pbase * HD + i] = 0.f;
+        return;
+    }
+    const int qpos = rb.n ? rb.pos[r0 + t] : rb.pos[0] + t;
+    const int k_hi = min((sidx + 1) * spl, qpos + 1);   // this row's keys in the split
+    for (int i = lane; i < HPK * HD; i += 32) { const int hh = i / HD, d = i % HD; sQ[wave][hh][d] = f2h(qf[((size_t)(r0 + t) * 24 + kh * HPK + hh) * 512 + d]); }
+    __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, "workgroup"); __builtin_amdgcn_wave_barrier();
+    f32x8_t O[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) O[i] = (f32x8_t){0, 0, 0, 0, 0, 0, 0, 0};
+    float m_row[8], l_row[8];
+#pragma unroll
+    for (int l = 0; l < 8; ++l) { m_row[l] = -INFINITY; l_row[l] = 0.f; }
+    for (int k0 = k_lo; k0 < k_hi; k0 += BK) {
+        f32x8_t S[2];
+        S[0] = (f32x8_t){0, 0, 0, 0, 0, 0, 0, 0}; S[1] = (f32x8_t){0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll 4
+        for (int s = 0; s < HD / 16; ++s) {
+            const f16x16_t qa = r16 < HPK ? ld_f16x16(&sQ[wave][r16][s * 16]) : (f16x16_t){};
+#pragma unroll
+            for (int c = 0; c < 2; ++c) {
+                const int key = k0 + c * 16 + r16;
+                const f16x16_t kb = key < k_hi ? ld_f16x16(K + (size_t)key * HD + s * 16) : (f16x16_t){};
+                S[c] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(qa, kb, S[c]);
+            }
+        }
+        float mloc[8];
+#pragma unroll
+        for (int l = 0; l < 8; ++l) {
+            const bool qrow = (2 * l + half) < HPK;
+#pragma unroll
+            for (int c = 0; c < 2; ++c) { const int key = k0 + c * 16 + r16; float v = S[c][l] * 0.0625f; if (key >= k_hi || !qrow) v = -INFINITY; S[c][l] = v; }
+            float mx = fmaxf(S[0][l], S[1][l]);
+#pragma unroll
+            for (int o = 8; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor(mx, o, 32));
+            mloc[l] = mx;
+        }
+#pragma unroll
+        for (int l = 0; l < 8; ++l) {
+            const float mnew = fmaxf(m_row[l], mloc[l]);
+            const float corr = (m_row[l] == -INFINITY) ? 0.f : __expf(m_row[l] - mnew);
+            float ps = 0.f;
+#pragma unroll
+            for (int c = 0; c < 2; ++c) { const float p = (mnew == -INFINITY) ? 0.f : __expf(S[c][l] - mnew); S[c][l] = p; ps += p; }
+#pragma unroll
+            for (int o = 8; o > 0; o >>= 1) ps += __shfl_xor(ps, o, 32);
+            l_row[l] = l_row[l] * corr + ps; m_row[l] = mnew;
+#pragma unroll
+            for (int i = 0; i < 16; ++i) O[i][l] *= corr;
+        }
+#pragma unroll
+        for (int l = 0; l < 8; ++l)
+#pragma unroll
+            for (int c = 0; c < 2; ++c) sP[wave][2 * l + half][c * 16 + r16] = f2h(S[c][l]);
+        __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, "workgroup"); __builtin_amdgcn_wave_barrier();
+#pragma unroll
+        for (int c = 0; c < 2; ++c) {
+            const f16x16_t pa = ld_f16x16(&sP[wave][r16][c * 16]);
+            const int kb0 = k0 + c * 16;
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                f16x16_t vb = kb0 < k_hi ? ld_f16x16(Vt + (size_t)(i * 16 + r16) * cp + kb0) : (f16x16_t){};
+                if (kb0 + 16 > k_hi) {   // V of keys past this row's position must not enter the product (see the note above)
+#pragma unroll
+                    for (int jj = 0; jj < 16; ++jj) if (kb0 + jj >= k_hi) vb[jj] = (_Float16)0.f;
+                }
+                O[i] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pa, vb, O[i]);
+            }
+        }
+        __builtin_amdgcn_fence(__ATOMIC_SEQ_CST, "workgroup"); __builtin_amdgcn_wave_barrier();
+    }
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        const int qi = 2 * l + half; if (qi >= 8) continue;
+        if (r16 == 0) { pm[pbase + qi] = m_row[l]; pl[pbase + qi] = l_row[l]; }
+#pragma unroll
+        for (int i = 0; i < 16; ++i) pO[(pbase + qi) * HD + i * 16 + r16] = O[i][l];
+    }
+}
+// merge the splits in order, gate, write f32 + q8. Block per (kv head, group, row t, head hh) = 64 slots per (kh, group).
+__global__ void __launch_bounds__(256) k_attn_mq_merge(const float* __restrict__ qf, const float* __restrict__ pO, const float* __restrict__ pm, const float* __restrict__ pl,
+                                                       RowBatch rb, AttnGroups g, int nsplit, float* __restrict__ out, int8_t* __restrict__ oq, float* __restrict__ od, float* __restrict__ os) {
+    constexpr int HD = 256, BQ = 64, HPK = 6;
+    const int kh = blockIdx.x / (g.n * BQ), gi = (blockIdx.x / BQ) % g.n, q = blockIdx.x % BQ, d = threadIdx.x;
+    const int t = q / 8, hh = q % 8; if (t >= g.T[gi] || hh >= HPK) return;
+    const int row = g.r0[gi] + t, head = kh * HPK + hh;
+    const size_t pb = ((size_t)(kh * g.n + gi) * nsplit) * BQ + q;
+    float m = -INFINITY; for (int s = 0; s < nsplit; ++s) m = fmaxf(m, pm[pb + (size_t)s * BQ]);
+    float o = 0.f, l = 0.f;
+    for (int s = 0; s < nsplit; ++s) { const float ms = pm[pb + (size_t)s * BQ]; const float w = ms == -INFINITY ? 0.f : __expf(ms - m); o += w * pO[(pb + (size_t)s * BQ) * HD + d]; l += w * pl[pb + (size_t)s * BQ]; }
+    const size_t oi = ((size_t)row * 24 + head) * HD + d;
+    const float v = (l > 0.f ? o / l : 0.f) * sigmoid(qf[((size_t)row * 24 + head) * 512 + 256 + d]);
+    out[oi] = v;
+    wave_quant32(v, oq, od, os, (int)(oi / 32), d % 32);
+}
+void attn_decode_mq(float* q_full, float* k, float* v, int T, const float* q_norm_w, const float* k_norm_w, float rope_base, const RowBatch& rb, const AttnGroups& g,
+                    uint16_t* kc, uint16_t* vc, size_t kv_stride, size_t kvt_stride, int max_ctx, float* out, XQ8 xq, const AttnPart& part, float eps, hipStream_t s) {
+    k_qk_norm_rope_kv<24, 4, false><<<28 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, 0, kc, vc, max_ctx, eps, nullptr, nullptr, nullptr, nullptr, rb, kv_stride, kvt_stride, 0);
+    int pmax = 0; for (int r = 0; r < T; ++r) pmax = max(pmax, rb.pos[r]);
+    const int nsplit = min(part.nsplit_max, (pmax + 1 + part.spl - 1) / part.spl);
+    k_attn_mq<<<4 * g.n * nsplit, 256, 0, s>>>(q_full, kc, vc, rb, g, kv_stride, kvt_stride, max_ctx, nsplit, part.spl, part.O, part.m, part.l);
+    k_attn_mq_merge<<<4 * g.n * 64, 256, 0, s>>>(q_full, part.O, part.m, part.l, rb, g, nsplit, out, xq.q, xq.d, xq.s);
 }
 void attn_prefill(const float* q_full, const uint16_t* kc, const uint16_t* vc, int T, int pos0, int max_ctx, uint16_t* out_bf16, hipStream_t s) {
     k_attn_prefill<false, 4><<<24 * ((T + 63) / 64), 128, 0, s>>>(q_full, kc, vc, nullptr, nullptr, nullptr, nullptr, T, pos0, max_ctx, out_bf16);

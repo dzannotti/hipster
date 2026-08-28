@@ -65,6 +65,13 @@ void gdn_step_b(const float* qkv, const float* z, const float* beta_raw, const f
                 const float* st_base, float* st_obase, const float* norm_w, float* out, XQ8 xq, float eps, hipStream_t s);   // 27B (silu gate)
 void gdn_step_sig_b(const float* qkv, const float* z, const float* beta_raw, const float* alpha_raw, const SeqBatch& sb, size_t st_stride, const float* dt_bias, const float* a_neg,
                     const float* st_base, float* st_obase, const float* norm_w, float* out, XQ8 xq, float eps, hipStream_t s);
+// Multi-query decode attention (27B geometry): K/V of a kv head are read once per block for all 6 q heads x the rows of
+// a group (rows of one slot, <= 8); keys split at fixed absolute 512-key boundaries (results are T-invariant), partials
+// merged in split order, then gate + q8 quantisation. Partials: pO [4][ngroups][nsplit][64][256], pm/pl [..][64].
+struct AttnGroups { int r0[8]; int T[8]; int n; };
+struct AttnPart { float* O; float* m; float* l; int nsplit_max; int spl; };
+void attn_decode_mq(float* q_full, float* k, float* v, int T, const float* q_norm_w, const float* k_norm_w, float rope_base, const RowBatch& rb, const AttnGroups& g,
+                    uint16_t* kc, uint16_t* vc, size_t kv_stride, size_t kvt_stride, int max_ctx, float* out, XQ8 xq, const AttnPart& part, float eps, hipStream_t s);
 // 27B geometry (24 q / 4 kv heads, V^T cache with kvt_stride rows per slot), per-row positions / KV slots
 void attn_decode_b(float* q_full, float* k, float* v, int T, const float* q_norm_w, const float* k_norm_w, float rope_base, const RowBatch& rb,
                    uint16_t* kc, uint16_t* vc, size_t kv_stride, size_t kvt_stride, int max_ctx, float* out, XQ8 xq, float eps, hipStream_t s);

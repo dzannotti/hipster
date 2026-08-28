@@ -50,7 +50,7 @@ int main(int argc, char** argv) {
               const int T = std::min(B, n_gen - i); m.forward(&plain[i], T, pos); m.accept(T); pos += T;
               std::vector<float> lg((size_t)T * V); hipMemcpy(lg.data(), m.logits(), lg.size() * 4, hipMemcpyDeviceToHost);
               for (int r = 0; r < T; ++r) { if (i + r + 1 >= (int)l1.size()) break; double md = 0; for (int v = 0; v < V; ++v) md = fmax(md, fabs((double)lg[(size_t)r * V + v] - l1[i + r + 1][v])); if (md > worst) { worst = md; worst_i = i + r + 1; }
-                  if (r == 0 || r == T - 1) printf("  logit diff step %d (row %d of %d): max|T=%d - T=1| = %.4f\n", i + r + 1, r, T, T, md); }
+                  if (r == 0 || r == T - 1 || i < 2 * B) printf("  logit diff step %d (row %d of %d): max|T=%d - T=1| = %.4f\n", i + r + 1, r, T, T, md); }
           }
           printf("worst T>1 vs T=1 logit difference: %.4f at step %d\n", worst, worst_i); }
         return 0;

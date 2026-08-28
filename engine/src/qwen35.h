@@ -86,6 +86,7 @@ public:
     // top-k per row of the given logits buffer -> host arrays [T][k]
     void topk(const float* logits, int T, int k, int* ids, float* vals);
     void reset();
+    void clear_kv(bool k, bool v);   // debug: zero the attention K and/or V caches
     size_t weight_bytes() const { return weight_bytes_; }
     std::string load_report() const { return report_; }
     float last_ms() const { return last_ms_; }
@@ -140,7 +141,8 @@ private:
     size_t weight_bytes_ = 0;
     std::string report_;
     float last_ms_ = 0;
-    bool gm_ = false, last_gm_ = false;   // the pass in flight is a prefill (GEMM path); rows > max_T in a batched pass stay on the GEMV path
+    bool gm_ = false, last_gm_ = false;
+    AttnPart apart_{}; AttnGroups agroups_{}; RowBatch arb_{}; bool attn_mq_ = true;   // multi-query decode attention (HIPSTER_ATTN=old disables)   // the pass in flight is a prefill (GEMM path); rows > max_T in a batched pass stay on the GEMV path
     bool timing_ = false, prefetch_on_ = false; float tacc_[T_N]; hipEvent_t tev_[2];
     void tmark(int cat);
 };

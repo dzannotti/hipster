@@ -100,3 +100,30 @@ sub-block accumulation with the int weight scales, one float update per block; l
 (the 7.9 GB bulk: its unpack, not the epilogue, is the cost); error vs f32 grows 3.4e-4 → 4.9e-4 (Q5_K). Weighted over
 the checkpoint ≈ −12 ms of the 97 ms GEMV at T=8; not adopted (engine-wide quantiser change for ~8% end-to-end, less
 precise activations). Kept as a bench option.
+
+## 2026-08-28 · multi-query decode attention (T rows × 6 heads per kv head, split-KV, WMMA f16)
+
+At 16K context the T=8 verify pass cost 265 ms (T=1: 110): `k_attn` launched one block per (row, q head), so the 16-layer
+KV was streamed once per row and head — 26 GB per pass. `k_attn_mq` (ops.hip) reads each K/V tile once per wave for a row's
+6 heads (rows 0..5 of a 16-row WMMA f16 tile, prefill-kernel tiling), one block per (kv head, slot group, 512-key split),
+partials merged in split order (`k_attn_mq_merge`, + gate + q8). `HIPSTER_ATTN=old` restores the scalar kernel.
+
+| context | pass | old kernel | multi-query |
+|---|---|---:|---:|
+| 29 tokens | T=1 / T=8 | 92 / 106 ms | 93 / 107 |
+| 16K | T=1 / T=2 / T=4 / T=8 | 110 / 122 / 188 / 265 | 106 / 106 / 110 / 120 |
+| 16K, DFlash2 n=7 (15% acceptance on that prompt) | t/s | 9.65 | **13.5** |
+
+**Exactness finding (hardware).** The first version put the 6 heads × T rows of a group into one 48-row tile and was
+T-variant: a row's logits differed by up to 0.6 between a T=1 and a T=8 pass, deterministically, although its softmax
+statistics were bit-identical. The cause is `wmma_f32_16x16x16_f16`: `bench/roofline/wmma_pair.hip` shows that with a
+single zero in the A operand and only the matching B element changed, **176 of 256 outputs change by an ulp** — the unit's
+internal alignment uses operands whose weight is exactly zero. In P·V the V of keys beyond a row's position (masked, P = 0)
+therefore leaks into the rounding, and a 16-key V tile shared by rows with different positions cannot be made identical for
+each of them. The kernel now gives every batch row its own wave, and each wave zeroes V per key beyond its own position
+(and loads no K beyond it). Result: rows of a T=8 pass bit-identical to eight T=1 passes (`DIAG=1 ROWSONLY=1 dflash27b …`),
+`HIPSTER_LOGIT_DIFF` 0.0000 at T=8, llama.cpp greedy 12/12, DFlash2 EXACT at 29 tokens, at 16K and with 2 slots. The same
+property means the prefill flash-attention kernel's output depends on the (zero) V padding beyond the prompt — consistent
+by construction, but worth knowing. Q is f16 in this kernel (f32 before): the greedy stream on the code prompt now
+takes the other branch at its near-tie token 13 (gap 0.024), so DFlash2 acceptance statistics on that prompt changed
+(78% → 72%): single 48.4 t/s, 2 slots 79.0 aggregate, both exact.
