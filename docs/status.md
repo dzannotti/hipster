@@ -26,6 +26,9 @@ Flash-Next: decode engine runs, **12/12 greedy identical to llama.cpp, 17.5 t/s*
 | MTP n=5 (WMMA verify) | 33.8 t/s, exact | |
 | T-invariance | max logit diff 0.0000 at T=8 | GEMV (WMMA, fixed reduction order) + attention (per-row V masking) |
 | ngram-map-k4v in front of DFlash2 | neutral at T≤8 | 9 of 78 rounds drafted by the map on 512 tokens of code |
+| served, 27B (OpenAI endpoint, DFlash2, `--slots 2`) | 46 t/s alone, 68 aggregate for 2 concurrent code requests | short prompts through 16-row GEMV passes (372 ms) |
+| served, Flash-Next (`--slots 4`, MTP policy n=2/1/0) | 43.7 alone, 48 for 2, 51 for 4 concurrent | outputs identical to solo/plain runs |
+| multi-query decode attention (27B) | 16K T=8 pass 265 → 120 ms | f16 WMMA rounding depends on zero-weight operands → per-row V masking |
 
 Flash-Next unchanged (36.3 ms/token, MTP 37–41 t/s, 63/80 t/s @4/8 slots, prefill ~1000 t/s @2K).
 

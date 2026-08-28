@@ -107,7 +107,7 @@ struct Params { int max_tokens = 4096; float temperature = 0.f, top_p = 1.f; int
 struct Result { std::vector<int> ids; std::string finish; int prompt_tokens = 0; double prefill_s = 0, gen_s = 0; int rounds = 0, accepted = 0, drafted = 0; };
 struct Job {   // one request in the scheduler
     std::vector<int> prompt; Params p; bool reasoning; std::function<void(const std::string&, bool)> emit;
-    Result r; std::string pending; int pos = 0, id_last = 0, slot = -1; bool spec = false; double t_gen0 = 0;
+    Result r; std::string pending; int pos = 0, id_last = 0, slot = -1; bool spec = false, gone = false; double t_gen0 = 0;
     std::mutex mu; std::condition_variable cv; bool done = false;
 };
 struct Server {
@@ -129,7 +129,8 @@ struct Server {
         std::discrete_distribution<int> dist(pr.begin(), pr.begin() + n); return idx[dist(rng)];
     }
     bool stop(int id) const { return id == eos || id == im_end; }
-    void out(Job& j, int id) {   // emit one token: thinking tags, UTF-8 boundary handling
+    void out(Job& j, int id) {   // emit one token: thinking tags, UTF-8 boundary handling; a failed emit (client gone) ends the job
+        if (j.gone) return;
         j.r.ids.push_back(id);
         if (id == think_close && j.reasoning) { j.reasoning = false; return; }
         if (id == think_open) { j.reasoning = true; return; }
@@ -137,10 +138,10 @@ struct Server {
         size_t ok = j.pending.size();
         { size_t p = j.pending.size(); int back = 0; while (p > 0 && back < 4 && ((unsigned char)j.pending[p - 1] & 0xC0) == 0x80) { --p; ++back; }
           if (p > 0) { unsigned char c = j.pending[p - 1]; int need = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1; if (j.pending.size() - (p - 1) < (size_t)need) ok = p - 1; } }
-        if (ok > 0) { j.emit(j.pending.substr(0, ok), j.reasoning); j.pending.erase(0, ok); }
+        if (ok > 0) { try { j.emit(j.pending.substr(0, ok), j.reasoning); } catch (...) { j.gone = true; j.r.finish = "abort"; } j.pending.erase(0, ok); }
     }
     void finish(Job& j) {
-        if (!j.pending.empty()) { j.emit(j.pending, j.reasoning); j.pending.clear(); }
+        if (!j.pending.empty() && !j.gone) { try { j.emit(j.pending, j.reasoning); } catch (...) { j.gone = true; } j.pending.clear(); }
         if (j.r.finish.empty()) j.r.finish = "length";
         j.r.gen_s = now() - j.t_gen0;
         m->reset_slot(j.slot);
@@ -199,7 +200,7 @@ struct Server {
                 for (int i = 0; i < mm; ++i) { if ((int)j->r.ids.size() >= j->p.max_tokens) { full = true; break; } out(*j, dr[i]); }
                 j->id_last = j->p.temperature <= 0.f ? ids[r0 + mm] : pick(m->logits() + (size_t)(r0 + mm) * N_VOCAB, j->p, host);
                 j->pos += mm + 1; ++j->r.rounds; j->r.drafted += ndr[j->slot]; j->r.accepted += mm; r0 += T;
-                if (full || (int)j->r.ids.size() >= j->p.max_tokens) finish(*j); else still.push_back(j);
+                if (full || j->gone || (int)j->r.ids.size() >= j->p.max_tokens) finish(*j); else still.push_back(j);
             }
             { std::lock_guard<std::mutex> lk(qmu); for (Job* j : active) if (std::find(still.begin(), still.end(), j) == still.end()) used[j->slot] = false; active = still; }
         }
