@@ -12,6 +12,8 @@
 #include <random>
 #include <algorithm>
 #include <hip/hip_runtime.h>
+#include <fstream>
+#include <sstream>
 
 namespace {
 using D = hip::FnDims;
@@ -85,12 +87,30 @@ struct Server {
     }
 };
 std::string sse(const js::Value& v) { return "data: " + js::dump(v) + "\n\n"; }
+const char* mime(const std::string& p) {
+    auto ends = [&](const char* e) { size_t n = strlen(e); return p.size() >= n && p.compare(p.size() - n, n, e) == 0; };
+    if (ends(".html")) return "text/html; charset=utf-8"; if (ends(".js")) return "application/javascript"; if (ends(".css")) return "text/css"; if (ends(".json") || ends(".webmanifest")) return "application/json";
+    if (ends(".svg")) return "image/svg+xml"; if (ends(".png")) return "image/png"; if (ends(".ico")) return "image/x-icon"; if (ends(".woff2")) return "font/woff2"; if (ends(".woff")) return "font/woff"; return "application/octet-stream";
+}
+bool serve_static(const std::string& dir, std::string path, http::Response& res) {   // llama.cpp's web UI (SvelteKit SPA): files, else index.html
+    if (dir.empty() || path.find("..") != std::string::npos) return false;
+    size_t q = path.find('?'); if (q != std::string::npos) path = path.substr(0, q);
+    if (path == "/" || path.empty()) path = "/index.html";
+    std::ifstream f(dir + path, std::ios::binary);
+    if (!f && path.find('.') == std::string::npos) { path = "/index.html"; f.open(dir + path, std::ios::binary); }
+    if (!f) return false;
+    std::stringstream b; b << f.rdbuf(); res.send(200, mime(path), b.str()); return true;
+}
+js::Value timings_json(int prompt_n, double prefill_s, int predicted_n, double gen_s) {
+    js::Value t = js::Value::object(); t["cache_n"] = 0; t["prompt_n"] = prompt_n; t["prompt_ms"] = prefill_s * 1000; t["prompt_per_second"] = prefill_s > 0 ? prompt_n / prefill_s : 0.0;
+    t["predicted_n"] = predicted_n; t["predicted_ms"] = gen_s * 1000; t["predicted_per_second"] = gen_s > 0 ? predicted_n / gen_s : 0.0; return t;
+}
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string model, host = "127.0.0.1"; int port = 8090, ctx = 16384, chunk = 2048, mtp = 2;
+    std::string model, host = "127.0.0.1", ui_dir = "/models/.work/fn-tree/build/tools/ui/dist"; int port = 8090, ctx = 16384, chunk = 2048, mtp = 2;
     for (int i = 1; i < argc; ++i) { std::string a = argv[i]; auto next = [&] { return std::string(argv[++i]); };
-        if (a == "--model") model = next(); else if (a == "--port") port = atoi(next().c_str()); else if (a == "--host") host = next(); else if (a == "--ctx") ctx = atoi(next().c_str()); else if (a == "--chunk") chunk = atoi(next().c_str()); else if (a == "--mtp") mtp = atoi(next().c_str()); }
+        if (a == "--model") model = next(); else if (a == "--port") port = atoi(next().c_str()); else if (a == "--host") host = next(); else if (a == "--ctx") ctx = atoi(next().c_str()); else if (a == "--chunk") chunk = atoi(next().c_str()); else if (a == "--mtp") mtp = atoi(next().c_str()); else if (a == "--ui-dir") ui_dir = next(); }
     if (model.empty()) { fprintf(stderr, "usage: hipster-serve --model <shard1.gguf> [--port 8090] [--host 127.0.0.1] [--ctx 16384] [--chunk 2048] [--mtp 2]\n"); return 2; }
     hip::Qwen4Exp m(model, ctx, 1, chunk);
     tok::Tokenizer T(m.gguf());
@@ -104,7 +124,14 @@ int main(int argc, char** argv) {
     http::serve(host, port, [&](const http::Request& req, http::Response& res) {
         if (req.method == "OPTIONS") { res.send(200, "text/plain", ""); return; }
         if (req.path == "/health") { res.send(200, "application/json", "{\"status\":\"ok\"}"); return; }
-        if (req.path == "/" || req.path == "") { res.send(200, "text/plain", "hipster-serve: " + S.model_name + "\nendpoints: GET /health, GET /v1/models, POST /v1/chat/completions, POST /v1/completions\nsee docs/serving.md\n"); return; }
+        if (req.path == "/props") {   // what llama.cpp's web UI reads
+            js::Value v = js::Value::object(); js::Value dgs = js::Value::object(); dgs["params"] = js::Value::object(); dgs["n_ctx"] = ctx; v["default_generation_settings"] = dgs;
+            v["total_slots"] = 1; v["model_alias"] = S.model_name; v["model_ftype"] = "UD-Q4_K_XL"; v["model_path"] = model;
+            js::Value mod = js::Value::object(); mod["vision"] = false; mod["video"] = false; mod["audio"] = false; v["modalities"] = mod;
+            v["endpoint_slots"] = false; v["endpoint_props"] = true; v["endpoint_metrics"] = false; v["ui"] = true; v["ui_settings"] = js::Value::object();
+            v["chat_template"] = ""; v["chat_template_caps"] = js::Value::object(); v["bos_token"] = ""; v["eos_token"] = "<|im_end|>"; v["build_info"] = "hipster"; v["is_sleeping"] = false; v["cors_proxy_enabled"] = false;
+            res.send(200, "application/json", js::dump(v)); return; }
+        if (req.method == "GET" && (req.path == "/" || req.path.rfind("/v1", 0) != 0) && serve_static(ui_dir, req.path, res)) return;
         if (req.path == "/v1/models") { js::Value v = js::Value::object(); v["object"] = "list"; js::Value md = js::Value::object(); md["id"] = S.model_name; md["object"] = "model"; md["owned_by"] = "hipster"; v["data"] = js::Value::array(); v["data"].push(md); res.send(200, "application/json", js::dump(v)); return; }
         const bool chat_ep = req.path == "/v1/chat/completions", comp_ep = req.path == "/v1/completions";
         if (!chat_ep && !comp_ep) { res.send(404, "application/json", "{\"error\":{\"message\":\"not found\"}}"); return; }
@@ -120,16 +147,20 @@ int main(int argc, char** argv) {
         std::string content, reasoning;
         if (p.stream) {
             res.begin_stream();
+            int ntok = 0; double t_first = 0, t_start = Server::now(); int prompt_n = (int)prompt.size();
             auto delta = [&](const std::string& text, bool is_reasoning) { js::Value v = js::Value::object(); v["id"] = id; v["object"] = chat_ep ? "chat.completion.chunk" : "text_completion"; v["created"] = (double)created; v["model"] = S.model_name;
                 js::Value ch = js::Value::object(); ch["index"] = 0; ch["finish_reason"] = js::Value();
                 if (chat_ep) { js::Value d = js::Value::object(); if (content.empty() && reasoning.empty()) d["role"] = "assistant"; d[is_reasoning ? "reasoning_content" : "content"] = text; ch["delta"] = d; } else ch["text"] = text;
-                v["choices"] = js::Value::array(); v["choices"].push(ch); res.chunk(sse(v)); };
+                v["choices"] = js::Value::array(); v["choices"].push(ch);
+                if (!t_first) t_first = Server::now(); ++ntok; v["timings"] = timings_json(prompt_n, t_first - t_start, ntok, Server::now() - t_first);
+                res.chunk(sse(v)); };
             auto r = S.generate(prompt, p, thinking_open, [&](const std::string& t, bool rs) { (rs ? reasoning : content) += t; delta(t, rs); });
             js::Value fin = js::Value::object(); fin["id"] = id; fin["object"] = chat_ep ? "chat.completion.chunk" : "text_completion"; fin["created"] = (double)created; fin["model"] = S.model_name;
             js::Value ch = js::Value::object(); ch["index"] = 0; ch["finish_reason"] = r.finish; js::Value d = js::Value::object();
             if (chat_ep) { auto parsed = chat::parse_output((thinking_open ? reasoning + "</think>" : "") + content, thinking_open); if (!parsed.tool_calls.a.empty()) { d["tool_calls"] = parsed.tool_calls; ch["finish_reason"] = "tool_calls"; } ch["delta"] = d; } else ch["text"] = "";
             fin["choices"] = js::Value::array(); fin["choices"].push(ch);
             js::Value u = js::Value::object(); u["prompt_tokens"] = r.prompt_tokens; u["completion_tokens"] = (int)r.ids.size(); u["total_tokens"] = r.prompt_tokens + (int)r.ids.size(); fin["usage"] = u;
+            fin["timings"] = timings_json(r.prompt_tokens, r.prefill_s, (int)r.ids.size(), r.gen_s);
             res.chunk(sse(fin)); res.chunk("data: [DONE]\n\n"); res.end();
             fprintf(stderr, "[%s] prompt %d tok in %.2f s (%.0f t/s) | gen %zu tok in %.2f s (%.1f t/s) | mtp rounds %d acc %d/%d | %s\n", chat_ep ? "chat" : "comp", r.prompt_tokens, r.prefill_s, r.prompt_tokens / r.prefill_s, r.ids.size(), r.gen_s, r.ids.size() / r.gen_s, r.rounds, r.accepted, r.drafted, r.finish.c_str());
         } else {
@@ -140,6 +171,7 @@ int main(int argc, char** argv) {
             else ch["text"] = content;
             v["choices"] = js::Value::array(); v["choices"].push(ch);
             js::Value u = js::Value::object(); u["prompt_tokens"] = r.prompt_tokens; u["completion_tokens"] = (int)r.ids.size(); u["total_tokens"] = r.prompt_tokens + (int)r.ids.size(); v["usage"] = u;
+            v["timings"] = timings_json(r.prompt_tokens, r.prefill_s, (int)r.ids.size(), r.gen_s);
             res.send(200, "application/json", js::dump(v));
             fprintf(stderr, "[%s] prompt %d tok in %.2f s (%.0f t/s) | gen %zu tok in %.2f s (%.1f t/s) | mtp rounds %d acc %d/%d | %s\n", chat_ep ? "chat" : "comp", r.prompt_tokens, r.prefill_s, r.prompt_tokens / r.prefill_s, r.ids.size(), r.gen_s, r.ids.size() / r.gen_s, r.rounds, r.accepted, r.drafted, r.finish.c_str());
         }

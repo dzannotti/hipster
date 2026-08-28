@@ -4,7 +4,12 @@
 (model: the UD-Q4_K_XL-MTP shards; `MODEL=...` overrides). One slot, requests served in order. Startup ≈ 60 s (78.6 GiB
 of weights via pread + GEMM warm-up). Stop with `docker stop hipster-serve`.
 
-Endpoints: `GET /health`, `GET /v1/models`, `POST /v1/chat/completions` (`messages`, `tools`, `stream`, `max_tokens`,
+A built-in chat page is served at `/` (streaming, multi-turn, thinking toggle + effort, temperature, max tokens; shows time to first token and t/s).
+
+llama.cpp's web UI is served at `/` (static files from `--ui-dir`, default the fn-tree build's `tools/ui/dist` mounted read-only
+inside the container; `/props` and per-chunk `timings` are provided in the shape it reads, so its prompt/generation t/s readout works).
+
+Endpoints: `GET /health`, `GET /props`, `GET /v1/models`, `POST /v1/chat/completions` (`messages`, `tools`, `stream`, `max_tokens`,
 `temperature`, `top_p`, `top_k`, `chat_template_kwargs: {enable_thinking, reasoning_effort}` or top-level
 `enable_thinking`/`reasoning_effort`), `POST /v1/completions` (raw `prompt` string, no template).
 - Thinking is on by default (the model's template): the reply carries `reasoning_content` (streamed as
