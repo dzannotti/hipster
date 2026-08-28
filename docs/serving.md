@@ -56,5 +56,7 @@ pass, one verify pass over all rows, per-slot accept/encode/stream. Greedy outpu
 | 2 concurrent code | 32.7 / 38.5 | **61.4** |
 | code + prose | 30.6 / 19.1 | 32.9 (prose accepts ~30% of the drafts) |
 
-The 40-token prompts cost 1.1 s each through the GEMM path (every weight dequantised to bf16 per chunk); next: short
-prompts through 16-row GEMV passes.
+The 40-token prompts cost 1.1 s each through the GEMM path (every weight dequantised to bf16 per chunk). Prompts of
+≤ 96 tokens now go through 16-row GEMV passes (a single-slot pass of up to 16 rows takes the GEMV path; attention groups
+are split at 8 rows): `prompt_ms 372`, and with the prefill share smaller the two concurrent code requests reach
+**68.4 t/s aggregate** (600 tokens in 8.8 s wall, per request 35.7 / 38.5, text identical to the solo run).

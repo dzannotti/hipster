@@ -28,7 +28,7 @@ struct Backend {
     virtual ~Backend() {}
     virtual int n_slots() = 0;
     virtual void reset_slot(int s) = 0;
-    virtual void prefill(int s, const int* toks, int n, int pos0, bool spec) = 0;   // one chunk of slot s (+ draft catch-up when spec)
+    virtual const float* prefill(int s, const int* toks, int n, int pos0, bool spec) = 0;   // one chunk of slot s (+ draft catch-up when spec); returns the last row's logits
     virtual const float* logits() = 0;                                              // rows of the last pass, in request order
     virtual void topk(const float* l, int T, int k, int* ids, float* vals) = 0;
     virtual int max_draft() = 0;                                                    // 0: no drafts
@@ -45,7 +45,7 @@ struct FnBackend : Backend {   // Flash-Next + MTP, one slot
     }
     int n_slots() override { return 1; }
     void reset_slot(int) override { m.reset(); }
-    void prefill(int, const int* t, int n, int p, bool spec) override { m.prefill(t, n, p); if (spec && mtp > 0) m.mtp_catchup(t, n, p); hipMemcpy(h_pending, m.h_nextn(), (size_t)hip::FnDims::wide * 4, hipMemcpyDeviceToDevice); }
+    const float* prefill(int, const int* t, int n, int p, bool spec) override { m.prefill(t, n, p); if (spec && mtp > 0) m.mtp_catchup(t, n, p); hipMemcpy(h_pending, m.h_nextn(), (size_t)hip::FnDims::wide * 4, hipMemcpyDeviceToDevice); return m.logits(); }
     const float* logits() override { return m.logits(); }
     void topk(const float* l, int T, int k, int* i, float* v) override { m.topk(l, T, k, i, v); }
     int max_draft() override { return mtp; }
@@ -68,7 +68,15 @@ struct B27Backend : Backend {   // 27B + DFlash2, n slots (rows per pass <= 16)
     }
     int n_slots() override { return ns; }
     void reset_slot(int s) override { m.reset_slot(s); }
-    void prefill(int s, const int* t, int n, int p, bool spec) override { hip::SlotReq r{s, t, n, p}; m.forward(&r, 1); m.accept(s, n); if (spec && nd > 0) m.dflash_encode(s, n, p); }
+    const float* prefill(int s, const int* t, int n, int p, bool spec) override {
+        if (n <= 96) {   // short prompt: 16-row GEMV passes (a GEMM-path chunk costs ~1 s of weight dequantisation whatever its length)
+            int k = 0;
+            for (int c0 = 0; c0 < n; c0 += hip::Qwen35::MAXR) { k = std::min(hip::Qwen35::MAXR, n - c0); hip::SlotReq r{s, t + c0, k, p + c0}; m.forward(&r, 1); m.accept(s, k); if (spec && nd > 0) m.dflash_encode(s, k, p + c0); }
+            return m.logits() + (size_t)(k - 1) * N_VOCAB;   // the GEMV path keeps every row's logits
+        }
+        hip::SlotReq r{s, t, n, p}; m.forward(&r, 1); m.accept(s, n); if (spec && nd > 0) m.dflash_encode(s, n, p);
+        return m.logits();
+    }
     const float* logits() override { return m.logits(); }
     void topk(const float* l, int T, int k, int* i, float* v) override { m.topk(l, T, k, i, v); }
     int max_draft() override { return nd; }
@@ -140,9 +148,9 @@ struct Server {
                 while (!queue.empty() && (int)active.size() < ns) {
                     Job* j = queue.front(); queue.pop_front(); int s = 0; while (used[s]) ++s; used[s] = true; j->slot = s; active.push_back(j);
                     lk.unlock();
-                    const double t0 = now(); m->reset_slot(s);
-                    for (int c0 = 0; c0 < (int)j->prompt.size(); c0 += chunk) { const int n = std::min(chunk, (int)j->prompt.size() - c0); m->prefill(s, &j->prompt[c0], n, c0, j->spec); }
-                    j->r.prefill_s = now() - t0; j->pos = (int)j->prompt.size(); j->id_last = pick(m->logits(), j->p, host); j->t_gen0 = now();
+                    const double t0 = now(); m->reset_slot(s); const float* last = nullptr;
+                    for (int c0 = 0; c0 < (int)j->prompt.size(); c0 += chunk) { const int n = std::min(chunk, (int)j->prompt.size() - c0); last = m->prefill(s, &j->prompt[c0], n, c0, j->spec); }
+                    j->r.prefill_s = now() - t0; j->pos = (int)j->prompt.size(); j->id_last = pick(last, j->p, host); j->t_gen0 = now();
                     lk.lock();
                 }
             }
@@ -215,6 +223,7 @@ int main(int argc, char** argv) {
     Server S{be, &T, ctx, chunk, mtp, is27b ? "qwen3.8-27b" : "qwen3.8-flash-next", T.eos(), T.special("<|im_end|>"), T.special("<think>"), T.special("</think>")};
     {   // warm-up: the GEMM shapes of a short and a full chunk (hipBLASLt autotune), then reset
         std::vector<int> w(chunk, 1); be->reset_slot(0); be->prefill(0, w.data(), 128, 0, false); be->reset_slot(0); be->prefill(0, w.data(), chunk, 0, false); be->reset_slot(0);
+        be->prefill(0, w.data(), 40, 0, false); be->reset_slot(0);
         hip::SlotReq r{0, w.data(), 1, 0}; be->verify(&r, 1); be->accept(0, 0, nullptr, 0); be->reset_slot(0);
     }
     std::thread([&S] { S.run(); }).detach();

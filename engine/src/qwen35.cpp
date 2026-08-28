@@ -259,7 +259,8 @@ void Qwen35::attn_block(const AttnBlock& a, int T, int pos0, uint16_t* kc, uint1
     } else if (!gm_ && attn_mq_) {   // multi-query: K/V read once per kv head for all heads x rows; rows grouped by slot
         const RowBatch* rbp = rb;
         if (!rbp) { arb_.n = T; for (int t = 0; t < T; ++t) { arb_.pos[t] = pos0 + t; arb_.kv[t] = 0; } rbp = &arb_; }
-        agroups_.n = 0; for (int t = 0; t < T; ++t) { if (t == 0 || rbp->kv[t] != rbp->kv[t - 1]) { agroups_.r0[agroups_.n] = t; agroups_.T[agroups_.n] = 0; ++agroups_.n; } ++agroups_.T[agroups_.n - 1]; }
+        agroups_.n = 0;   // rows grouped by slot, at most 8 rows (one wave each) per group
+        for (int t = 0; t < T; ++t) { if (t == 0 || rbp->kv[t] != rbp->kv[t - 1] || agroups_.T[agroups_.n - 1] == 8) { agroups_.r0[agroups_.n] = t; agroups_.T[agroups_.n] = 0; ++agroups_.n; } ++agroups_.T[agroups_.n - 1]; }
         attn_decode_mq(qf, k, v, T, a.q_norm, a.k_norm, D::rope_base, *rbp, agroups_, kc, vc, kv_slot_, kvt_slot_, max_ctx_, ao, xq_, apart_, D::rms_eps, s_);
     } else if (rb) {   // batched rows (several slots): per-row positions and KV slots
         attn_decode_b(qf, k, v, T, a.q_norm, a.k_norm, D::rope_base, *rb, kc, vc, kv_slot_, kvt_slot_, max_ctx_, ao, xq_, D::rms_eps, s_);
@@ -288,9 +289,8 @@ void Qwen35::ffn_block(const Lin& g, const Lin& u, const Lin& d, int T, float* y
 float Qwen35::forward(const SlotReq* reqs, int S) {
     if (S < 1 || S > n_slots_) throw std::runtime_error("bad S");
     int T = 0; for (int i = 0; i < S; ++i) T += reqs[i].T;
-    const bool gm = S == 1 && T > D::max_T;   // GEMM (prefill) path: one slot
-    if (T < 1 || T > D::max_prefill || (!gm && T > MAXR) || (S > 1 && reqs[0].T > D::max_T)) throw std::runtime_error("bad T");
-    for (int i = 0; i < S; ++i) if (reqs[i].T > D::max_T && !gm) throw std::runtime_error("a batched request has more than max_T rows");
+    const bool gm = S == 1 && T > MAXR;   // GEMM (prefill) path: one slot; up to MAXR rows go through the GEMV path (short prompts)
+    if (T < 1 || T > D::max_prefill || (!gm && T > MAXR)) throw std::runtime_error("bad T");
     gm_ = gm;
     const int slot0 = reqs[0].slot, pos0 = reqs[0].pos;   // used by the single-sequence paths
     SeqBatch sb; RowBatch rb; std::vector<int> toks(T);
