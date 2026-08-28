@@ -31,7 +31,8 @@ int main(int argc, char** argv) {
     auto envi = [](const char* k, int d) { return getenv(k) ? atoi(getenv(k)) : d; };
     hip::NgramMap ngram(envi("NGRAM_N", 12), envi("NGRAM_M", 48), envi("NGRAM_MIN_HITS", 1));
     const int n_slots = getenv("SLOTS") ? atoi(getenv("SLOTS")) : 1;
-    hip::Qwen35 m(argv[1], 8192, n_slots); m.load_dflash(argv[2]);
+    const int max_ctx = (int)((prompt.size() + (argc > 4 ? atoi(argv[4]) : 64) * 2 + 1023) / 1024 * 1024 + 1024);
+    hip::Qwen35 m(argv[1], std::max(8192, max_ctx), n_slots); m.load_dflash(argv[2]);
     int ids[16 * 8]; float vals[16 * 8];
 
     if (getenv("DIAG") && n_slots >= 2) {   // identical tokens/state in two slots of one batched pass: rows must match bit for bit
@@ -51,7 +52,9 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (getenv("PROF_T")) {   // per-category GPU time of a T-token pass (HIPSTER_TIMING=1 for the categories)
-        m.reset(); int pos = 0; for (int t : prompt) { m.forward(&t, 1, pos++); m.accept(1); }
+        m.reset(); int pos = 0;
+        if (getenv("PREFILL")) { for (int p0 = 0; p0 < (int)prompt.size(); p0 += 4096) { const int n = std::min(4096, (int)prompt.size() - p0); m.forward(prompt.data() + p0, n, p0); m.accept(n); } pos = (int)prompt.size(); }
+        else for (int t : prompt) { m.forward(&t, 1, pos++); m.accept(1); }
         for (int T : {1, 2, 4, 8}) {
             std::vector<int> toks(T, 1393); m.forward(toks.data(), T, pos); m.accept(T); pos += T; m.timing_reset();
             const int reps = 6; double t0 = now_ms(); float gpu = 0;
@@ -62,9 +65,12 @@ int main(int argc, char** argv) {
         }
         return 0;
     }
+    const bool prefill = getenv("PREFILL") != nullptr;   // prompt in one GEMM-path pass instead of token by token
+    const int P = (int)prompt.size();
     std::vector<int> plain;
     { m.reset(); int pos = 0;
-      for (int t : prompt) { m.forward(&t, 1, pos++); m.accept(1); }
+      if (prefill) { for (int p0 = 0; p0 < P; p0 += 4096) { const int n = std::min(4096, P - p0); m.forward(prompt.data() + p0, n, p0); m.accept(n); } pos = P; }
+      else for (int t : prompt) { m.forward(&t, 1, pos++); m.accept(1); }
       m.topk(m.logits(), 1, 1, ids, vals); int cur = ids[0];
       double t0 = now_ms();
       for (int i = 0; i < n_gen; ++i) { plain.push_back(cur); m.forward(&cur, 1, pos++); m.accept(1); m.topk(m.logits(), 1, 1, ids, vals); cur = ids[0]; }
@@ -73,7 +79,8 @@ int main(int argc, char** argv) {
 
     std::vector<int> spec;
     { m.reset();
-      for (size_t i = 0; i < prompt.size(); ++i) { m.forward(&prompt[i], 1, (int)i); m.accept(1); m.dflash_encode(1, (int)i); }
+      if (prefill) { for (int p0 = 0; p0 < P; p0 += 4096) { const int n = std::min(4096, P - p0); m.forward(prompt.data() + p0, n, p0); m.accept(n); m.dflash_encode(n, p0); } }
+      else for (size_t i = 0; i < prompt.size(); ++i) { m.forward(&prompt[i], 1, (int)i); m.accept(1); m.dflash_encode(1, (int)i); }
       int pos = (int)prompt.size();
       m.topk(m.logits(), 1, 1, ids, vals); int id_last = ids[0]; spec.push_back(id_last);
       int rounds = 0, drafted = 0, accepted = 0, ng_rounds = 0, ng_accepted = 0, ng_drafted = 0; std::vector<int> hist(n_draft + 1, 0);
@@ -108,7 +115,8 @@ int main(int argc, char** argv) {
     if (n_slots < 2) return match == n_gen ? 0 : 1;
     // ---- S slots in lockstep, every slot running the same prompt + DFlash2 (aggregate throughput; each stream must stay exact) ----
     { m.reset(); std::vector<int> pos(n_slots, 0), idl(n_slots); std::vector<std::vector<int>> out(n_slots);
-      for (int s = 0; s < n_slots; ++s) { for (size_t i = 0; i < prompt.size(); ++i) { hip::SlotReq r{s, &prompt[i], 1, (int)i}; m.forward(&r, 1); m.accept(s, 1); m.dflash_encode(s, 1, (int)i); }
+      for (int s = 0; s < n_slots; ++s) { if (prefill) { for (int p0 = 0; p0 < P; p0 += 4096) { const int n = std::min(4096, P - p0); hip::SlotReq r{s, prompt.data() + p0, n, p0}; m.forward(&r, 1); m.accept(s, n); m.dflash_encode(s, n, p0); } }
+          else for (size_t i = 0; i < prompt.size(); ++i) { hip::SlotReq r{s, &prompt[i], 1, (int)i}; m.forward(&r, 1); m.accept(s, 1); m.dflash_encode(s, 1, (int)i); }
           m.topk(m.logits(), 1, 1, ids, vals); idl[s] = ids[0]; out[s].push_back(ids[0]); pos[s] = (int)prompt.size(); }
       int rounds = 0, drafted = 0, accepted = 0; double t0 = now_ms(), t_draft = 0, t_verify = 0; int total = 0;
       std::vector<std::vector<int>> batch(n_slots); std::vector<int> nd(n_slots);

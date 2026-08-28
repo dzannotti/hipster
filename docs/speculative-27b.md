@@ -129,3 +129,9 @@ The draft kernels are block-aware (`dfl::Blk{slot, key_end, anchor}` per block o
 block, attention/K-V writes address the block's slot cache, the selector uses the block's anchor), so both slots' blocks
 go through one draft pass (16 GEMV columns). Above Flash-Next's 8-slot plain-decode aggregate (80 t/s) with two streams.
 A third slot needs a 24-row verify (two GEMV launches, ≈2.3× a single pass for 3× the tokens) and does not pay.
+
+DFlash2 after a real prefill (`PREFILL=1`, prompt through the GEMM path in ≤4096-token passes, features captured for
+every row and encoded in 16-row chunks): code prompt 48.7 t/s single (acceptance 72%: the draft sees the prefill's bf16
+activations instead of the decode-quantised ones), 84.7 aggregate with 2 slots, all EXACT. 16K-token prompt
+(`docs/ref/long16k.json`, 64 tokens): EXACT but 9.65 t/s vs 9.94 plain — the T=8 verify pass costs 257 ms at that depth
+(106 at 29 tokens): decode attention reads the 16-layer KV once per row. Next hotspot.

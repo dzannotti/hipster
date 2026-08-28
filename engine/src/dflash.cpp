@@ -38,7 +38,8 @@ void Qwen35::load_dflash(const std::string& path) {
         dfl_->layers.push_back(L);
     }
     const int T = MAXR;
-    CK(hipMalloc(&dfl_feat_, (size_t)MAXR * 5 * E * 4)); CK(hipMalloc(&dfl_g_, (size_t)T * E * 4)); CK(hipMalloc(&dfl_x_, (size_t)T * E * 4)); CK(hipMalloc(&dfl_y_, (size_t)T * E * 4));
+    // every pass captures all its rows into dfl_feat_ (prefill included: 419 MB)
+    CK(hipMalloc(&dfl_feat_, (size_t)D::max_prefill * 5 * E * 4)); CK(hipMalloc(&dfl_g_, (size_t)T * E * 4)); CK(hipMalloc(&dfl_x_, (size_t)T * E * 4)); CK(hipMalloc(&dfl_y_, (size_t)T * E * 4));
     CK(hipMalloc(&dfl_blk_, (size_t)MAXR * sizeof(dfl::Blk)));
     CK(hipMalloc(&dfl_q_, (size_t)T * NQ * HD * 4)); CK(hipMalloc(&dfl_k_, (size_t)T * NKV * HD * 4)); CK(hipMalloc(&dfl_v_, (size_t)T * NKV * HD * 4)); CK(hipMalloc(&dfl_o_, (size_t)T * NQ * HD * 4));
     CK(hipMalloc(&dfl_delta_, (size_t)T * 4 * N_GROUPS * 4)); CK(hipMalloc(&dfl_logits_, (size_t)T * D::n_vocab * 4)); CK(hipMalloc(&dfl_gate_, (size_t)T * RANK * 4));
@@ -49,17 +50,22 @@ void Qwen35::load_dflash(const std::string& path) {
 }
 
 void Qwen35::dflash_encode(int slot, int T, int pos0) {
-    std::vector<int> pos(T); for (int i = 0; i < T; ++i) pos[i] = pos0 + i;
-    CK(hipMemcpyAsync(dfl_pos_, pos.data(), T * 4, hipMemcpyHostToDevice, s_));
-    quantize_x_q8(dfl_feat_ + (size_t)lr0_[slot] * 5 * E, xq_, T, 5 * E, s_);
     uint16_t* kcs = dfl_kc_ + (size_t)slot * dfl_slot_stride_; uint16_t* vcs = dfl_vc_ + (size_t)slot * dfl_slot_stride_;
-    lin(dfl_->fc, dfl_g_, T);
-    add_rmsnorm_quant(dfl_g_, nullptr, dfl_->enc_norm, xn_, xq_, T, E, D::rms_eps, s_);
-    for (size_t l = 0; l < dfl_->layers.size(); ++l) {
-        const DflashLayer& L = dfl_->layers[l];
-        GemvSeg segs[2] = {{L.wk.fmt, L.wk.w, dfl_k_, L.wk.N, L.wk.K}, {L.wv.fmt, L.wv.w, dfl_v_, L.wv.N, L.wv.K}};
-        lin_multi(segs, 2, T);
-        qk_rope_kv(nullptr, dfl_k_, dfl_v_, nullptr, L.k_norm, D::rope_base, dfl_pos_, T, T, nullptr, 0, kcs + l * dfl_layer_stride_, vcs + l * dfl_layer_stride_, max_ctx_, D::rms_eps, s_);
+    for (int c0 = 0; c0 < T; c0 += MAXR) {   // rows in chunks of MAXR through the GEMV path (a prefill's rows included)
+        const int Tc = std::min(MAXR, T - c0);
+        std::vector<int> pos(Tc); for (int i = 0; i < Tc; ++i) pos[i] = pos0 + c0 + i;
+        CK(hipMemcpyAsync(dfl_pos_, pos.data(), Tc * 4, hipMemcpyHostToDevice, s_));
+        static const bool dbg = getenv("DFL_DBG") != nullptr;
+        auto chk = [&](const char* what) { if (!dbg) return; hipError_t e = hipStreamSynchronize(s_); fprintf(stderr, "  encode %s: %s (gm_=%d Tc=%d lr0=%d c0=%d xq=%p feat=%p g=%p)\n", what, hipGetErrorString(e), (int)gm_, Tc, lr0_[slot], c0, (void*)xq_.q, (void*)dfl_feat_, (void*)dfl_g_); };
+        quantize_x_q8(dfl_feat_ + (size_t)(lr0_[slot] + c0) * 5 * E, xq_, Tc, 5 * E, s_); chk("quant");
+        lin(dfl_->fc, dfl_g_, Tc); chk("fc");
+        add_rmsnorm_quant(dfl_g_, nullptr, dfl_->enc_norm, xn_, xq_, Tc, E, D::rms_eps, s_); chk("norm");
+        for (size_t l = 0; l < dfl_->layers.size(); ++l) {
+            const DflashLayer& L = dfl_->layers[l];
+            GemvSeg segs[2] = {{L.wk.fmt, L.wk.w, dfl_k_, L.wk.N, L.wk.K}, {L.wv.fmt, L.wv.w, dfl_v_, L.wv.N, L.wv.K}};
+            lin_multi(segs, 2, Tc);
+            qk_rope_kv(nullptr, dfl_k_, dfl_v_, nullptr, L.k_norm, D::rope_base, dfl_pos_, Tc, Tc, nullptr, 0, kcs + l * dfl_layer_stride_, vcs + l * dfl_layer_stride_, max_ctx_, D::rms_eps, s_);
+        }
     }
 }
 
