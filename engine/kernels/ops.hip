@@ -364,7 +364,7 @@ __global__ void k_qk_norm_rope_kv(float* __restrict__ qf, float* __restrict__ k,
                                   const float* __restrict__ qw, const float* __restrict__ kw, float base, int pos0,
                                   uint16_t* __restrict__ kc, uint16_t* __restrict__ vc, int max_ctx, float eps,
                                   int8_t* __restrict__ kc8, uint16_t* __restrict__ ks, int8_t* __restrict__ vc8, uint16_t* __restrict__ vs,
-                                  RowBatch rb, size_t kv_stride, size_t kvt_stride) {
+                                  RowBatch rb, size_t kv_stride, size_t kvt_stride, int vrow) {
     __shared__ float sh[8]; __shared__ float buf[256];
     const int t = threadIdx.x, hb = blockIdx.x % (NQ + NKV), tt = blockIdx.x / (NQ + NKV);
     const int pos = rb.n ? rb.pos[tt] : pos0 + tt, slot = rb.n ? rb.kv[tt] : 0;
@@ -391,7 +391,8 @@ __global__ void k_qk_norm_rope_kv(float* __restrict__ qf, float* __restrict__ k,
         const float vv = v[(size_t)tt * NKV * 256 + kh * 256 + t];
         if constexpr (!I8) {
             kc[((size_t)kh * max_ctx + pos) * 256 + t] = f2h(n);   // K head-major [kh][pos][256]
-            vc[((size_t)kh * 256 + t) * cp + pos] = f2h(vv);       // V^T [kh][dim][pos]
+            if (vrow) vc[((size_t)kh * max_ctx + pos) * 256 + t] = f2h(vv);   // V row-major like K (gather attention)
+            else vc[((size_t)kh * 256 + t) * cp + pos] = f2h(vv);            // V^T [kh][dim][pos]
         } else {
             // K: per-32-dim block absmax scale (8 per row); V: one scale per position over 256 dims
             float am = fabsf(n);
@@ -766,39 +767,48 @@ void silu_mul_quant(const float* gate, const float* up, XQ8 xq, int n, hipStream
 }
 void attn_decode(float* q_full, float* k, float* v, int T, const float* q_norm_w, const float* k_norm_w, float rope_base, int pos0,
                  uint16_t* kc, uint16_t* vc, int max_ctx, float* out, XQ8 xq, float eps, hipStream_t s) {
-    k_qk_norm_rope_kv<24, 4, false><<<28 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, pos0, kc, vc, max_ctx, eps, nullptr, nullptr, nullptr, nullptr, RowBatch{}, 0, 0);
+    k_qk_norm_rope_kv<24, 4, false><<<28 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, pos0, kc, vc, max_ctx, eps, nullptr, nullptr, nullptr, nullptr, RowBatch{}, 0, 0, 0);
     k_attn<24, 4, false><<<24 * T, 256, 0, s>>>(q_full, kc, vc, nullptr, nullptr, nullptr, nullptr, pos0, max_ctx, out, xq.q, xq.d, xq.s, RowBatch{}, 0, 0);
 }
 void attn_decode_i8(float* q_full, float* k, float* v, int T, const float* q_norm_w, const float* k_norm_w, float rope_base, int pos0,
                     const KV8& c, int max_ctx, float* out, XQ8 xq, float eps, hipStream_t s) {
-    k_qk_norm_rope_kv<24, 4, true><<<28 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, pos0, nullptr, nullptr, max_ctx, eps, c.k, c.ks, c.v, c.vs, RowBatch{}, 0, 0);
+    k_qk_norm_rope_kv<24, 4, true><<<28 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, pos0, nullptr, nullptr, max_ctx, eps, c.k, c.ks, c.v, c.vs, RowBatch{}, 0, 0, 0);
     k_attn<24, 4, true><<<24 * T, 256, 0, s>>>(q_full, nullptr, nullptr, c.k, c.ks, c.v, c.vs, pos0, max_ctx, out, xq.q, xq.d, xq.s, RowBatch{}, 0, 0);
 }
 // Flash-Next geometry: 24 q heads, 2 kv heads (dense; exact below the QSA budget)
 void attn_decode_24_2(float* q_full, float* k, float* v, int T, const float* q_norm_w, const float* k_norm_w, float rope_base, int pos0,
                       uint16_t* kc, uint16_t* vc, int max_ctx, float* out, XQ8 xq, float eps, hipStream_t s) {
-    k_qk_norm_rope_kv<24, 2, false><<<26 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, pos0, kc, vc, max_ctx, eps, nullptr, nullptr, nullptr, nullptr, RowBatch{}, 0, 0);
+    k_qk_norm_rope_kv<24, 2, false><<<26 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, pos0, kc, vc, max_ctx, eps, nullptr, nullptr, nullptr, nullptr, RowBatch{}, 0, 0, 0);
     k_attn<24, 2, false><<<24 * T, 256, 0, s>>>(q_full, kc, vc, nullptr, nullptr, nullptr, nullptr, pos0, max_ctx, out, xq.q, xq.d, xq.s, RowBatch{}, 0, 0);
 }
 void attn_decode_24_2_b(float* q_full, float* k, float* v, int T, const float* q_norm_w, const float* k_norm_w, float rope_base, const RowBatch& rb,
                         uint16_t* kc, uint16_t* vc, size_t kv_stride, size_t kvt_stride, int max_ctx, float* out, XQ8 xq, float eps, hipStream_t s) {
-    k_qk_norm_rope_kv<24, 2, false><<<26 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, 0, kc, vc, max_ctx, eps, nullptr, nullptr, nullptr, nullptr, rb, kv_stride, kvt_stride);
+    k_qk_norm_rope_kv<24, 2, false><<<26 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, 0, kc, vc, max_ctx, eps, nullptr, nullptr, nullptr, nullptr, rb, kv_stride, kvt_stride, 0);
     k_attn<24, 2, false><<<24 * T, 256, 0, s>>>(q_full, kc, vc, nullptr, nullptr, nullptr, nullptr, 0, max_ctx, out, xq.q, xq.d, xq.s, rb, kv_stride, kvt_stride);
+}
+// Flash-Next QSA path: norm + rope + K/V write only (V row-major), per-row positions/slots
+void attn_rope_kv_24_2_rowv(float* q_full, float* k, const float* v, int T, const float* q_norm_w, const float* k_norm_w, float rope_base, const RowBatch& rb,
+                            uint16_t* kc, uint16_t* vc, size_t kv_stride, int max_ctx, float eps, hipStream_t s) {
+    k_qk_norm_rope_kv<24, 2, false><<<26 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, 0, kc, vc, max_ctx, eps, nullptr, nullptr, nullptr, nullptr, rb, kv_stride, kv_stride, 1);
+}
+void attn_rope_kv_24_2_rowv_pos0(float* q_full, float* k, const float* v, int T, const float* q_norm_w, const float* k_norm_w, float rope_base, int pos0,
+                                 uint16_t* kc, uint16_t* vc, int max_ctx, float eps, hipStream_t s) {
+    k_qk_norm_rope_kv<24, 2, false><<<26 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, pos0, kc, vc, max_ctx, eps, nullptr, nullptr, nullptr, nullptr, RowBatch{}, 0, 0, 1);
 }
 void attn_decode_gqa(float* q_full, float* k, float* v, int T, const float* q_norm_w, const float* k_norm_w, float rope_base, int pos0,
                      uint16_t* kc, uint16_t* vc, int max_ctx, float* out, XQ8 xq, float* pO, float* pm, float* pl, float eps, hipStream_t s) {
-    k_qk_norm_rope_kv<24, 4, false><<<28 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, pos0, kc, vc, max_ctx, eps, nullptr, nullptr, nullptr, nullptr, RowBatch{}, 0, 0);
+    k_qk_norm_rope_kv<24, 4, false><<<28 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, pos0, kc, vc, max_ctx, eps, nullptr, nullptr, nullptr, nullptr, RowBatch{}, 0, 0, 0);
     const int nsplit = (pos0 + T + GQA_CH - 1) / GQA_CH;
     k_attn_gqa<<<4 * nsplit, 32, 0, s>>>(q_full, kc, vc, T, pos0, max_ctx, nsplit, pO, pm, pl);
     k_attn_merge<<<4 * 6 * T, 256, 0, s>>>(q_full, pO, pm, pl, T, nsplit, out, xq.q, xq.d, xq.s);
 }
 void attn_stage1(float* q_full, float* k, const float* v, int T, const float* q_norm_w, const float* k_norm_w, float rope_base, int pos0,
                  uint16_t* kc, uint16_t* vc, int max_ctx, float eps, hipStream_t s) {
-    k_qk_norm_rope_kv<24, 4, false><<<28 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, pos0, kc, vc, max_ctx, eps, nullptr, nullptr, nullptr, nullptr, RowBatch{}, 0, 0);
+    k_qk_norm_rope_kv<24, 4, false><<<28 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, pos0, kc, vc, max_ctx, eps, nullptr, nullptr, nullptr, nullptr, RowBatch{}, 0, 0, 0);
 }
 void attn_stage1_i8(float* q_full, float* k, const float* v, int T, const float* q_norm_w, const float* k_norm_w, float rope_base, int pos0,
                     const KV8& c, int max_ctx, float eps, hipStream_t s) {
-    k_qk_norm_rope_kv<24, 4, true><<<28 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, pos0, nullptr, nullptr, max_ctx, eps, c.k, c.ks, c.v, c.vs, RowBatch{}, 0, 0);
+    k_qk_norm_rope_kv<24, 4, true><<<28 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, pos0, nullptr, nullptr, max_ctx, eps, c.k, c.ks, c.v, c.vs, RowBatch{}, 0, 0, 0);
 }
 void attn_prefill(const float* q_full, const uint16_t* kc, const uint16_t* vc, int T, int pos0, int max_ctx, uint16_t* out_bf16, hipStream_t s) {
     k_attn_prefill<false, 4><<<24 * ((T + 63) / 64), 128, 0, s>>>(q_full, kc, vc, nullptr, nullptr, nullptr, nullptr, T, pos0, max_ctx, out_bf16);
@@ -809,7 +819,7 @@ void attn_prefill_i8(const float* q_full, const KV8& c, int T, int pos0, int max
 // Flash-Next prefill: 24 q / 2 kv heads
 void attn_stage1_24_2(float* q_full, float* k, const float* v, int T, const float* q_norm_w, const float* k_norm_w, float rope_base, int pos0,
                       uint16_t* kc, uint16_t* vc, int max_ctx, float eps, hipStream_t s) {
-    k_qk_norm_rope_kv<24, 2, false><<<26 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, pos0, kc, vc, max_ctx, eps, nullptr, nullptr, nullptr, nullptr, RowBatch{}, 0, 0);
+    k_qk_norm_rope_kv<24, 2, false><<<26 * T, 256, 0, s>>>(q_full, k, v, q_norm_w, k_norm_w, rope_base, pos0, kc, vc, max_ctx, eps, nullptr, nullptr, nullptr, nullptr, RowBatch{}, 0, 0, 0);
 }
 void attn_prefill_24_2(const float* q_full, const uint16_t* kc, const uint16_t* vc, int T, int pos0, int max_ctx, uint16_t* out_bf16, hipStream_t s) {
     k_attn_prefill<false, 2><<<24 * ((T + 63) / 64), 128, 0, s>>>(q_full, kc, vc, nullptr, nullptr, nullptr, nullptr, T, pos0, max_ctx, out_bf16);

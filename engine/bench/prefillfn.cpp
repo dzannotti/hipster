@@ -29,17 +29,20 @@ int main(int argc, char** argv) {
     if (getenv("HIPSTER_PROMPT_CUT")) prompt.resize(std::min<size_t>(prompt.size(), atoi(getenv("HIPSTER_PROMPT_CUT"))));   // diff tests on short prompts
     const int n_gen = argc > 3 ? atoi(argv[3]) : 12, chunk = argc > 4 ? atoi(argv[4]) : 2048;
     std::vector<int> sizes; for (int i = 5; i < argc; ++i) sizes.push_back(atoi(argv[i])); if (sizes.empty()) sizes = {512, 1024, 2048};
-    hip::Qwen4Exp m(argv[1], 8192, 1, chunk);
+    const int max_ctx = std::max(8192, (int)((prompt.size() + n_gen + 1023) / 1024 * 1024));
+    hip::Qwen4Exp m(argv[1], max_ctx, 1, chunk);
     const int V = hip::FnDims::n_vocab;
     int ids[16]; float vals[16];
     auto greedy = [&](int pos, int n) { std::vector<int> out; m.topk(m.logits(), 1, 1, ids, vals); int cur = ids[0];
         for (int i = 0; i < n; ++i) { out.push_back(cur); m.forward(&cur, 1, pos++); m.accept(1); m.topk(m.logits(), 1, 1, ids, vals); cur = ids[0]; } return out; };
 
-    // reference: token by token
-    std::vector<float> lref(V);
-    m.reset(); { m.dbg_arm(true); int pos = 0; for (int t : prompt) { m.forward(&t, 1, pos++); m.accept(1); } m.dbg_arm(false); }
-    hipMemcpy(lref.data(), m.logits(), (size_t)V * 4, hipMemcpyDeviceToHost);
-    auto gref = greedy((int)prompt.size(), n_gen);
+    // reference: token by token (HIPSTER_NO_DECODE_REF=1 skips it: 16K tokens take 10 minutes)
+    std::vector<float> lref(V, 0.f); std::vector<int> gref(n_gen, -1);
+    if (!getenv("HIPSTER_NO_DECODE_REF")) {
+        m.reset(); { m.dbg_arm(true); int pos = 0; for (int t : prompt) { m.forward(&t, 1, pos++); m.accept(1); } m.dbg_arm(false); }
+        hipMemcpy(lref.data(), m.logits(), (size_t)V * 4, hipMemcpyDeviceToHost);
+        gref = greedy((int)prompt.size(), n_gen);
+    }
     // chunked prefill
     m.reset(); double tp = 0;
     for (int c0 = 0; c0 < (int)prompt.size(); c0 += chunk) { const int n = std::min(chunk, (int)prompt.size() - c0); tp += m.prefill(&prompt[c0], n, c0); }
@@ -60,6 +63,8 @@ int main(int argc, char** argv) {
     m.dbg_report();
     auto gpf = greedy((int)prompt.size(), n_gen);
     int match = 0; for (int i = 0; i < n_gen; ++i) if (gref[i] == gpf[i]) ++match;
+    { auto rg = parse_ids(buf.str(), "gen_ids"); int mr = 0; for (size_t i = 0; i < rg.size() && i < gpf.size(); ++i) if (rg[i] == gpf[i]) ++mr; else break;
+      printf("vs llama.cpp continuation (%zu ref tokens): first %d identical\n", rg.size(), mr); }
     printf("prefill of the %zu-token prompt in chunks of %d: %.1f ms; last-row top-1 %s (%d vs %d), max |logit diff| %.3f; greedy continuation %d/%d identical\n",
            prompt.size(), chunk, tp, a1 == a2 ? "identical" : "DIFFERENT", a1, a2, md, match, n_gen);
     // throughput: synthetic prompt (the reference prompt repeated), warm-up run per size (hipBLASLt autotune), then 2 timed runs

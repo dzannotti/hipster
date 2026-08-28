@@ -17,7 +17,7 @@ target_link_libraries(hipster_core PUBLIC hip::host)
 add_executable(bench_gemv bench/bench_gemv.cpp)
 target_link_libraries(bench_gemv hipster_core)
 
-target_sources(hipster_core PRIVATE kernels/ops.hip kernels/gemm.hip kernels/fn.hip src/qwen35.cpp src/qwen4exp.cpp)
+target_sources(hipster_core PRIVATE kernels/ops.hip kernels/gemm.hip kernels/fn.hip kernels/qsa.hip src/qwen35.cpp src/qwen4exp.cpp)
 target_link_directories(hipster_core PUBLIC /opt/rocm/lib)
 target_link_libraries(hipster_core PUBLIC /opt/rocm/lib/libhipblaslt.so)
 add_executable(run27b bench/run27b.cpp)

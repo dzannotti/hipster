@@ -6,6 +6,7 @@
 #include "../kernels/gemv.h"
 #include "../kernels/ops.h"
 #include "../kernels/gemm.h"
+#include "../kernels/qsa.h"
 #include <hip/hip_runtime.h>
 #include <string>
 #include <vector>
@@ -33,8 +34,9 @@ struct FnLayer {
     FnLin hc_attn_down, hc_attn_up, hc_ffn_down, hc_ffn_up;
     // GDN
     FnLin qkv, zgate, beta, alpha, ssm_out; float *conv_w, *dt_bias, *a_neg, *ssm_norm;
-    // attention
+    // attention (+ QSA indexer: bf16 projections, raw keys cached per token, 4 query heads)
     FnLin wq, wk, wv, wo; float *q_norm, *k_norm;
+    uint16_t *idx_k = nullptr, *idx_q = nullptr; float *idx_kn = nullptr, *idx_qn = nullptr;
     // MoE
     float* router;        // f32 [512][2560]
     float* shexp_gate;    // f32 [2560]
@@ -97,7 +99,10 @@ private:
     void head(int T, const Pending& p, float* R, float* logits_out);
     void hc_block(const FnLayer& L, bool ffn, int T, const Pending& p, float* mixed, float* inject_out, float* R);
     void ple(const SlotReq* reqs, int S, const int* r0s, int rows);
-    void attn_layer_b(const FnLayer& L, int rows, const RowBatch& rb, uint16_t* kc, uint16_t* vc, size_t kvs, size_t kvts);
+    // indexer + top-k selection (qsa) or dense, norm/rope/KV write, gather attention -> ao f32 [rows][24][256] (+ xq)
+    void qsa_attention(const FnLayer& L, int rows, const std::vector<int>& pos, const std::vector<int>& kv, const RowBatch* rb, const float* mixed,
+                       float* qf, float* k, float* v, float* ao, XQ8 xq, uint16_t* kc, uint16_t* vc, size_t kvs, int ai, bool qsa);
+    void attn_layer_b(const FnLayer& L, int rows, const RowBatch& rb, uint16_t* kc, uint16_t* vc, size_t kvs, int ai, bool qsa);
     void gemv_cols(WFmt fmt, const void* w, int N, int K, int tpr, float* y, int ncol);
     void ple_rows(const std::vector<int>& hist, const int* tokens, int T, float* emb_out);   // host hash + gather -> emb_out [T][2560]
     void lin_gemm(const GemvSeg* segs, int n, int M, const uint16_t* A);                      // dequant segments -> one GEMM -> gout_ bf16 [M][sum N]
@@ -113,7 +118,10 @@ private:
     uint8_t* tok_embd_ = nullptr; float* head_norm_ = nullptr; FnLin head_down_, head_up_, output_;
     // per-slot state, double-buffered: index slot*2 + buf, cur_[slot] = committed buffer
     float *gdn_state_, *conv_state_, *ple_state_; size_t st_stride_, cs_stride_, ple_stride_; std::vector<int> cur_;
-    uint16_t *kc_, *vc_, *mkc_ = nullptr, *mvc_ = nullptr; size_t kv_stride_, kvt_stride_, mkv_stride_, mkvt_stride_;   // per-slot strides (elements)
+    uint16_t *kc_, *vc_, *mkc_ = nullptr, *mvc_ = nullptr; size_t kv_stride_, mkv_stride_;   // per-slot strides (elements); K and V both [kh][pos][256]
+    // QSA: raw indexer keys f16 [slot][attn layer][max_ctx][128], pooled block keys f32 [slot][layer][max_ctx/4][128]
+    uint16_t* idxc_ = nullptr; float* pooled_ = nullptr; size_t idx_slot_stride_, pooled_slot_stride_; int max_blocks_;
+    int *d_idx_ = nullptr, *d_cnt_, *d_pos_, *d_kv_; float *q_raw_, *q_idx_, *k_idx_, *sel_scratch_, *part_; int idx_rows_;
     FnMtp mtp_; bool has_mtp_ = false;
     // saved inputs of the last pass (by row) for replay on partial accept, and each slot's rows in it
     float *sv_qkv_, *sv_beta_, *sv_alpha_, *sv_plekey_, *sv_pleval_, *sv_pleR_, *ple_scratch_;

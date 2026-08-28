@@ -3,7 +3,7 @@
 prompt with a planted needle at ~40% depth and a question, records token ids, the greedy answer
 and the top-10 logprobs at the last prompt position. usage: ref-long.py <target_tokens> <name>"""
 import json, sys, urllib.request, os, random
-URL = "http://127.0.0.1:18082"
+URL = os.environ.get("REF_URL", "http://127.0.0.1:18082")
 def post(path, body):
     req = urllib.request.Request(URL + path, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
     return json.loads(urllib.request.urlopen(req, timeout=36000).read())

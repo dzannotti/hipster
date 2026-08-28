@@ -63,6 +63,10 @@ void gdn_step_sig_b(const float* qkv, const float* z, const float* beta_raw, con
                     const float* st_base, float* st_obase, const float* norm_w, float* out, XQ8 xq, float eps, hipStream_t s);
 void attn_decode_24_2_b(float* q_full, float* k, float* v, int T, const float* q_norm_w, const float* k_norm_w, float rope_base, const RowBatch& rb,
                         uint16_t* kc, uint16_t* vc, size_t kv_stride, size_t kvt_stride, int max_ctx, float* out, XQ8 xq, float eps, hipStream_t s);
+void attn_rope_kv_24_2_rowv(float* q_full, float* k, const float* v, int T, const float* q_norm_w, const float* k_norm_w, float rope_base, const RowBatch& rb,
+                            uint16_t* kc, uint16_t* vc, size_t kv_stride, int max_ctx, float eps, hipStream_t s);
+void attn_rope_kv_24_2_rowv_pos0(float* q_full, float* k, const float* v, int T, const float* q_norm_w, const float* k_norm_w, float rope_base, int pos0,
+                                 uint16_t* kc, uint16_t* vc, int max_ctx, float eps, hipStream_t s);
 void attn_decode_24_2(float* q_full, float* k, float* v, int T, const float* q_norm_w, const float* k_norm_w, float rope_base, int pos0,
                       uint16_t* kc, uint16_t* vc, int max_ctx, float* out, XQ8 xq, float eps, hipStream_t s);
 

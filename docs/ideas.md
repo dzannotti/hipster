@@ -90,10 +90,10 @@ the value is elsewhere:
 | expert GEMV: one launch over the 10 routed experts × T tokens, expert ids in device memory (no host sync) | measured: gate\|up + shared expert in one launch 227 GB/s; down (K=640) 152 GB/s at 16 lanes/row; combine folded into the launch (atomics) |
 | prefetch expert i+1 while computing expert i; SwiGLU × routing weight fused into the down-proj input | untested |
 | requantise the 4.1 GB of Q8_0 dense tensors (attention/GDN/hc) to ~5 bits (floor 37 → ~60 t/s) — needs the artifact converter | untested |
-| QSA indexer: index keys on the WMMA M axis, (queries × 4 heads) on N, one score per (q, block); int8 keys with power-of-two scales | untested |
-| QSA top-512 blocks: LDS radix select; previous step's threshold as the initial guess; one selection per MTP round (IndexShare) | untested |
-| sparse gather attention: 64-key index tiles, −1 sentinels, base-2 online softmax with lazy rescale, split-KV + LSE merge | untested |
-| PLE gather: hash on the host at sampling time, issue the 16-row gather + key/value GEMVs so it lands by layer 1; hot-row LRU | partially (host hash + sync gather); prefetch untested |
+| QSA indexer: index keys on the WMMA M axis, (queries × 4 heads) on N, one score per (q, block); int8 keys with power-of-two scales | scalar version done + exact (4K/16K refs); WMMA scoring untested |
+| QSA top-512 blocks: LDS radix select; previous step's threshold as the initial guess; one selection per MTP round (IndexShare) | radix select done (per query block, 4×8-bit passes); threshold reuse / IndexShare untested |
+| sparse gather attention: 64-key index tiles, −1 sentinels, base-2 online softmax with lazy rescale, split-KV + LSE merge | scalar 32-key tiles + split/merge done; WMMA version untested (12× slower than the flash kernel on dense chunks) |
+| PLE gather: hash on the host at sampling time, issue the 16-row gather + key/value GEMVs so it lands by layer 1; hot-row LRU | MADV_WILLNEED batch gather (0.4 ms/token warm, 0.75 cold); next-chunk prefetch during prefill / io_uring untested |
 | gated residual: read/write as two fused kernels; residual streams in FP8 (Qwen: negligible loss) | write folded into the next read's norm (0 launches); read = norm + split-K down + silu + up + mix; FP8 streams untested |
 | MoE prefill: sort tokens by expert, per-expert GEMM tiles sized by average rows/expert, shared activation quant for gate/up | untested |
 | MTP block (QSA + MoE + hc) with the frozen top-k across draft steps | done (dense attention): 27.4 → 37.2 t/s at n=2, exact; acceptance 69% first draft, decays fast (docs/decode-flash-next.md) |
@@ -110,6 +110,7 @@ the value is elsewhere:
 | idea | status |
 |---|---|
 | Flash-Next: the XL keeps GDN/attention projections at Q8_0 = 1.96 GB of the 6.1 GB streamed per token (32%); a lower-bit variant of just those tensors is worth up to ~4 ms/token | untested — needs the KL/needle gate on the candidate file |
+| Flash-Next: requantise the Q8_0 dense projections to Q6_K/Q5_K at load (our own artifact or a load-time pass): 6.1 → ~5.0 GB/token, floor 39 → ~48 t/s; gate on KL vs the Q8_0 run + needle (ROCmFP4-FAST shows the byte math, at +10% PPL) | untested |
 | 27B: XS vs XL — speed is bytes-proportional (decode is bandwidth-bound), quality must be measured with our KL-vs-reference + 16K/32K needle gate | untested — needs the XS GGUF on a non-/srv path |
 
 ## Speculation

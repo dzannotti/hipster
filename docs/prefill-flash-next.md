@@ -61,3 +61,19 @@ the registers that the occupancy needed. The two lane-halves of a WMMA fragment 
 (the layout mirrors them) — a half-split dequant + lane swap is the remaining structural idea (≤2× on the dequant part).
 Decision: the int8 kernel with 16-column tiles stays (fastest measured, and its activation quantisation is decode's).
 MoE ≈ 1.0 s of the 2.05 s prefill at 2048 tokens; the floor of this tiling would be ≈ 0.45 s.
+
+## 2026-08-28 (cont.) — QSA sparse attention: exact beyond 2051 tokens, 4K and 16K references
+Kernels (`engine/kernels/qsa.{h,hip}`): bf16 indexer projections (x rounded to bf16 as ggml does), raw keys cached f16
+per token, per-block pooling (mean of 4 → rmsnorm·w → rope at pos 4b) recomputed each pass for the blocks it touches,
+4-head relu scoring, radix top-K over blocks with ascending-id ties (K = 512 blocks, +1 partial block when the
+incomplete tail has fewer than 3 tokens, exactly the reference's width = min(n_kv, 2051)), gather attention over the
+per-query key list (12 q heads per kv head, 32-key tiles in LDS, online softmax; 16 key-splits + merge for decode;
+dense list below 2051 keys — bit-identical to the old dense kernel, unit-tested). V cache now row-major like K.
+References from llama.cpp (`tools/ref-long.py` against the fn-tree ROCm build, needle at 40% depth):
+| prompt | llama.cpp prefill | ours (2048 chunks) | last-row top-10 Δlogprob | continuation | needle |
+|---|---:|---:|---:|---|---|
+| 4111 tokens | 9.7 s (425 t/s) | 7.9 s (**520 t/s**, incl. 3.1 s cold n-gram gather) | 1.47 | 7/7 identical (decode path too) | amber-falcon-73 ✓ |
+| 16767 tokens | 51.1 s (328 t/s) | 31.7 s (**530 t/s**) | 1.32 | 7/7 identical | ✓ |
+Costs surfaced: the scalar gather attention is ~12× slower than the WMMA flash kernel on the ≤2K dense chunk
+(72 vs 6 ms per layer) and the per-query selection scans dominate at 16K (attention phase 40%); the host n-gram gather
+is 0.75 ms/token cold (65K random NVMe rows per 4K prompt) — both next.

@@ -3,6 +3,7 @@
 //  2. attention 24q/2kv: attn_stage1_24_2 + attn_prefill_24_2 (bf16 out) vs attn_decode_24_2 (f32 out) on the same KV.
 #include "../kernels/ops.h"
 #include "../kernels/gemv.h"
+#include "../kernels/qsa.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -70,6 +71,16 @@ int main(int argc, char** argv) {
         report("out: flash prefill (bf16) vs decode", o2, o1);
         auto k1 = down(kc1, kvn), k2 = down(kc2, kvn); size_t nd_ = 0; for (size_t i = 0; i < kvn; ++i) nd_ += k1[i] != k2[i]; printf("  KV cache K entries differing: %zu\n", nd_);
         for (int t : {0, 1, T / 2, T - 1}) { double md = 0, mx = 0; for (int i = 0; i < NQ * HD; ++i) { md = fmax(md, fabs((double)o1[(size_t)t * NQ * HD + i] - o2[(size_t)t * NQ * HD + i])); mx = fmax(mx, fabs((double)o1[(size_t)t * NQ * HD + i])); } printf("    query %2d: max|diff| %.3e (%.3f%%)\n", t, md, 100 * md / mx); }
+        // 3. gather attention (dense list, row-major V) vs the dense decode kernel, nsplit 1 and 16
+        float *dq3 = up(q), *dk3 = up(k); uint16_t *kc3, *vc3; CK(hipMalloc(&kc3, kvn * 2)); CK(hipMalloc(&vc3, kvn * 2));
+        std::vector<int> pos(T), kvs(T, 0); for (int i = 0; i < T; ++i) pos[i] = i; int *dpos = up(pos), *dkv = up(kvs);
+        hip::attn_rope_kv_24_2_rowv_pos0(dq3, dk3, dv, T, dqw, dkw, 1e7f, pos0, kc3, vc3, max_ctx, eps, s);
+        float* part; CK(hipMalloc(&part, (size_t)T * 2 * 16 * 12 * 258 * 4)); float* out3; CK(hipMalloc(&out3, (size_t)T * NQ * HD * 4));
+        for (int nsplit : {1, 16}) {
+            hip::qsa::attend(dq3, kc3, vc3, kvn, max_ctx, dpos, dkv, nullptr, nullptr, T, nsplit, part, out3, xq, s);
+            CK(hipDeviceSynchronize()); auto o3 = down(out3, (size_t)T * NQ * HD);
+            char what[64]; snprintf(what, sizeof what, "gather attention (dense, nsplit %d) vs decode", nsplit); report(what, o3, o1);
+        }
     }
     return 0;
 }

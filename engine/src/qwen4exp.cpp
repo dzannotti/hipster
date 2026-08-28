@@ -66,6 +66,12 @@ void Qwen4Exp::load_layer(const GGUF& g, int il, FnLayer& L, bool attn) {
         if (attn) {
             L.wq = upload_lin(g, p + "attn_q.weight"); L.wk = upload_lin(g, p + "attn_k.weight"); L.wv = upload_lin(g, p + "attn_v.weight"); L.wo = upload_lin(g, p + "attn_output.weight");
             L.q_norm = upload_f32(g, p + "attn_q_norm.weight", D::head_dim); L.k_norm = upload_f32(g, p + "attn_k_norm.weight", D::head_dim);
+            if (g.has(p + "indexer.k_proj.weight")) {   // QSA indexer (the MTP block carries one too but attends dense)
+                auto raw = [&](const std::string& name, size_t n) { const GTensor& t = g.get(name); if (t.type != GType::BF16 || t.nbytes != n * 2) throw std::runtime_error("indexer weight must be bf16: " + name);
+                    std::vector<uint8_t> st(t.nbytes); g.read_tensor(t, st.data()); uint16_t* d; CK(hipMalloc(&d, t.nbytes)); CK(hipMemcpy(d, st.data(), t.nbytes, hipMemcpyHostToDevice)); weight_bytes_ += t.nbytes; return d; };
+                L.idx_k = raw(p + "indexer.k_proj.weight", (size_t)qsa::IDX_DIM * D::n_embd); L.idx_q = raw(p + "indexer.q_proj.weight", (size_t)qsa::IDX_HEADS * qsa::IDX_DIM * D::n_embd);
+                L.idx_kn = upload_f32(g, p + "indexer.k_norm.weight", qsa::IDX_DIM); L.idx_qn = upload_f32(g, p + "indexer.q_norm.weight", qsa::IDX_DIM);
+            }
         } else {
             L.qkv = upload_lin(g, p + "attn_qkv.weight"); L.zgate = upload_lin(g, p + "attn_gate.weight");
             L.beta = upload_lin(g, p + "ssm_beta.weight"); L.alpha = upload_lin(g, p + "ssm_alpha.weight"); L.ssm_out = upload_lin(g, p + "ssm_out.weight");
@@ -151,12 +157,19 @@ Qwen4Exp::Qwen4Exp(const std::string& path, int max_ctx, int n_slots, int max_pr
     CK(hipMalloc(&sv_qkv_, (size_t)D::n_gdn * MAXR * D::gdn_qkv * 4)); CK(hipMalloc(&sv_beta_, (size_t)D::n_gdn * MAXR * 64 * 4)); CK(hipMalloc(&sv_alpha_, (size_t)D::n_gdn * MAXR * 64 * 4));
     CK(hipMalloc(&sv_plekey_, (size_t)MAXR * D::wide * 4)); CK(hipMalloc(&sv_pleval_, (size_t)MAXR * D::n_embd * 4));
     CK(hipMalloc(&sv_pleR_, (size_t)MAXR * D::wide * 4)); CK(hipMalloc(&ple_scratch_, (size_t)MAXR * D::wide * 4));
-    kv_stride_ = (size_t)D::n_attn * max_ctx_ * D::n_head_kv * D::head_dim; kvt_stride_ = (size_t)D::n_attn * (max_ctx_ + 128) * D::n_head_kv * D::head_dim;
-    CK(hipMalloc(&kc_, (size_t)n_slots_ * kv_stride_ * 2)); CK(hipMalloc(&vc_, (size_t)n_slots_ * kvt_stride_ * 2)); CK(hipMemset(vc_, 0, (size_t)n_slots_ * kvt_stride_ * 2));
+    kv_stride_ = (size_t)D::n_attn * max_ctx_ * D::n_head_kv * D::head_dim;
+    CK(hipMalloc(&kc_, (size_t)n_slots_ * kv_stride_ * 2)); CK(hipMalloc(&vc_, (size_t)n_slots_ * kv_stride_ * 2));
+    max_blocks_ = max_ctx_ / qsa::R; idx_slot_stride_ = (size_t)D::n_attn * max_ctx_ * qsa::IDX_DIM; pooled_slot_stride_ = (size_t)D::n_attn * max_blocks_ * qsa::IDX_DIM;
+    CK(hipMalloc(&idxc_, (size_t)n_slots_ * idx_slot_stride_ * 2)); CK(hipMalloc(&pooled_, (size_t)n_slots_ * pooled_slot_stride_ * 4));
+    idx_rows_ = std::max(MAXR, max_prefill_);
+    CK(hipMalloc(&d_idx_, (size_t)idx_rows_ * qsa::WIDTH * 4)); CK(hipMalloc(&d_cnt_, (size_t)idx_rows_ * 4));
+    CK(hipMalloc(&q_raw_, (size_t)idx_rows_ * qsa::IDX_HEADS * qsa::IDX_DIM * 4)); CK(hipMalloc(&q_idx_, (size_t)idx_rows_ * qsa::IDX_HEADS * qsa::IDX_DIM * 4)); CK(hipMalloc(&k_idx_, (size_t)idx_rows_ * qsa::IDX_DIM * 4));
+    CK(hipMalloc(&sel_scratch_, (size_t)256 * max_blocks_ * 4)); CK(hipMalloc(&part_, (size_t)MAXR * 2 * 32 * 12 * 258 * 4));
+    CK(hipMalloc(&d_pos_, (size_t)idx_rows_ * 4)); CK(hipMalloc(&d_kv_, (size_t)idx_rows_ * 4));
     const int T = MAXR;
     CK(hipMalloc(&R_, (size_t)T * D::wide * 4)); CK(hipMalloc(&R_mtp_, (size_t)T * D::wide * 4)); CK(hipMalloc(&mlogits_, (size_t)T * D::n_vocab * 4));
-    if (has_mtp_) { mkv_stride_ = (size_t)max_ctx_ * D::n_head_kv * D::head_dim; mkvt_stride_ = (size_t)(max_ctx_ + 128) * D::n_head_kv * D::head_dim;
-                    CK(hipMalloc(&mkc_, (size_t)n_slots_ * mkv_stride_ * 2)); CK(hipMalloc(&mvc_, (size_t)n_slots_ * mkvt_stride_ * 2)); CK(hipMemset(mvc_, 0, (size_t)n_slots_ * mkvt_stride_ * 2)); }
+    if (has_mtp_) { mkv_stride_ = (size_t)max_ctx_ * D::n_head_kv * D::head_dim;
+                    CK(hipMalloc(&mkc_, (size_t)n_slots_ * mkv_stride_ * 2)); CK(hipMalloc(&mvc_, (size_t)n_slots_ * mkv_stride_ * 2)); }
     CK(hipMalloc(&xn_, (size_t)T * D::wide * 4)); CK(hipMalloc(&lo_, (size_t)T * KSPLIT * D::hc_lr * 4)); CK(hipMalloc(&up_, (size_t)T * D::wide * 4));
     CK(hipMalloc(&mixed_, (size_t)T * D::n_embd * 4)); CK(hipMalloc(&inject_, (size_t)T * 20 * 4 * 4)); CK(hipMalloc(&inject2_, (size_t)T * 20 * 4 * 4)); CK(hipMalloc(&ymoe_, (size_t)T * D::n_embd * 4)); CK(hipMalloc(&y_, (size_t)T * D::n_embd * 4));
     const size_t bigw = (size_t)T * 12288;   // largest per-token row: attention q (24 x 512); qkv is 10240
@@ -274,11 +287,38 @@ void Qwen4Exp::ple(const SlotReq* reqs, int S, const int* r0s, int rows) {
     }
 }
 
-void Qwen4Exp::attn_layer_b(const FnLayer& L, int rows, const RowBatch& rb, uint16_t* kc, uint16_t* vc, size_t kvs, size_t kvts) {
+// rows described by host arrays pos[]/kv[] (uploaded to d_pos_/d_kv_); rb == null: single slot, consecutive positions from pos[0]
+void Qwen4Exp::qsa_attention(const FnLayer& L, int rows, const std::vector<int>& pos, const std::vector<int>& kv, const RowBatch* rb, const float* mixed,
+                             float* qf, float* k, float* v, float* ao, XQ8 xq, uint16_t* kc, uint16_t* vc, size_t kvs, int ai, bool qsa) {
+    CK(hipMemcpyAsync(d_pos_, pos.data(), rows * 4, hipMemcpyHostToDevice, s_)); CK(hipMemcpyAsync(d_kv_, kv.data(), rows * 4, hipMemcpyHostToDevice, s_));
+    if (qsa) {
+        // indexer: raw keys cached per token; pooled keys for the complete blocks this pass touches (recomputed every pass:
+        // a rejected draft may have completed a block); 4 query heads; per-row top-k selection
+        qsa::bf16_gemv(L.idx_k, mixed, k_idx_, qsa::IDX_DIM, D::n_embd, rows, s_);
+        qsa::write_k(k_idx_, d_pos_, d_kv_, idxc_ + (size_t)ai * max_ctx_ * qsa::IDX_DIM, idx_slot_stride_, rows, s_);
+        qsa::bf16_gemv(L.idx_q, mixed, q_raw_, qsa::IDX_HEADS * qsa::IDX_DIM, D::n_embd, rows, s_);
+        qsa::query(q_raw_, d_pos_, L.idx_qn, q_idx_, rows, D::rms_eps, D::rope_base, s_);
+        for (int r0 = 0; r0 < rows;) {   // runs of rows of one slot: pool blocks [first/4, (last+1)/4)
+            int r1 = r0; while (r1 + 1 < rows && kv[r1 + 1] == kv[r0] && pos[r1 + 1] == pos[r1] + 1) ++r1;
+            const int sl = kv[r0], b0 = pos[r0] / qsa::R, b1 = (pos[r1] + 1) / qsa::R;
+            qsa::pool(idxc_ + (size_t)sl * idx_slot_stride_ + (size_t)ai * max_ctx_ * qsa::IDX_DIM, L.idx_kn, pooled_ + (size_t)sl * pooled_slot_stride_ + (size_t)ai * max_blocks_ * qsa::IDX_DIM, b0, b1, D::rms_eps, D::rope_base, s_);
+            r0 = r1 + 1;
+        }
+        for (int r0 = 0; r0 < rows; r0 += 256)   // selection in chunks of 256 rows (score scratch)
+            qsa::select(q_idx_ + (size_t)r0 * qsa::IDX_HEADS * qsa::IDX_DIM, d_pos_ + r0, d_kv_ + r0, pooled_ + (size_t)ai * max_blocks_ * qsa::IDX_DIM, pooled_slot_stride_, max_blocks_, sel_scratch_,
+                        d_idx_ + (size_t)r0 * qsa::WIDTH, d_cnt_ + r0, std::min(256, rows - r0), s_);
+    }
+    if (rb) attn_rope_kv_24_2_rowv(qf, k, v, rows, L.q_norm, L.k_norm, D::rope_base, *rb, kc, vc, kvs, max_ctx_, D::rms_eps, s_);
+    else { RowBatch one; one.n = 0; attn_rope_kv_24_2_rowv_pos0(qf, k, v, rows, L.q_norm, L.k_norm, D::rope_base, pos[0], kc, vc, max_ctx_, D::rms_eps, s_); }
+    const int nsplit = rows <= 8 ? 16 : 1;   // decode: split the key list across blocks for parallelism
+    qsa::attend(qf, kc, vc, kvs, max_ctx_, d_pos_, d_kv_, qsa ? d_idx_ : nullptr, d_cnt_, rows, nsplit, part_, ao, xq, s_);
+}
+void Qwen4Exp::attn_layer_b(const FnLayer& L, int rows, const RowBatch& rb, uint16_t* kc, uint16_t* vc, size_t kvs, int ai, bool qsa) {
     float* qf = big0_; float* k = big1_; float* v = big1_ + (size_t)rows * 512; float* ao = big2_;
     GemvSeg segs[3] = {{L.wq.fmt, L.wq.w, qf, L.wq.N, L.wq.K}, {L.wk.fmt, L.wk.w, k, L.wk.N, L.wk.K}, {L.wv.fmt, L.wv.w, v, L.wv.N, L.wv.K}};
     gemv_multi(segs, 3, xq_, rows, s_);
-    attn_decode_24_2_b(qf, k, v, rows, L.q_norm, L.k_norm, D::rope_base, rb, kc, vc, kvs, kvts, max_ctx_, ao, xq_, D::rms_eps, s_);
+    std::vector<int> pos(rb.pos, rb.pos + rows), kv(rb.kv, rb.kv + rows);
+    qsa_attention(L, rows, pos, kv, &rb, mixed_, qf, k, v, ao, xq_, kc, vc, kvs, ai, qsa);
     gemv(L.wo, y_, rows);
 }
 
@@ -354,8 +394,8 @@ float Qwen4Exp::forward(const SlotReq* reqs, int S) {
             gemv(L.ssm_out, y_, rows);
         } else {
             const int ai = attn_index(il);
-            const size_t off = (size_t)ai * max_ctx_ * D::n_head_kv * D::head_dim, offv = (size_t)ai * (max_ctx_ + 128) * D::n_head_kv * D::head_dim;
-            attn_layer_b(L, rows, P.rb, kc_ + off, vc_ + offv, kv_stride_, kvt_stride_);
+            const size_t off = (size_t)ai * max_ctx_ * D::n_head_kv * D::head_dim;
+            attn_layer_b(L, rows, P.rb, kc_ + off, vc_ + off, kv_stride_, ai, L.idx_k != nullptr);
         }
         pend = Pending{}; pend.y = y_; pend.inject = inject_;
         hc_block(L, true, rows, pend, mixed_, inject2_, R_);
@@ -382,7 +422,7 @@ void Qwen4Exp::mtp_forward(const SlotReq* reqs, int S, const float* h) {
     gemv_cols(mtp_.eh_proj.fmt, mtp_.eh_proj.w, mtp_.eh_proj.N, mtp_.eh_proj.K, 32, R_mtp_, 4 * rows);   // eh_proj per stream: R_mtp[t][s] = W . [e_norm | h_norm_s]
     Pending pend;
     hc_block(ML, false, rows, pend, mixed_, inject_, R_mtp_);
-    attn_layer_b(ML, rows, P.rb, mkc_, mvc_, mkv_stride_, mkvt_stride_);
+    attn_layer_b(ML, rows, P.rb, mkc_, mvc_, mkv_stride_, 0, false);   // the draft attends dense
     pend = Pending{}; pend.y = y_; pend.inject = inject_;
     hc_block(ML, true, rows, pend, mixed_, inject2_, R_mtp_);
     moe_layer(ML, rows);
@@ -535,13 +575,14 @@ float Qwen4Exp::prefill(const int* tokens, int T, int pos0) {
             GemvSeg so = {L.ssm_out.fmt, L.ssm_out.w, nullptr, L.ssm_out.N, L.ssm_out.K}; lin_gemm(&so, 1, T, xb_); gemm_seg(D::n_embd, 0, D::n_embd, py_, T); pt.mark(1);
         } else {
             const int ai = attn_index(il);
-            const size_t off = (size_t)ai * max_ctx_ * D::n_head_kv * D::head_dim, offv = (size_t)ai * (max_ctx_ + 128) * D::n_head_kv * D::head_dim;
+            const size_t off = (size_t)ai * max_ctx_ * D::n_head_kv * D::head_dim;
             GemvSeg segs[3] = {{L.wq.fmt, L.wq.w, nullptr, L.wq.N, L.wq.K}, {L.wk.fmt, L.wk.w, nullptr, L.wk.N, L.wk.K}, {L.wv.fmt, L.wv.w, nullptr, L.wv.N, L.wv.K}};
             lin_gemm(segs, 3, T, xb_);
             const int Nt = 12288 + 1024;
             gemm_seg(Nt, 0, 12288, pq_, T); gemm_seg(Nt, 12288, 512, pk_, T); gemm_seg(Nt, 12800, 512, pv_, T); pt.mark(1);
-            attn_stage1_24_2(pq_, pk_, pv_, T, L.q_norm, L.k_norm, D::rope_base, pos0, kc_ + off, vc_ + offv, max_ctx_, D::rms_eps, s_);
-            attn_prefill_24_2(pq_, kc_ + off, vc_ + offv, T, pos0, max_ctx_, xb_, s_);   // xb_ bf16 [T][6144]
+            std::vector<int> pos(T), kv(T, 0); for (int t = 0; t < T; ++t) pos[t] = pos0 + t;
+            qsa_attention(L, T, pos, kv, nullptr, pmixed_, pq_, pk_, pv_, pao_, XQ8{nullptr, nullptr, nullptr}, kc_ + off, vc_ + off, kv_stride_, ai, L.idx_k != nullptr);
+            f32_to_bf16(pao_, xb_, (size_t)T * D::gdn_z, s_);   // [T][24*256] -> bf16 GEMM input
             pt.mark(3);
             GemvSeg so = {L.wo.fmt, L.wo.w, nullptr, L.wo.N, L.wo.K}; lin_gemm(&so, 1, T, xb_); gemm_seg(D::n_embd, 0, D::n_embd, py_, T); pt.mark(1);
         }
