@@ -5,7 +5,7 @@
 namespace hip {
 extern int g_persist_blocks;   // experiment knob: cap GEMV grids (persistent row loop); 0 = off
 // x quantised to int8 per 32-block: q8 [ncol][K] int8, d [ncol][K/32] f32 (scale), s [ncol][K/32] f32 (d*sum(q)).
-struct XQ8 { int8_t* q; float* d; float* s; };
+struct XQ8 { int8_t* q; float* d; float* s; float2* ds = nullptr; };   // ds: optional packed (d, s) copy per sub-block (WMMA GEMV reads it when present)
 void quantize_x_q8(const float* x, XQ8 out, int ncol, int K, hipStream_t s);
 
 // Weight layouts the decode GEMV understands. GGUF-native where the block is 16-byte friendly,
@@ -29,7 +29,11 @@ void gemv_multi(const GemvSeg* segs, int nseg, XQ8 x, int ncol, hipStream_t s); 
 // int8-WMMA GEMV for 1..8 columns: same cost for every ncol, every column reduced in the same order (T-invariant).
 // x must have 16 readable rows. Formats Q4_K/Q5_K/IQ4_XS/Q6_K_SOA/Q8_0_SOA, K % 256 == 0 (gemv_wmma_ok).
 bool gemv_wmma_ok(const GemvSeg* segs, int nseg);
-void gemv_wmma(const GemvSeg* segs, int nseg, XQ8 x, int ncol, int mode, hipStream_t s);   // mode: 0 auto | 1/2/4/8 split-K waves per tile | 3 interleaved layout
+// Q8_K activations for the WMMA GEMV: q [16][K], d [K/256][16], bs [K/256][16][8] int16 (sub-block sums); ncol <= 16
+struct XQ8K { int8_t* q; float* d; int16_t* bs; };
+void quantize_x_q8k(const float* x, XQ8K out, int ncol, int K, hipStream_t s);
+void gemv_wmma_q8k(const GemvSeg* segs, int nseg, XQ8K x, int ncol, int ks_mode, hipStream_t s);
+void gemv_wmma(const GemvSeg* segs, int nseg, XQ8 x, int ncol, int mode, hipStream_t s);   // mode: 0 auto | 1/2/4/8 split-K waves per tile | 3 interleaved layout | 5/6 = KS 4/1 with packed scales (x.ds)
 size_t wmma_il_bytes(WFmt f, int N, int K);
 void repack_wmma_il(WFmt f, const uint8_t* src, uint8_t* dst, int N, int K);
 // MoE: for token t < T and slot e < nexp, y[g][(t*nexp+e)][N] = W[g][expert ids[t*nexp+e]] . x[row] for segment g < nseg

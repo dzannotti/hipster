@@ -156,6 +156,7 @@ void Qwen35::reset() {
 }
 
 void Qwen35::gemv(const Lin& l, float* y, int ncol) {
+    if (ncol <= D::max_T) { lin(l, y, ncol); return; }   // same T-invariant kernel selection as every other GEMV (LM head incl.)
     // measured policy (docs/decode-gemv.md): 1 column -> direct tpr=32; 2..4 -> LDS-x tpr=4; >4 -> WMMA (Q4_K only so far)
     static const int pol = getenv("HIPSTER_GEMV_POLICY") ? atoi(getenv("HIPSTER_GEMV_POLICY")) : 0;   // debug: 1 = direct for all, 2 = LDS for all
     if (ncol == 1) gemv_q8(l.fmt, l.w, xq_, y, l.N, l.K, 1, 32, 1, s_);

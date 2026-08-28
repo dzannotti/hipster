@@ -88,3 +88,15 @@ Neither occupancy (split-K: +5–10%, worse for Q8_0), coalescing (interleaving:
 dominate the vector-memory instruction count, and holding them in registers spills. Engine (`PROF_T=1 HIPSTER_TIMING=1
 dflash27b …`, throttled box): T=1 101 ms (GEMV 85), T=8 120 ms (GEMV 98) with WMMA; old kernels 90 / 152.
 Auto mode (`gemv_wmma(..., mode 0)`): split-K 8/4/2/1 by rows (< 4096 / < 12288 / < 65536 / above).
+
+Corrections after a rocprofv3 trace: `HIPSTER_TIMING` events cost ~9 ms per pass, so the real pass times are **T=1 92 ms,
+T=2 93, T=4 97, T=8 106 ms** (`PROF_T=1 dflash27b …` without timing); launch gaps are 18 ms per 630 ms of kernels (3%,
+median 2 µs). The LM head still ran the old `k_gemv_q8_lds` kernel (`gemv()` member) — now routed through the same
+T-invariant selection (T=8: 108.7 → 106.4 ms).
+
+Q8_K activations prototype (`bench_gemv` rows `tpr=7/9 rpt=4`: one scale per 256 + int16 sub-block sums, integer
+sub-block accumulation with the int weight scales, one float update per block; llama.cpp's K-quant dot layout): at
+8 columns Q4_K 161 → 190 GB/s, IQ4_XS 131 → 155, Q6_K 0.482 → 0.417 ms, Q8_0 143 → 180, but **Q5_K 163 → 176 / 169 → 170**
+(the 7.9 GB bulk: its unpack, not the epilogue, is the cost); error vs f32 grows 3.4e-4 → 4.9e-4 (Q5_K). Weighted over
+the checkpoint ≈ −12 ms of the 97 ms GEMV at T=8; not adopted (engine-wide quantiser change for ~8% end-to-end, less
+precise activations). Kept as a bench option.

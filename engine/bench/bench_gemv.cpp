@@ -70,7 +70,8 @@ int main(int argc, char** argv) {
     std::vector<float> hx((size_t)16 * K); for (auto& v : hx) v = nd(rng);
     float *dx, *dy; CK(hipMalloc(&dx, hx.size() * 4)); CK(hipMalloc(&dy, (size_t)16 * N * 4));
     CK(hipMemcpy(dx, hx.data(), hx.size() * 4, hipMemcpyHostToDevice));
-    hip::XQ8 xq; CK(hipMalloc(&xq.q, hx.size())); CK(hipMalloc(&xq.d, hx.size() / 32 * 4)); CK(hipMalloc(&xq.s, hx.size() / 32 * 4));
+    hip::XQ8K xk; CK(hipMalloc(&xk.q, hx.size())); CK(hipMalloc(&xk.d, hx.size() / 256 * 4)); CK(hipMalloc(&xk.bs, hx.size() / 32 * 2)); CK(hipMemset(xk.q, 0, hx.size()));
+    hip::XQ8 xq; CK(hipMalloc(&xq.q, hx.size())); CK(hipMalloc(&xq.d, hx.size() / 32 * 4)); CK(hipMalloc(&xq.s, hx.size() / 32 * 4)); CK(hipMalloc(&xq.ds, hx.size() / 32 * 8));
     CK(hipMemset(xq.q, 0, hx.size())); CK(hipMemset(xq.d, 0, hx.size() / 32 * 4)); CK(hipMemset(xq.s, 0, hx.size() / 32 * 4));
 
     std::vector<int> rows; std::uniform_int_distribution<int> rd(0, N - 1); for (int i = 0; i < 64; ++i) rows.push_back(rd(rng));
@@ -87,8 +88,9 @@ int main(int argc, char** argv) {
                 if (!q8) memcpy(xr[c].data(), hx.data() + (size_t)c * K, K * 4);
                 else { std::vector<int8_t> q; std::vector<float> d, s; quantize_ref(hx.data() + (size_t)c * K, K, q, d, s); for (int k = 0; k < K; ++k) xr[c][k] = q[k] * d[k / 32]; }
             }
-            for (int cfg : {32, 16, 8, 4, 2, 1, 208, 204, 301, 302, 304, 308, 303, 404}) { if (ncol > 1 && (cfg == 16 || cfg == 8 || cfg == 2 || cfg == 1 || cfg == 208)) continue; if (cfg / 100 == 3 && (K % 256 != 0)) continue; if (cfg == 303 && dWil16.empty()) continue; if (cfg == 404 && dWil.empty()) continue; const int tpr = cfg % 100, rpt = cfg / 100 + 1;
-                int it = 0; auto run = [&] { uint8_t* w = (rpt == 5 ? dWil : (rpt == 4 && tpr == 3) ? dWil16 : dWs)[it++ % ncopy]; if (q8) { hip::quantize_x_q8(dx, xq, ncol, K, 0); if (rpt == 4 && ncol > 16) return; hip::gemv_q8(fmt, w, xq, dy, N, K, ncol, tpr, rpt, 0); } else hip::gemv_q4_K_f32(w, dx, dy, N, K, ncol, tpr, 0); };
+            for (int cfg : {32, 16, 8, 4, 2, 1, 208, 204, 301, 302, 304, 308, 303, 305, 306, 307, 309, 404}) { if (ncol > 1 && (cfg == 16 || cfg == 8 || cfg == 2 || cfg == 1 || cfg == 208)) continue; if (cfg / 100 == 3 && (K % 256 != 0)) continue; if (cfg == 303 && dWil16.empty()) continue; if (cfg == 404 && dWil.empty()) continue; const int tpr = cfg % 100, rpt = cfg / 100 + 1;
+                int it = 0; auto run = [&] { uint8_t* w = (rpt == 5 ? dWil : (rpt == 4 && tpr == 3) ? dWil16 : dWs)[it++ % ncopy]; if (q8) { if (rpt == 4 && (tpr == 7 || tpr == 9)) { hip::quantize_x_q8k(dx, xk, ncol, K, 0); hip::GemvSeg sg{fmt, w, dy, N, K}; hip::gemv_wmma_q8k(&sg, 1, xk, ncol, tpr == 7 ? 4 : 1, 0); return; }
+                                                        hip::quantize_x_q8(dx, xq, ncol, K, 0); if (rpt == 4 && ncol > 16) return; hip::gemv_q8(fmt, w, xq, dy, N, K, ncol, tpr, rpt, 0); } else hip::gemv_q4_K_f32(w, dx, dy, N, K, ncol, tpr, 0); };
                 it = 0; run(); CK(hipDeviceSynchronize());
                 std::vector<float> hy((size_t)ncol * N); CK(hipMemcpy(hy.data(), dy, hy.size() * 4, hipMemcpyDeviceToHost));
                 double maxrel = 0, maxrel_f32 = 0;
