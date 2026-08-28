@@ -60,3 +60,17 @@ The 40-token prompts cost 1.1 s each through the GEMM path (every weight dequant
 ≤ 96 tokens now go through 16-row GEMV passes (a single-slot pass of up to 16 rows takes the GEMV path; attention groups
 are split at 8 rows): `prompt_ms 372`, and with the prefill share smaller the two concurrent code requests reach
 **68.4 t/s aggregate** (600 tokens in 8.8 s wall, per request 35.7 / 38.5, text identical to the solo run).
+
+### Flash-Next with slots (plain batched decode)
+
+`--slots N` (≤ 8) on the Flash-Next GGUF: the same scheduler, one row per active slot per pass (its MTP drafts are used
+only with one slot for now). `prefill()` took a slot argument; it had been writing K/V through the single-slot rope/KV
+kernel without the slot offset (reads used the slot), so any request prefilled into slot ≠ 0 decoded garbage — fixed
+(`qsa_attention`, rb == null path). Checks: a request prefilled into slot 1 while slot 0 decodes matches its solo output;
+each of 4 concurrent requests matches its solo output.
+
+| Flash-Next | per request | aggregate (wall, incl. prefills) |
+|---|---|---|
+| 1 request, MTP n=2 | 43.5 t/s | 43.5 |
+| 1 request on a 4-slot server (plain) | 27.4 | 27.4 |
+| 4 concurrent (200-token replies, 40-token prompts) | 14.4–16.3 | **50.2** (63 while all four are active; one reply ended at 85 tokens) |

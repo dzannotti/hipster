@@ -37,15 +37,16 @@ struct Backend {
     virtual void accept(int s, int mm, const int* drafts, int pos) = 0;             // commit mm drafts + bonus on slot s, draft catch-up
     virtual size_t weight_bytes() = 0;
 };
-struct FnBackend : Backend {   // Flash-Next + MTP, one slot
-    hip::Qwen4Exp m; int mtp; float* h_pending = nullptr; std::vector<int> ids = std::vector<int>(16); std::vector<float> vals = std::vector<float>(16);
-    FnBackend(const std::string& path, int ctx, int chunk, int mtp_) : m(path, ctx, 1, chunk), mtp(mtp_) {
+struct FnBackend : Backend {   // Flash-Next: MTP drafts with one slot, plain batched decode with several (MTP over slots: later)
+    hip::Qwen4Exp m; int mtp, ns; float* h_pending = nullptr; std::vector<int> ids = std::vector<int>(16); std::vector<float> vals = std::vector<float>(16);
+    FnBackend(const std::string& path, int ctx, int chunk, int mtp_, int slots) : m(path, ctx, slots, chunk), mtp(mtp_), ns(slots) {
         if (mtp > 0 && !m.has_mtp()) { fprintf(stderr, "no MTP block in this GGUF: decoding without drafts\n"); mtp = 0; }
+        if (ns > 1 && mtp > 0) { fprintf(stderr, "Flash-Next with %d slots: plain batched decode (no MTP)\n", ns); mtp = 0; }
         hipMalloc(&h_pending, (size_t)hip::FnDims::wide * 4);
     }
-    int n_slots() override { return 1; }
-    void reset_slot(int) override { m.reset(); }
-    const float* prefill(int, const int* t, int n, int p, bool spec) override { m.prefill(t, n, p); if (spec && mtp > 0) m.mtp_catchup(t, n, p); hipMemcpy(h_pending, m.h_nextn(), (size_t)hip::FnDims::wide * 4, hipMemcpyDeviceToDevice); return m.logits(); }
+    int n_slots() override { return ns; }
+    void reset_slot(int s) override { if (ns == 1) m.reset(); else m.reset_slot(s); }
+    const float* prefill(int s, const int* t, int n, int p, bool spec) override { m.prefill(t, n, p, s); if (spec && mtp > 0) m.mtp_catchup(t, n, p); if (mtp > 0) hipMemcpy(h_pending, m.h_nextn(), (size_t)hip::FnDims::wide * 4, hipMemcpyDeviceToDevice); return m.logits(); }
     const float* logits() override { return m.logits(); }
     void topk(const float* l, int T, int k, int* i, float* v) override { m.topk(l, T, k, i, v); }
     int max_draft() override { return mtp; }
@@ -54,10 +55,10 @@ struct FnBackend : Backend {   // Flash-Next + MTP, one slot
         for (int i = 0; i < mtp; ++i) { m.mtp_forward(&tok, h, 1, pos[0] + i); m.topk(m.mtp_logits(), 1, 1, ids.data(), vals.data()); tok = ids[0]; out[i] = tok; h = m.mtp_h(); }
         return mtp;
     }
-    void verify(const hip::SlotReq* r, int) override { m.forward(r[0].tokens, r[0].T, r[0].pos); }
-    void accept(int, int mm, const int* drafts, int pos) override {
-        m.accept(mm + 1); if (mm > 0) m.mtp_forward(drafts, m.h_nextn(), mm, pos + 1);
-        hipMemcpy(h_pending, m.h_nextn() + (size_t)mm * hip::FnDims::wide, (size_t)hip::FnDims::wide * 4, hipMemcpyDeviceToDevice);
+    void verify(const hip::SlotReq* r, int S) override { m.forward(r, S); }
+    void accept(int s, int mm, const int* drafts, int pos) override {
+        m.accept(s, mm + 1);
+        if (mtp > 0) { if (mm > 0) m.mtp_forward(drafts, m.h_nextn(), mm, pos + 1); hipMemcpy(h_pending, m.h_nextn() + (size_t)mm * hip::FnDims::wide, (size_t)hip::FnDims::wide * 4, hipMemcpyDeviceToDevice); }
     }
     size_t weight_bytes() override { return m.weight_bytes(); }
 };
@@ -216,8 +217,7 @@ int main(int argc, char** argv) {
     std::string arch; { hip::GGUF g(model); arch = g.arch(); }
     const bool is27b = arch == "qwen35";
     if (is27b) chunk = std::min(chunk, hip::Qwen35Dims::max_prefill);
-    if (!is27b && slots != 1) { fprintf(stderr, "Flash-Next serving is one slot for now\n"); slots = 1; }
-    Backend* be = is27b ? (Backend*)new B27Backend(model, draft, ctx, std::min(ndraft, 7), std::max(1, std::min(slots, 2))) : (Backend*)new FnBackend(model, ctx, chunk, mtp);
+    Backend* be = is27b ? (Backend*)new B27Backend(model, draft, ctx, std::min(ndraft, 7), std::max(1, std::min(slots, 2))) : (Backend*)new FnBackend(model, ctx, chunk, mtp, std::max(1, std::min(slots, 8)));
     mtp = be->max_draft();
     tok::Tokenizer* Tp; { hip::GGUF g(model); Tp = new tok::Tokenizer(g); } tok::Tokenizer& T = *Tp;
     Server S{be, &T, ctx, chunk, mtp, is27b ? "qwen3.8-27b" : "qwen3.8-flash-next", T.eos(), T.special("<|im_end|>"), T.special("<think>"), T.special("</think>")};

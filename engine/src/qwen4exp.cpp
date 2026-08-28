@@ -208,6 +208,11 @@ Qwen4Exp::Qwen4Exp(const std::string& path, int max_ctx, int n_slots, int max_pr
     reset();
 }
 
+void Qwen4Exp::reset_slot(int s) {
+    CK(hipMemset(gdn_state_ + (size_t)s * 2 * st_stride_, 0, (size_t)2 * st_stride_ * 4)); CK(hipMemset(conv_state_ + (size_t)s * 2 * cs_stride_, 0, (size_t)2 * cs_stride_ * 4));
+    CK(hipMemset(ple_state_ + (size_t)s * 2 * ple_stride_, 0, (size_t)2 * ple_stride_ * 4));
+    hist_[s].clear(); cur_[s] = 0; lT_[s] = 0;
+}
 void Qwen4Exp::reset() {
     CK(hipMemset(gdn_state_, 0, (size_t)n_slots_ * 2 * st_stride_ * 4)); CK(hipMemset(conv_state_, 0, (size_t)n_slots_ * 2 * cs_stride_ * 4));
     CK(hipMemset(ple_state_, 0, (size_t)n_slots_ * 2 * ple_stride_ * 4));
@@ -322,7 +327,7 @@ void Qwen4Exp::qsa_attention(const FnLayer& L, int rows, const std::vector<int>&
                         d_idx_ + (size_t)r0 * qsa::WIDTH, d_cnt_ + r0, std::min(256, rows - r0), s_);
     }
     if (rb) attn_rope_kv_24_2_rowv(qf, k, v, rows, L.q_norm, L.k_norm, D::rope_base, *rb, kc, vc, kvs, max_ctx_, D::rms_eps, s_);
-    else { RowBatch one; one.n = 0; attn_rope_kv_24_2_rowv_pos0(qf, k, v, rows, L.q_norm, L.k_norm, D::rope_base, pos[0], kc, vc, max_ctx_, D::rms_eps, s_); }
+    else attn_rope_kv_24_2_rowv_pos0(qf, k, v, rows, L.q_norm, L.k_norm, D::rope_base, pos[0], kc + (size_t)kv[0] * kvs, vc + (size_t)kv[0] * kvs, max_ctx_, D::rms_eps, s_);   // one slot's rows: write into that slot's cache (attend reads kc + kv*kvs)
     const int nsplit = rows <= 8 ? 16 : 1;   // decode: split the key list across blocks for parallelism
     qsa::attend(qf, kc, vc, kvs, max_ctx_, d_pos_, d_kv_, qsa ? d_idx_ : nullptr, d_cnt_, rows, nsplit, part_, ao, xq, s_);
 }
@@ -554,12 +559,13 @@ void Qwen4Exp::dbg_report() const {
     }
 }
 
-float Qwen4Exp::prefill(const int* tokens, int T, int pos0) {
+float Qwen4Exp::prefill(const int* tokens, int T, int pos0, int slot) {
     if (!max_prefill_) throw std::runtime_error("engine built without prefill buffers");
     if (T < 1 || T > max_prefill_) throw std::runtime_error("bad prefill T");
     if (pos0 + T > max_ctx_) throw std::runtime_error("pos >= max_ctx");
     if (pos0 + T > D::qsa_dense_limit) fprintf(stderr, "warning: %d cached tokens > QSA budget; dense attention is no longer exact\n", pos0 + T);
-    const int sl = 0, cur = cur_[sl], nxt = cur ^ 1;
+    if (slot < 0 || slot >= n_slots_) throw std::runtime_error("bad slot");
+    const int sl = slot, cur = cur_[sl], nxt = cur ^ 1;
     CK(hipEventRecord(ev0_, s_));
     CK(hipMemcpyAsync(pd_tok_, tokens, T * 4, hipMemcpyHostToDevice, s_));
     fn::embed_q8_0(tok_embd_, pd_tok_, T, pemb_, D::n_embd, s_);
@@ -608,7 +614,7 @@ float Qwen4Exp::prefill(const int* tokens, int T, int pos0) {
             lin_gemm(segs, 3, T, xb_);
             const int Nt = 12288 + 1024;
             gemm_seg(Nt, 0, 12288, pq_, T); gemm_seg(Nt, 12288, 512, pk_, T); gemm_seg(Nt, 12800, 512, pv_, T); pt.mark(1);
-            std::vector<int> pos(T), kv(T, 0); for (int t = 0; t < T; ++t) pos[t] = pos0 + t;
+            std::vector<int> pos(T), kv(T, sl); for (int t = 0; t < T; ++t) pos[t] = pos0 + t;
             qsa_attention(L, T, pos, kv, nullptr, pmixed_, pq_, pk_, pv_, pao_, XQ8{nullptr, nullptr, nullptr}, kc_ + off, vc_ + off, kv_stride_, ai, L.idx_k != nullptr);
             f32_to_bf16(pao_, xb_, (size_t)T * D::gdn_z, s_);   // [T][24*256] -> bf16 GEMM input
             pt.mark(3);

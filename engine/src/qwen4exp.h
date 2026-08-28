@@ -57,7 +57,7 @@ public:
     explicit Qwen4Exp(const std::string& gguf_path, int max_ctx = 8192, int n_slots = 1, int max_prefill = 0);
     // Prefill (slot 0): T tokens (<= max_prefill) at positions pos0.. through the GEMM path (bf16 activations,
     // hipBLASLt); logits for the LAST row only in logits(); state committed (no accept). h_nextn() = the last row.
-    float prefill(const int* tokens, int T, int pos0);
+    float prefill(const int* tokens, int T, int pos0, int slot = 0);
     // A pass over S slots (rows = sum of T, <= MAXR, in request order). Logits [rows][n_vocab] on device.
     // Commit per slot with accept(slot, m): m == T swaps that slot's state buffers, m < T replays the recurrent
     // state (GDN, conv, PLE conv history) for the first m tokens from the saved inputs.
@@ -85,6 +85,7 @@ public:
     const float* logits() const { return logits_; }
     void topk(const float* logits, int T, int k, int* ids, float* vals);
     void reset();
+    void reset_slot(int slot);   // zero one slot's recurrent/PLE state and n-gram history
     size_t weight_bytes() const { return weight_bytes_; }
     std::string load_report() const { return report_; }
 
