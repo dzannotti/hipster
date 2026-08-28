@@ -71,6 +71,10 @@ public:
     void mtp_forward(const SlotReq* reqs, int S, const float* h);
     void mtp_forward(const int* tokens, const float* h, int T, int pos0) { SlotReq r{0, tokens, T, pos0}; mtp_forward(&r, 1, h); }
     int n_slots() const { return n_slots_; }
+    const GGUF& gguf() const { return *gguf_; }
+    // after prefill(tokens, T, pos0): run the MTP block over the same rows (h for row p = the trunk residual after row p-1,
+    // the previous chunk's last row for the first one) so the draft KV covers the prompt
+    void mtp_catchup(const int* tokens, int T, int pos0);
     bool has_mtp() const { return has_mtp_; }
     double ple_host_ms() const { return ple_host_ms_; }   // host time spent hashing + gathering n-gram rows from the mmap (SSD)
     double gpu_ms() const { return gpu_ms_; }             // accumulated forward() GPU time
@@ -134,7 +138,7 @@ private:
     // prefill (GEMM path) buffers, allocated when max_prefill > 0
     int max_prefill_ = 0; BlasLt blas_;
     uint16_t *xb_ = nullptr, *xb2_, *gout_, *wscratch_;
-    float *pR_, *pxn_, *pmixed_, *py_, *pymoe_, *pqkv_, *pqkvc_, *pz_, *pba_, *pqn_, *praw_, *pao_, *pq_, *pk_, *pv_, *prl_, *prw_, *peg_, *peu_, *pinj_, *pinj2_, *pkey_, *pval_, *pemb_;
+    float *hprev_, *mtp_h_; float *pR_, *pxn_, *pmixed_, *py_, *pymoe_, *pqkv_, *pqkvc_, *pz_, *pba_, *pqn_, *praw_, *pao_, *pq_, *pk_, *pv_, *prl_, *prw_, *peg_, *peu_, *pinj_, *pinj2_, *pkey_, *pval_, *pemb_;
     int *peid_, *pd_tok_, *d_kpos_, *d_rowtok_; MoeTile* d_tiles_; float* pdown_; XQ8 pxq_;
     std::set<int> dbg_layers_; std::map<int, std::vector<float>> dbg_pf_, dbg_dec_; bool dbg_armed_ = false;
     void dbg_capture(int il, const float* y, const float* ymoe, bool pf); void dbg_capture_mix(int il, const float* mixed, bool pf);

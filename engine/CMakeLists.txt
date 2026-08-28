@@ -46,3 +46,9 @@ target_link_libraries(bench_moe hipster_core)
 
 add_executable(test_fnkernels bench/test_fnkernels.cpp)
 target_link_libraries(test_fnkernels hipster_core)
+
+add_executable(tok_test ../front/tok_test.cpp ../front/tokenizer.cpp)
+target_link_libraries(tok_test hipster_core)
+
+add_executable(hipster-serve ../front/serve.cpp ../front/tokenizer.cpp ../front/chat.cpp ../front/http.cpp)
+target_link_libraries(hipster-serve hipster_core)

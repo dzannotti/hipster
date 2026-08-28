@@ -120,7 +120,7 @@ void Qwen4Exp::upload_experts(const GGUF& g, const std::string& name, uint8_t** 
     *dst = l.w; *fmt = l.fmt; *eb = l.bytes / E;
 }
 
-Qwen4Exp::Qwen4Exp(const std::string& path, int max_ctx, int n_slots, int max_prefill) : max_ctx_(max_ctx), n_slots_(n_slots), max_prefill_(max_prefill) {
+Qwen4Exp::Qwen4Exp(const std::string& path, int max_ctx, int n_slots, int max_prefill) : max_ctx_(max_ctx), n_slots_(n_slots), max_prefill_((max_prefill + 127) / 128 * 128) {
     if (n_slots < 1 || n_slots > MAXS) throw std::runtime_error("n_slots must be 1..8");
     gguf_ = new GGUF(path);
     if (const char* e = getenv("HIPSTER_DBG_LAYERS")) { std::stringstream ss(e); std::string t; while (std::getline(ss, t, ',')) dbg_layers_.insert(atoi(t.c_str())); }
@@ -191,6 +191,7 @@ Qwen4Exp::Qwen4Exp(const std::string& path, int max_ctx, int n_slots, int max_pr
         f32(&pq_, P * 12288); f32(&pk_, P * 512); f32(&pv_, P * 512); f32(&prl_, P * (D::n_exp + 1)); f32(&prw_, P * (D::n_used + 1));
         f32(&peg_, P * (D::n_used + 1) * D::exp_ff); f32(&peu_, P * (D::n_used + 1) * D::exp_ff); f32(&pinj_, P * 20 * 4); f32(&pinj2_, P * 20 * 4);
         f32(&pkey_, P * D::wide); f32(&pval_, P * D::n_embd); f32(&pemb_, P * D::n_embd);
+        f32(&hprev_, D::wide); CK(hipMemset(hprev_, 0, D::wide * 4)); f32(&mtp_h_, (size_t)MAXR * D::wide);
         CK(hipMalloc(&peid_, P * (D::n_used + 1) * 4)); CK(hipMalloc(&pd_tok_, P * 4));
         CK(hipMalloc(&d_kpos_, P * (D::n_used + 1) * 4)); CK(hipMalloc(&d_rowtok_, P * (D::n_used + 1) * 4)); CK(hipMalloc(&d_tiles_, (P * (D::n_used + 1) / 16 + D::n_exp + 2) * sizeof(MoeTile)));
         f32(&pdown_, P * (D::n_used + 1) * D::n_embd);
@@ -295,8 +296,8 @@ void Qwen4Exp::qsa_attention(const FnLayer& L, int rows, const std::vector<int>&
         // indexer: raw keys cached per token; pooled keys for the complete blocks this pass touches (recomputed every pass:
         // a rejected draft may have completed a block); 4 query heads; per-row top-k selection
         if (rows > MAXR) {   // prefill: one bf16 GEMM on the bf16 mixed rows (xb_) for k and q (weights are bf16 already)
-            blas_.gemm(xb_, L.idx_k, gout_, rows, qsa::IDX_DIM, D::n_embd, s_); bf16_to_f32(gout_, k_idx_, (size_t)rows * qsa::IDX_DIM, s_);
-            blas_.gemm(xb_, L.idx_q, gout_, rows, qsa::IDX_HEADS * qsa::IDX_DIM, D::n_embd, s_); bf16_to_f32(gout_, q_raw_, (size_t)rows * qsa::IDX_HEADS * qsa::IDX_DIM, s_);
+            blas_.gemm(xb_, L.idx_k, gout_, round_m(rows), qsa::IDX_DIM, D::n_embd, s_); bf16_to_f32(gout_, k_idx_, (size_t)rows * qsa::IDX_DIM, s_);
+            blas_.gemm(xb_, L.idx_q, gout_, round_m(rows), qsa::IDX_HEADS * qsa::IDX_DIM, D::n_embd, s_); bf16_to_f32(gout_, q_raw_, (size_t)rows * qsa::IDX_HEADS * qsa::IDX_DIM, s_);
         } else {
             qsa::bf16_gemv(L.idx_k, mixed, k_idx_, qsa::IDX_DIM, D::n_embd, rows, s_);
             qsa::bf16_gemv(L.idx_q, mixed, q_raw_, qsa::IDX_HEADS * qsa::IDX_DIM, D::n_embd, rows, s_);
@@ -435,6 +436,20 @@ void Qwen4Exp::mtp_forward(const SlotReq* reqs, int S, const float* h) {
     head(rows, pend, R_mtp_, mlogits_);
 }
 
+void Qwen4Exp::mtp_catchup(const int* tokens, int T, int pos0) {
+    if (!has_mtp_) return;
+    if (pos0 == 0) CK(hipMemsetAsync(hprev_, 0, D::wide * 4, s_));
+    for (int w0 = 0; w0 < T; w0 += MAXR) {
+        const int n = std::min(MAXR, T - w0);
+        // h rows: row 0 <- hprev_ (w0 == 0) or pR_[w0-1]; rows i >= 1 <- pR_[w0+i-1]
+        if (w0 == 0) CK(hipMemcpyAsync(mtp_h_, hprev_, D::wide * 4, hipMemcpyDeviceToDevice, s_));
+        else CK(hipMemcpyAsync(mtp_h_, pR_ + (size_t)(w0 - 1) * D::wide, D::wide * 4, hipMemcpyDeviceToDevice, s_));
+        if (n > 1) CK(hipMemcpyAsync(mtp_h_ + D::wide, pR_ + (size_t)w0 * D::wide, (size_t)(n - 1) * D::wide * 4, hipMemcpyDeviceToDevice, s_));
+        SlotReq r{0, tokens + w0, n, pos0 + w0}; mtp_forward(&r, 1, mtp_h_);
+    }
+    CK(hipMemcpyAsync(hprev_, pR_ + (size_t)(T - 1) * D::wide, D::wide * 4, hipMemcpyDeviceToDevice, s_));
+}
+
 void Qwen4Exp::accept(int slot, int m) {
     if (slot < 0 || slot >= n_slots_ || m < 1 || m > lT_[slot]) throw std::runtime_error("bad accept");
     const int cur = cur_[slot], nxt = cur ^ 1, r0 = lr0_[slot];
@@ -483,7 +498,9 @@ void prefill_timing_report(double denom_tokens) {
     for (auto& kv : g_gemm_ms) if (kv.first.first % 8192 > 64) fprintf(stderr, "  gemm M=%d N=%5d K=%5d: %4d calls, avg %.3f ms, min %.3f ms (avg includes the first call's autotune)\n", kv.first.first % 8192, kv.first.first / 8192, kv.first.second / 10, kv.second.second, kv.second.first / kv.second.second, g_gemm_min[kv.first]);
     g_gemm_ms.clear(); g_gemm_min.clear();
 }
+static int round_m(int M) { return (M + 127) / 128 * 128; }   // GEMM row counts padded to 128: a handful of hipBLASLt shapes (autotuned once)
 void Qwen4Exp::lin_gemm(const GemvSeg* segs, int n, int M, const uint16_t* A) {
+    M = round_m(M);
     int Nt = 0; const int K = segs[0].K;
     for (int i = 0; i < n; ++i) { dequant_bf16(segs[i].fmt, segs[i].w, wscratch_ + (size_t)Nt * K, segs[i].N, K, s_); Nt += segs[i].N; }
     auto run = [&] { blas_.gemm(A, wscratch_, gout_, M, Nt, K, s_); };
@@ -594,7 +611,7 @@ float Qwen4Exp::prefill(const int* tokens, int T, int pos0) {
         pend = Pending{}; pend.y = py_; pend.inject = pinj_;
         hc_read_pf(L, true, T, pend, pinj2_); pt.mark(0);
         // MoE over T rows: exact f32 router GEMM, top-10, sorted slots -> grouped WMMA GEMMs
-        blas_.gemm_f32(pmixed_, L.router, prl_, T, D::n_exp + 1, D::n_embd, s_);
+        blas_.gemm_f32(pmixed_, L.router, prl_, round_m(T), D::n_exp + 1, D::n_embd, s_);
         fn::moe_route(prl_, peid_, prw_, T, s_);
         {   // slots sorted by expert on the host -> tiles of <= 16 columns; grouped WMMA GEMMs read each expert once per tile
             const int NS = T * (D::n_used + 1); constexpr int NE = D::n_used + 1;
